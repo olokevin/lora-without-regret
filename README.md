@@ -83,10 +83,24 @@ We observe that LoRA fine tuning can match the performance of full fine tuning, 
 
 ## Code Navigation
 
+Quickstart:
+```
+uv sync # install dependencies
+CUDA_VISIBLE_DEVICES=0 uv run sft_lora.py --lr 2e-4 --lora-rank 1 --lora-type all --no-wandb
+```
+
+I ran my experiments on Azure NC H100 instances which are 2xH100 NVL nodes. Each device has 94 GB memory so you may need to adjust parameters or add gradient checkpointing if running on a lower memory device. All of my experiments were done on a single device.
+
+training scripts:
 - `sft_full.py`: SFT training script for full fine tuning
 - `sft_lora.py`: SFT training script for LoRA fine tuning
 - `rl_full.py`: RL training script for full fine tuning
 - `rl_lora.py`: RL training script for LoRA fine tuning
-- `wandb_sft_export.db`: contains run data for sft experiments
-- `wandb_rl_export.db`: contains run data for rl experiments
+
+misc:
 - `math_utils.py`: utilities for extracting boxed math answers and comparing equivalence of two math expression strings
+
+run data for my experiments (stored in sqlite files):
+- `results/wandb_sft_export.db`
+- `results/wandb_rl_export.db`
+- `dataschema.md`: describes the data schema of the sqlite dbs
