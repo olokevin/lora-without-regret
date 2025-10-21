@@ -13,7 +13,7 @@ Key results:
 ## SFT Experiments
 Model: [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)
 
-Dataset: We use the first 6400 examples in the train split of the [no_robots dataset](https://huggingface.co/datasets/HuggingFaceH4/no_robots) and the first 100 examples in test split for validation.
+Dataset: We use the first 6400 examples in the train split of the [No Robots dataset](https://huggingface.co/datasets/HuggingFaceH4/no_robots) and the first 100 examples in test split for validation. No Robots is an instruction following dataset collected by human annotators.
 
 We do learning rate sweeps for the following configurations:
 - Full fine tune
