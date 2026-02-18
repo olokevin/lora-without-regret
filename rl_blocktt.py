@@ -1,28 +1,26 @@
 """
-this script requires a vllm instance to be run on the same node with --enable-lora flag
-in another terminal, install vllm and then run the following commands
-```
-export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora
-```
+this script uses vllm's v0 engine for rollout generation.
 
-then run this training script after the vllm instance is set up
-uv run rl_lora.py --lr 1e-4 --lora_r 1 --model_id Qwen/Qwen3-1.7B --disable_wandb
-
-this script save the LoRA weights to filesystem on each iteration
-and then send requests to the vllm instance to load the lora weights and use them during inference
+run:
+uv run rl_blocktt.py --lr 1e-4 --blocktt-type all --decomp-mode input_one_block --disable_wandb
 """
 
+import os
+
+os.environ["VLLM_USE_V1"] = "0"
+
+from vllm import LLM, SamplingParams
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
 from math_utils import last_boxed_only_string, remove_boxed, is_equiv
-from peft import LoraConfig, get_peft_model
-from pathlib import Path
-import requests
+from btt_layer import (
+    BTTLayer,
+    convert_linear_to_btt,
+    configure_blocktt_trainability,
+    get_blocktt_target_module_names,
+)
 import torch
 from tqdm import tqdm
-import os
 import random
 import argparse
 import wandb
@@ -30,7 +28,7 @@ import time
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a language model with GRPO")
+    parser = argparse.ArgumentParser(description="Train a language model with GRPO + BlockTT")
 
     # Model configuration
     parser.add_argument(
@@ -40,22 +38,31 @@ def parse_args():
         help="HuggingFace model ID to use",
     )
 
-    # LoRA configuration
-    parser.add_argument("--lora_r", type=int, default=1, help="LoRA rank")
+    # BlockTT configuration
     parser.add_argument(
-        "--lora_target_modules",
+        "--blocktt-type",
         type=str,
-        nargs="+",
-        default=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "up_proj",
-            "gate_proj",
-            "down_proj",
-        ],
-        help="Target modules for LoRA",
+        default="all",
+        choices=["all", "mlp", "attn"],
+        help="BlockTT target modules: all, mlp, or attn",
+    )
+    parser.add_argument(
+        "--decomp-mode",
+        type=str,
+        default="input_one_block",
+        choices=["input_one_block", "output_one_block"],
+        help="BlockTT decomposition mode; controls which core is trainable",
+    )
+    parser.add_argument(
+        "--blocktt-rank",
+        type=str,
+        default="full",
+        help="BTT rank; default full for lossless decomposition",
+    )
+    parser.add_argument(
+        "--no-train-bias",
+        action="store_true",
+        help="Freeze BTT bias terms; by default BTT bias is trainable",
     )
 
     # Training hyperparameters
@@ -111,12 +118,6 @@ def parse_args():
         help="Path to prompt template file",
     )
     parser.add_argument(
-        "--vllm_url",
-        type=str,
-        default="http://localhost:8000",
-        help="URL for vLLM API server",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -132,7 +133,7 @@ def parse_args():
     parser.add_argument(
         "--wandb_project",
         type=str,
-        default="math-grpo",
+        default="math-grpo-blocktt",
         help="Wandb project name",
     )
     parser.add_argument(
@@ -150,6 +151,63 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_blocktt_rank(rank_arg: str):
+    if rank_arg == "full":
+        return "full"
+    try:
+        rank = int(rank_arg)
+    except ValueError as exc:
+        raise ValueError("--blocktt-rank must be 'full' or a positive integer") from exc
+    if rank <= 0:
+        raise ValueError("--blocktt-rank must be > 0")
+    return rank
+
+
+@torch.no_grad()
+def materialize_btt_weight(layer: BTTLayer) -> torch.Tensor:
+    if hasattr(layer, "lr_act"):
+        raise ValueError("BlockTT rollout export requires lr_act=False")
+
+    ms0, ms1 = layer.ms
+    ns0, ns1 = layer.ns
+    rank = layer.rank
+
+    r = layer.btt_r.reshape(ms1, ms0, ns0, rank).permute(2, 0, 1, 3)
+    l = layer.btt_l.reshape(ns0, ms1, rank, ns1)
+
+    # Produces per-block transposed matrices (ns0, ms1, ms0, ns1), then transpose.
+    block_t = torch.matmul(r, l)
+    block = block_t.permute(0, 3, 1, 2).contiguous()
+    return block.reshape(ns0 * ns1, ms1 * ms0)
+
+
+@torch.no_grad()
+def export_weights_for_vllm(model: torch.nn.Module):
+    btt_module_names = []
+    weight_tuples = []
+
+    for module_name, module in model.named_modules():
+        if not isinstance(module, BTTLayer):
+            continue
+        btt_module_names.append(module_name)
+        dense_weight = materialize_btt_weight(module)
+        weight_tuples.append((f"{module_name}.weight", dense_weight))
+        if module.bias is not None:
+            weight_tuples.append((f"{module_name}.bias", module.bias))
+
+    if btt_module_names:
+        btt_prefixes = tuple(f"{name}." for name in btt_module_names)
+    else:
+        btt_prefixes = ()
+
+    for name, param in model.named_parameters():
+        if btt_prefixes and name.startswith(btt_prefixes):
+            continue
+        weight_tuples.append((name, param))
+
+    return weight_tuples
+
+
 def main():
     args = parse_args()
 
@@ -157,11 +215,18 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    print(f"Training configuration:")
+    target_modules = get_blocktt_target_module_names(args.blocktt_type)
+    train_bias = not args.no_train_bias
+    blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
+
+    print("Training configuration:")
     print(f"  Model ID: {args.model_id}")
     print(f"  Learning rate: {args.lr}")
-    print(f"  LoRA rank: {args.lora_r}")
-    print(f"  Target modules: {args.lora_target_modules}")
+    print(f"  BlockTT type: {args.blocktt_type}")
+    print(f"  Decomp mode: {args.decomp_mode}")
+    print(f"  BlockTT rank: {blocktt_rank}")
+    print(f"  Train BTT bias: {train_bias}")
+    print(f"  Target modules: {target_modules}")
     print(f"  Save checkpoint: {'enabled' if args.enable_save_ckpt else 'disabled'}")
     print(f"  W&B logging: {'enabled' if not args.disable_wandb else 'disabled'}")
     print()
@@ -178,7 +243,8 @@ def main():
     # Initialize wandb
     if not args.disable_wandb:
         wandb_run_name = (
-            args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_r{args.lora_r}"
+            args.wandb_run_name
+            or f"{args.model_id}_{args.lr:.1e}_{args.decomp_mode}_{args.blocktt_type}"
         )
         wandb.init(
             project=args.wandb_project,
@@ -186,14 +252,20 @@ def main():
             config=vars(args),
             dir=run_name,
         )
-        # Log the run directory
-        wandb.config.update({"run_dir": run_name})
+        wandb.config.update(
+            {
+                "target_modules": target_modules,
+                "resolved_blocktt_rank": blocktt_rank,
+                "train_bias": train_bias,
+                "run_dir": run_name,
+            }
+        )
 
     # Load dataset and tokenizer
-    train_dataset = load_dataset("qwedsacf/competition_math", split=f"train[:7500]")
-    val_dataset = load_dataset("qwedsacf/competition_math", split=f"train[-5000:]")
+    train_dataset = load_dataset("qwedsacf/competition_math", split="train[:7500]")
+    val_dataset = load_dataset("qwedsacf/competition_math", split="train[-5000:]")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if tokenizer.pad_token_id == None:
+    if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Load prompt template
@@ -213,57 +285,71 @@ def main():
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
 
-    # generate util for calling vllm
-    def generate(
-        prompts: list[str], vllm_model_id: str, temperature=0, responses_per_prompt=1
-    ):
+    # Load model
+    device = "cuda:0"
+    model_kwargs = dict(
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
+        use_cache=False,
+        device_map=device,
+    )
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+
+    converted_modules = convert_linear_to_btt(
+        model,
+        btt_rank=blocktt_rank,
+        decomp_mode=args.decomp_mode,
+        init_mode="default",
+        include_names=target_modules,
+        skip_names=("lm_head",),
+        lr_act=False,
+    )
+    stats = configure_blocktt_trainability(model, train_bias=train_bias)
+    if stats["num_btt_layers"] == 0:
+        raise ValueError("No layers were converted to BTT; check --blocktt-type selection.")
+
+    trainable_params = stats["trainable_params"]
+    print(f"Converted modules: {len(converted_modules)}")
+    print(
+        f"Trainable params: {stats['trainable_param_count']:,} / "
+        f"{stats['total_param_count']:,} "
+        f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
+    )
+    print(
+        f"Tuned cores: left={stats['tuned_left_cores']}, "
+        f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
+    )
+
+    # vLLM rollout engine
+    vllm_model = LLM(
+        model=args.model_id,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.4,
+        max_model_len=2048,
+        max_num_batched_tokens=4096,
+        logprobs_mode="processed_logprobs",
+    )
+
+    # generate util for vllm
+    def generate(prompts: list[str], hf_model: torch.nn.Module, temperature=0, responses_per_prompt=1):
         """
         takes in a list of prompts list[str]
         and returns a list of outputs list[str]
         """
-        api_url = f"{args.vllm_url}/v1/completions"
-        headers = {"Content-Type": "application/json"}
+        weight_tuples = export_weights_for_vllm(hf_model)
+        vllm_internal_model = (
+            vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
+        )
+        vllm_internal_model.load_weights(weight_tuples)
 
-        payload = {
-            "model": vllm_model_id,
-            "prompt": prompts,
-            "max_tokens": 1024,
-            "temperature": temperature,
-            "n": responses_per_prompt,
-        }
+        sampling_params = SamplingParams(
+            max_tokens=1024,
+            temperature=temperature,
+            n=responses_per_prompt,
+        )
 
-        response = requests.post(api_url, headers=headers, json=payload)
-        response.raise_for_status()
-        result = response.json()
-
-        outputs = [choice["text"] for choice in result["choices"]]
-        return outputs
-
-    # lora needs to be loaded onto
-    loaded_loras = []
-
-    def load_lora(lora_name):
-        if lora_name in loaded_loras:
-            return
-        api_url = f"{args.vllm_url}/v1/load_lora_adapter"
-        headers = {"Content-Type": "application/json"}
-
-        lora_path = str(Path.cwd() / lora_name)
-
-        payload = {
-            "lora_name": lora_name,
-            "lora_path": lora_path,
-        }
-
-        response = requests.post(api_url, headers=headers, json=payload)
-        response.raise_for_status()
-        loaded_loras.append(lora_name)
-
-    def save_lora(model, step):
-        lora_name = f"{run_name}/step={step}"
-        if not os.path.exists(lora_name):
-            model.save_pretrained(lora_name)
-        return lora_name
+        outputs = vllm_model.generate(prompts, sampling_params)
+        return [o.text for output in outputs for o in output.outputs]
 
     def tokenize_prompt_and_output(
         prompt_strs: list[str],
@@ -282,14 +368,14 @@ def main():
         full = []
         max_len = 0
 
-        for i in range(len(prompt_t)):
-            row_len = len(prompt_t[i]) + len(output_t[i])
+        for j in range(len(prompt_t)):
+            row_len = len(prompt_t[j]) + len(output_t[j])
             max_len = max(max_len, row_len)
 
-        for i in range(len(prompt_t)):
-            padding_size = max_len - len(prompt_t[i]) - len(output_t[i])
+        for j in range(len(prompt_t)):
+            padding_size = max_len - len(prompt_t[j]) - len(output_t[j])
             padding = [tokenizer.pad_token_id] * padding_size
-            row = torch.tensor(prompt_t[i] + output_t[i] + padding, dtype=torch.long)
+            row = torch.tensor(prompt_t[j] + output_t[j] + padding, dtype=torch.long)
             full.append(row.unsqueeze(0))
 
         f2 = torch.cat(full)
@@ -297,9 +383,9 @@ def main():
         labels = f2[:, 1:]
 
         response_mask = torch.zeros(len(prompt_strs), max_len - 1)
-        for i in range(len(prompt_t)):
+        for j in range(len(prompt_t)):
             response_mask[
-                i, len(prompt_t[i]) - 1 : len(prompt_t[i]) + len(output_t[i]) - 1
+                j, len(prompt_t[j]) - 1 : len(prompt_t[j]) + len(output_t[j]) - 1
             ] = 1
         return {
             "input_ids": input_ids,
@@ -311,46 +397,41 @@ def main():
         model: torch.nn.Module,
         input_ids: torch.Tensor,
         labels: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         logits = model(input_ids).logits
         z = logits - logits.max(dim=-1, keepdim=True).values
         exp_z = torch.exp(z)
         denom = exp_z.sum(dim=-1, keepdim=True)
-        p = exp_z / denom
         logprobs = z - torch.log(denom)
         logprobs_for_label = torch.gather(
             logprobs, dim=-1, index=labels.unsqueeze(-1)
         ).squeeze(-1)
         return logprobs_for_label
 
-    def eval_model(model, step):
-        lora_name = save_lora(model, step)
-        load_lora(lora_name)
-
+    def eval_model(model: torch.nn.Module, step: int):
         val_prompts = val_dataset[:1000]["prompt"]
 
         eval_start = time.time()
-        outputs = generate(val_prompts, lora_name, temperature=0)
+        outputs = generate(val_prompts, model, temperature=0)
         eval_time = time.time() - eval_start
 
         correct = 0
         idx_correct = []
         idx_wrong = []
 
-        for i in range(len(outputs)):
-            correct_answer = val_dataset[i]["answer"]
-            generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
+        for j in range(len(outputs)):
+            correct_answer = val_dataset[j]["answer"]
+            generated_answer = remove_boxed(last_boxed_only_string(outputs[j]))
 
-            if generated_answer != None and is_equiv(generated_answer, correct_answer):
+            if generated_answer is not None and is_equiv(generated_answer, correct_answer):
                 correct += 1
-                idx_correct.append(i)
+                idx_correct.append(j)
             else:
-                idx_wrong.append(i)
+                idx_wrong.append(j)
 
         accuracy = correct / len(outputs)
         print(f"step={step}, correct: {correct} / {len(outputs)} ({accuracy:.2%})")
 
-        # Log to wandb
         if not args.disable_wandb:
             wandb.log(
                 {
@@ -364,33 +445,13 @@ def main():
 
         return correct, idx_correct, idx_wrong
 
-    device = "cuda:0"
-
-    # Load model
-    model_kwargs = dict(
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        use_cache=False,
-        device_map=device,
-    )
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
-
-    # Setup LoRA
-    peft_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=32,
-        target_modules=args.lora_target_modules,
-    )
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
-
     # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
     # Training loop
     print("Starting initial evaluation...")
     model = model.to(device)
-    c, ic, iw = eval_model(model, 0)
+    eval_model(model, 0)
     model.train()
 
     for i in range(args.n_grpo_steps):
@@ -401,15 +462,11 @@ def main():
         )
         batch = train_dataset[sample_indices]
 
-        # Save the current lora so vllm can use it
-        vllm_model_id = save_lora(model, step=i)
-        load_lora(vllm_model_id)
-
         # Generate rollouts
         generation_start = time.time()
         outputs = generate(
             batch["prompt"],
-            vllm_model_id=vllm_model_id,
+            model,
             temperature=1,
             responses_per_prompt=args.group_size,
         )
@@ -420,8 +477,8 @@ def main():
 
         # Compute advantages
         raw_reward = [
-            a != None and is_equiv(a, batch["answer"][i // args.group_size])
-            for i, a in enumerate(generated_answers)
+            answer is not None and is_equiv(answer, batch["answer"][j // args.group_size])
+            for j, answer in enumerate(generated_answers)
         ]
         raw_reward_tensor = torch.tensor(raw_reward, dtype=torch.float).reshape(
             (args.n_prompts_per_step, args.group_size)
@@ -508,7 +565,7 @@ def main():
                 loss.backward()
 
                 if (b + 1) % args.gradient_accumulation_steps == 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
                     optimizer.zero_grad()
@@ -569,11 +626,11 @@ def main():
             eval_model(model, i + 1)
 
     if args.enable_save_ckpt:
-        ckpt_dir = os.path.join(run_name, "final_ckpt")
-        print(f"Saving model checkpoint to {ckpt_dir}")
-        model.save_pretrained(ckpt_dir)
-        tokenizer.save_pretrained(ckpt_dir)
-        print(f"Checkpoint saved to {ckpt_dir}")
+        save_dir = os.path.join(run_name, "final_ckpt")
+        print(f"Saving model checkpoint to {save_dir}")
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        print(f"Checkpoint saved to {save_dir}")
     else:
         print("Final checkpoint save disabled (--enable-save-ckpt not set).")
 

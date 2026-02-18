@@ -87,14 +87,14 @@ We observe that LoRA fine tuning can match the performance of full fine tuning, 
 Quickstart:
 ```
 uv sync # install dependencies
-CUDA_VISIBLE_DEVICES=0 uv run sft_lora.py --lr 2e-4 --lora-rank 1 --lora-type all --no-wandb
+CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode lora --lr 2e-4 --lora-rank 1 --lora-type all --no-wandb
 ```
 
 I ran my experiments on Azure NC H100 instances which are 2xH100 NVL nodes. Each device has 94 GB memory so you may need to adjust parameters or add gradient checkpointing if running on a lower memory device. All of my experiments were done on a single device.
 
 training scripts:
-- `sft_full.py`: SFT training script for full fine tuning
-- `sft_lora.py`: SFT training script for LoRA fine tuning
+- `run_sft.py`: unified SFT training script (`--train-mode full|lora|blocktt`)
+- `sft_full.py`, `sft_lora.py`, `sft_blocktt.py`: compatibility wrappers around `run_sft.py`
 - `rl_full.py`: RL training script for full fine tuning
 - `rl_lora.py`: RL training script for LoRA fine tuning
 

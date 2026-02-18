@@ -90,6 +90,11 @@ def parse_args():
         default=42,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--enable-save-ckpt",
+        action="store_true",
+        help="Save final checkpoint after training (default: disabled)",
+    )
 
     # Wandb configuration
     parser.add_argument(
@@ -123,6 +128,7 @@ def main():
     print(f"Training configuration:")
     print(f"  Model ID: {args.model_id}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  Save checkpoint: {'enabled' if args.enable_save_ckpt else 'disabled'}")
     print(f"  W&B logging: {'enabled' if not args.disable_wandb else 'disabled'}")
     print()
 
@@ -498,6 +504,15 @@ def main():
 
         if (i + 1) % 5 == 0:
             eval_model(model, i + 1)
+
+    if args.enable_save_ckpt:
+        ckpt_dir = os.path.join(run_name, "final_ckpt")
+        print(f"Saving model checkpoint to {ckpt_dir}")
+        model.save_pretrained(ckpt_dir)
+        tokenizer.save_pretrained(ckpt_dir)
+        print(f"Checkpoint saved to {ckpt_dir}")
+    else:
+        print("Final checkpoint save disabled (--enable-save-ckpt not set).")
 
     if not args.disable_wandb:
         wandb.finish()
