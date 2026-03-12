@@ -4,7 +4,7 @@ in another terminal, install vllm and then run the following commands
 ```
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora --max-lora-rank 64
 ```
 
 then run this training script after the vllm instance is set up

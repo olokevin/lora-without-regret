@@ -5,7 +5,7 @@ import numpy as np
 import warnings
 
 
-VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split"}
+VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
 
 
 def _closest_factor_pair(d):
@@ -46,10 +46,10 @@ def resolve_blocktt_s_merged_to(train_position, s_merged_to=None, left_size=None
 
     if s_merged_to not in VALID_S_MERGED_TO:
         raise ValueError(
-            "s_merged_to must be one of: frozen, trainable, output, input, split"
+            "s_merged_to must be one of: frozen, trainable, output, input, split, keep"
         )
 
-    if s_merged_to in {"output", "input", "split"}:
+    if s_merged_to in {"output", "input", "split", "keep"}:
         return s_merged_to
 
     if left_size is None or right_size is None:
@@ -184,6 +184,8 @@ def configure_blocktt_trainability(model, train_bias=True, train_position="small
 
         module.btt_l.requires_grad = train_left
         module.btt_r.requires_grad = train_right
+        if module.btt_s is not None:
+            module.btt_s.requires_grad = False
         tuned_left_cores += int(train_left)
         tuned_right_cores += int(train_right)
 
@@ -370,6 +372,7 @@ class BTTLayer(nn.Module):
         self.btt_l.btt_n = self.n
         self.btt_l.btt_m = self.m
         self.btt_l.btt_a = self.a
+        self.register_parameter("btt_s", None)
 
         if bias == False:
             self.register_parameter("bias", None)
@@ -451,7 +454,20 @@ class BTTLayer(nn.Module):
         vh_used = Vh[:, :use_rank, :].to(dtype=param_dtype)
         s_used = torch.clamp(S[:, :use_rank], min=0).to(dtype=param_dtype)
 
-        if merge_target == "split":
+        if merge_target == "keep":
+            core_l[:, :, :use_rank] = u_used
+            core_r[:, :use_rank, :] = vh_used
+            s_keep = torch.zeros(
+                self.m * self.n,
+                self.rank,
+                device=weight.device,
+                dtype=param_dtype,
+            )
+            s_keep[:, :use_rank] = s_used
+            self.btt_s = nn.Parameter(
+                s_keep.reshape(self.m, self.n, self.rank), requires_grad=False
+            )
+        elif merge_target == "split":
             sqrt_s = torch.sqrt(s_used)
             core_l[:, :, :use_rank] = u_used * sqrt_s.unsqueeze(1)
             core_r[:, :use_rank, :] = sqrt_s.unsqueeze(-1) * vh_used
@@ -461,6 +477,8 @@ class BTTLayer(nn.Module):
         else:
             core_l[:, :, :use_rank] = u_used
             core_r[:, :use_rank, :] = s_used.unsqueeze(-1) * vh_used
+        if merge_target != "keep":
+            self.btt_s = None
 
         core_l = core_l.reshape(self.m, self.n, self.a, self.rank)
         core_r = core_r.reshape(self.m, self.n, self.rank, self.b)
@@ -494,6 +512,8 @@ class BTTLayer(nn.Module):
         # W[m, a, n, b] = sum_r btt_l[m, n, r, a] * btt_r[m, n, r, b]
         r = self.btt_r.reshape(self.n, self.b, self.m, self.rank).permute(2, 0, 3, 1)
         l = self.btt_l.reshape(self.m, self.n, self.rank, self.a)
+        if self.btt_s is not None:
+            l = l * self.btt_s.unsqueeze(-1)
         w_blocks = torch.einsum("mnra,mnrb->mnab", l, r)
         return w_blocks.permute(0, 2, 1, 3).reshape(self.out_features, self.in_features)
 
@@ -524,9 +544,15 @@ class BTTLayer(nn.Module):
                 inner = self.act_fn(inner)
 
         # Step 2: (m, B, n*r) @ (m, n*r, a) -> (m, B, a)
+        btt_l = self.btt_l
+        if self.btt_s is not None:
+            btt_l = (
+                self.btt_l.reshape(self.m, self.n, self.rank, self.a)
+                * self.btt_s.unsqueeze(-1)
+            ).reshape(self.m, self.rank * self.n, self.a)
         out = torch.bmm(
             inner.reshape(self.m, batch_n, self.rank * self.n),
-            self.btt_l,
+            btt_l,
         )
         out = out.permute(1, 0, 2).contiguous().reshape(
             *orig_shape[:-1], self.out_features

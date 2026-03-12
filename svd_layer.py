@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split"}
+VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
 
 
 def resolve_svd_s_merged_to(train_position, s_merged_to=None):
@@ -16,10 +16,10 @@ def resolve_svd_s_merged_to(train_position, s_merged_to=None):
 
     if s_merged_to not in VALID_S_MERGED_TO:
         raise ValueError(
-            "s_merged_to must be one of: frozen, trainable, output, input, split"
+            "s_merged_to must be one of: frozen, trainable, output, input, split, keep"
         )
 
-    if s_merged_to in {"output", "input", "split"}:
+    if s_merged_to in {"output", "input", "split", "keep"}:
         return s_merged_to
 
     if s_merged_to == "trainable":
@@ -42,6 +42,7 @@ class SVDLayer(nn.Module):
 
         self.svd_a = nn.Parameter(torch.empty(out_features, self.rank))
         self.svd_b = nn.Parameter(torch.empty(self.rank, in_features))
+        self.register_parameter("svd_s", None)
 
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
@@ -75,7 +76,17 @@ class SVDLayer(nn.Module):
             train_position=train_position,
             s_merged_to=s_merged_to,
         )
-        if merge_target == "split":
+        if merge_target == "keep":
+            a = u
+            b = vh
+            s_keep = torch.ones(
+                self.rank,
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+            s_keep[: s.shape[0]] = s.to(device=weight.device, dtype=weight.dtype)
+            self.svd_s = nn.Parameter(s_keep, requires_grad=False)
+        elif merge_target == "split":
             s_sqrt = torch.sqrt(s)
             a = u * s_sqrt.unsqueeze(0)
             b = s_sqrt.unsqueeze(1) * vh
@@ -85,6 +96,8 @@ class SVDLayer(nn.Module):
         else:
             a = u
             b = s.unsqueeze(1) * vh
+        if merge_target != "keep":
+            self.svd_s = None
 
         self.svd_a.copy_(a.to(device=weight.device, dtype=weight.dtype))
         self.svd_b.copy_(b.to(device=weight.device, dtype=weight.dtype))
@@ -92,6 +105,8 @@ class SVDLayer(nn.Module):
             self.bias.copy_(bias.to(device=weight.device, dtype=weight.dtype))
 
     def materialize_dense_weight(self):
+        if self.svd_s is not None:
+            return (self.svd_a * self.svd_s.unsqueeze(0)) @ self.svd_b
         return self.svd_a @ self.svd_b
 
     def forward(self, x):
@@ -188,6 +203,8 @@ def configure_svd_trainability(model, train_position="output", train_bias=True):
             module.svd_a.requires_grad = False
             module.svd_b.requires_grad = True
             tuned_input_cores += 1
+        if module.svd_s is not None:
+            module.svd_s.requires_grad = False
 
         if module.bias is not None:
             module.bias.requires_grad = train_bias

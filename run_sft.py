@@ -139,10 +139,10 @@ def parse_args(argv=None):
         "--s-merged-to",
         type=str,
         default=None,
-        choices=["frozen", "trainable", "output", "input", "split"],
+        choices=["frozen", "trainable", "output", "input", "split", "keep"],
         help=(
             "Where to merge S during SVD init for svd/blocktt: "
-            "frozen, trainable, output, input, or split"
+            "frozen, trainable, output, input, split, or keep"
         ),
     )
 

@@ -9,8 +9,14 @@
 # BlockTT constraint: with --train-position both, --s-merged-to frozen/trainable is invalid.
 # BlockTT side map: output -> btt_l, input -> btt_r
 
-# For TRAIN_MODE=lora:
-# - run_rl.py uses external vLLM HTTP if VLLM_URL is reachable
+# For LORA: 
+# - this script requires a vllm instance to be run on the same node with --enable-lora flag
+# - in another terminal, install vllm and then run the following commands
+# ```
+# export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+# source .venv/bin/activate
+# CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora --max-lora-rank 64
+# ```
 # - otherwise it falls back to local in-process vLLM rollout (no vllm serve)
 
 
@@ -145,15 +151,27 @@ run_blocktt()
 
 run_sequential()
 {
+  ### baseline
   # LR=1e-5 run_full
-  # LR=8e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=split run_blocktt
+  # LR=8e-5 LORA_RANK=64 run_lora
+
+  ### input one block ablation
+  # LR=1e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=split run_blocktt
   # LR=8e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
   # LR=8e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
 
-  LR=8e-5 LORA_RANK=64 run_lora
-  LR=8e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen OPTIMIZER=muon run_blocktt
-  LR=1e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=split run_blocktt
-  LR=8e-5 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  ### output one block ablation
+  # LR=8e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+  # LR=1e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=split run_blocktt
+  # LR=1e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
+
+
+  ### muon ablation
+  LR=1e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
+  LR=1e-3 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
+  LR=1e-3 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+  LR=1e-2 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+
 }
 
 
