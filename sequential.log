@@ -1,0 +1,212 @@
+/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+wandb: Currently logged in as: yequan_zhao (yequan_zhao-university-of-california-santa-barbara) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run kz9xbnes
+wandb: Tracking run with wandb version 0.22.2
+wandb: Run data is saved locally in runs/12/wandb/run-20260312_105142-kz9xbnes
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run lora-lr_8e-5-rank_64
+wandb: ⭐️ View project at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL
+wandb: 🚀 View run at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL/runs/kz9xbnes
+`torch_dtype` is deprecated! Use `dtype` instead!
+Training configuration:
+  Train mode: lora
+  Model ID: Qwen/Qwen3-1.7B
+  Learning rate: 8e-05
+  GRPO steps: 50
+  Prompts per step: 32
+  Group size: 8
+  Epochs per step: 1
+  Micro batch size: 2
+  Gradient accumulation: 128
+  LoRA rank: 64
+  Trainable type: all
+  Target modules: ['gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj']
+  Rollout backend: local_inproc
+  vLLM URL: http://localhost:8000
+  Save checkpoint: disabled
+  W&B logging: enabled
+
+Created: runs/12
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  1.74it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  3.25it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  2.87it/s]
+trainable params: 69,730,304 || all params: 1,790,305,280 || trainable%: 3.8949
+INFO 03-12 10:51:50 [__init__.py:216] Automatically detected platform cuda.
+INFO 03-12 10:51:50 [utils.py:328] non-default args: {'max_model_len': 2048, 'gpu_memory_utilization': 0.4, 'max_num_batched_tokens': 4096, 'logprobs_mode': 'processed_logprobs', 'disable_log_stats': True, 'model': 'Qwen/Qwen3-1.7B'}
+INFO 03-12 10:51:56 [__init__.py:742] Resolved architecture: Qwen3ForCausalLM
+INFO 03-12 10:51:56 [__init__.py:1815] Using max model len 2048
+INFO 03-12 10:51:56 [llm_engine.py:221] Initializing a V0 LLM engine (v0.10.2) with config: model='Qwen/Qwen3-1.7B', speculative_config=None, tokenizer='Qwen/Qwen3-1.7B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, kv_cache_dtype=auto, device_config=cuda, decoding_config=DecodingConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_backend=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=None, served_model_name=Qwen/Qwen3-1.7B, enable_prefix_caching=None, chunked_prefill_enabled=False, use_async_output_proc=True, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":[],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":0,"cudagraph_capture_sizes":[256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"pass_config":{},"max_capture_size":256,"local_cache_dir":null}, use_cached_outputs=False, 
+INFO 03-12 10:51:58 [cuda.py:456] Using Flash Attention backend.
+[W312 10:51:58.760348974 ProcessGroupNCCL.cpp:981] Warning: TORCH_NCCL_AVOID_RECORD_STREAMS is the default now, this environment variable is thus deprecated. (function operator())
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+INFO 03-12 10:51:58 [parallel_state.py:1165] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+INFO 03-12 10:51:58 [model_runner.py:1051] Starting to load model Qwen/Qwen3-1.7B...
+INFO 03-12 10:51:59 [weight_utils.py:348] Using model weights format ['*.safetensors']
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00,  4.68it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00,  4.67it/s]
+
+INFO 03-12 10:52:00 [default_loader.py:268] Loading weights took 0.56 seconds
+INFO 03-12 10:52:00 [model_runner.py:1083] Model loading took 3.2152 GiB and 1.033507 seconds
+INFO 03-12 10:52:01 [worker.py:290] Memory profiling takes 0.49 seconds
+INFO 03-12 10:52:01 [worker.py:290] the current vLLM instance can use total_gpu_memory (93.10GiB) x gpu_memory_utilization (0.40) = 37.24GiB
+INFO 03-12 10:52:01 [worker.py:290] model weights take 3.22GiB; non_torch_memory takes 0.07GiB; PyTorch activation peak memory takes 1.42GiB; the rest of the memory reserved for KV Cache is 32.53GiB.
+INFO 03-12 10:52:01 [executor_base.py:114] # cuda blocks: 19036, # CPU blocks: 2340
+INFO 03-12 10:52:01 [executor_base.py:119] Maximum concurrency for 2048 tokens per request: 148.72x
+INFO 03-12 10:52:04 [model_runner.py:1355] Capturing cudagraphs for decoding. This may lead to unexpected consequences if the model is not static. To run the model in eager mode, set 'enforce_eager=True' or use '--enforce-eager' in the CLI. If out-of-memory error occurs during cudagraph capture, consider decreasing `gpu_memory_utilization` or switching to eager mode. You can also reduce the `max_num_seqs` as needed to decrease memory usage.
+Capturing CUDA graph shapes:   0%|          | 0/35 [00:00<?, ?it/s]Capturing CUDA graph shapes:   3%|▎         | 1/35 [00:00<00:22,  1.48it/s]Capturing CUDA graph shapes:   6%|▌         | 2/35 [00:01<00:20,  1.60it/s]Capturing CUDA graph shapes:   9%|▊         | 3/35 [00:01<00:19,  1.65it/s]Capturing CUDA graph shapes:  11%|█▏        | 4/35 [00:02<00:18,  1.67it/s]Capturing CUDA graph shapes:  14%|█▍        | 5/35 [00:03<00:18,  1.66it/s]Capturing CUDA graph shapes:  17%|█▋        | 6/35 [00:03<00:17,  1.66it/s]Capturing CUDA graph shapes:  20%|██        | 7/35 [00:04<00:16,  1.68it/s]Capturing CUDA graph shapes:  23%|██▎       | 8/35 [00:04<00:15,  1.69it/s]Capturing CUDA graph shapes:  26%|██▌       | 9/35 [00:05<00:15,  1.68it/s]Capturing CUDA graph shapes:  29%|██▊       | 10/35 [00:05<00:14,  1.69it/s]Capturing CUDA graph shapes:  31%|███▏      | 11/35 [00:06<00:14,  1.70it/s]Capturing CUDA graph shapes:  34%|███▍      | 12/35 [00:07<00:13,  1.70it/s]Capturing CUDA graph shapes:  37%|███▋      | 13/35 [00:07<00:12,  1.70it/s]Capturing CUDA graph shapes:  40%|████      | 14/35 [00:08<00:12,  1.70it/s]Capturing CUDA graph shapes:  43%|████▎     | 15/35 [00:08<00:11,  1.70it/s]Capturing CUDA graph shapes:  46%|████▌     | 16/35 [00:09<00:11,  1.71it/s]Capturing CUDA graph shapes:  49%|████▊     | 17/35 [00:10<00:10,  1.71it/s]Capturing CUDA graph shapes:  51%|█████▏    | 18/35 [00:10<00:10,  1.70it/s]Capturing CUDA graph shapes:  54%|█████▍    | 19/35 [00:11<00:09,  1.68it/s]Capturing CUDA graph shapes:  57%|█████▋    | 20/35 [00:11<00:08,  1.67it/s]Capturing CUDA graph shapes:  60%|██████    | 21/35 [00:12<00:08,  1.69it/s]Capturing CUDA graph shapes:  63%|██████▎   | 22/35 [00:13<00:07,  1.70it/s]Capturing CUDA graph shapes:  66%|██████▌   | 23/35 [00:13<00:07,  1.70it/s]Capturing CUDA graph shapes:  69%|██████▊   | 24/35 [00:14<00:06,  1.70it/s]Capturing CUDA graph shapes:  71%|███████▏  | 25/35 [00:14<00:05,  1.71it/s]Capturing CUDA graph shapes:  74%|███████▍  | 26/35 [00:15<00:05,  1.69it/s]Capturing CUDA graph shapes:  77%|███████▋  | 27/35 [00:16<00:04,  1.67it/s]Capturing CUDA graph shapes:  80%|████████  | 28/35 [00:16<00:04,  1.68it/s]Capturing CUDA graph shapes:  83%|████████▎ | 29/35 [00:17<00:03,  1.68it/s]Capturing CUDA graph shapes:  86%|████████▌ | 30/35 [00:17<00:02,  1.69it/s]Capturing CUDA graph shapes:  89%|████████▊ | 31/35 [00:18<00:02,  1.69it/s]Capturing CUDA graph shapes:  91%|█████████▏| 32/35 [00:18<00:01,  1.71it/s]Capturing CUDA graph shapes:  94%|█████████▍| 33/35 [00:19<00:01,  1.72it/s]Capturing CUDA graph shapes:  97%|█████████▋| 34/35 [00:20<00:00,  1.72it/s]Capturing CUDA graph shapes: 100%|██████████| 35/35 [00:20<00:00,  1.73it/s]Capturing CUDA graph shapes: 100%|██████████| 35/35 [00:20<00:00,  1.69it/s]
+INFO 03-12 10:52:25 [model_runner.py:1507] Graph capturing finished in 21 secs, took 0.30 GiB
+INFO 03-12 10:52:25 [worker.py:467] Free memory on device (83.75/93.1 GiB) on startup. Desired GPU memory utilization is (0.4, 37.24 GiB). Actual usage is 3.22 GiB for weight, 1.42 GiB for peak activation, 0.07 GiB for non-torch memory, and 0.3 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=34453073510` to fit into requested memory, or `--kv-cache-memory=84394493952` to fully utilize gpu memory. Current kv cache memory in use is 34931224166 bytes.
+INFO 03-12 10:52:25 [llm_engine.py:420] init engine (profile, create kv cache, warmup model) took 25.00 seconds
+INFO 03-12 10:52:25 [llm.py:295] Supported_tasks: ['generate']
+INFO 03-12 10:52:25 [__init__.py:36] No IOProcessor plugins requested by the model
+Starting initial evaluation...
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/run_rl.py", line 1073, in <module>
+[rank0]:     main()
+[rank0]:     ~~~~^^
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/run_rl.py", line 907, in main
+[rank0]:     eval_model(0)
+[rank0]:     ~~~~~~~~~~^^^
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/run_rl.py", line 881, in eval_model
+[rank0]:     outputs = generate_for_eval(val_prompts, step)
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/run_rl.py", line 623, in generate_for_eval
+[rank0]:     return generate(prompts, temperature=0, responses_per_prompt=1)
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/run_rl.py", line 605, in generate
+[rank0]:     vllm_internal_model.load_weights(weight_tuples)
+[rank0]:     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/vllm/model_executor/models/qwen3.py", line 344, in load_weights
+[rank0]:     return loader.load_weights(weights)
+[rank0]:            ~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/vllm/model_executor/models/utils.py", line 291, in load_weights
+[rank0]:     autoloaded_weights = set(self._load_module("", self.module, weights))
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/vllm/model_executor/models/utils.py", line 249, in _load_module
+[rank0]:     yield from self._load_module(prefix,
+[rank0]:                                  child_modules[child_prefix],
+[rank0]:                                  child_weights)
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/vllm/model_executor/models/utils.py", line 222, in _load_module
+[rank0]:     loaded_params = module_load_weights(weights)
+[rank0]:   File "/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/vllm/model_executor/models/qwen2.py", line 420, in load_weights
+[rank0]:     param = params_dict[name]
+[rank0]:             ~~~~~~~~~~~^^^^^^
+[rank0]: KeyError: 'layers.0.self_attn.qkv_proj.base_layer.weight'
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mlora-lr_8e-5-rank_64[0m at: [34m[0m
+[rank0]:[W312 10:52:27.174481686 ProcessGroupNCCL.cpp:1538] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+wandb: Currently logged in as: yequan_zhao (yequan_zhao-university-of-california-santa-barbara) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run qxkqg3um
+wandb: Tracking run with wandb version 0.22.2
+wandb: Run data is saved locally in runs/13/wandb/run-20260312_105234-qxkqg3um
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run blocktt-lr_1e-5-input_one_block-s_to_split-train_both
+wandb: ⭐️ View project at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL
+wandb: 🚀 View run at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL/runs/qxkqg3um
+`torch_dtype` is deprecated! Use `dtype` instead!
+Training configuration:
+  Train mode: blocktt
+  Model ID: Qwen/Qwen3-1.7B
+  Learning rate: 1e-05
+  GRPO steps: 50
+  Prompts per step: 32
+  Group size: 8
+  Epochs per step: 1
+  Micro batch size: 2
+  Gradient accumulation: 128
+  BlockTT rank: full
+  Trainable type: all
+  Decomp mode: input_one_block
+  Train position: both
+  S merged to: split
+  Train BTT bias: True
+  Target modules: ('gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj')
+  Save checkpoint: disabled
+  W&B logging: enabled
+
+Created: runs/13
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  1.72it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  3.23it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  2.85it/s]
+Converting 196 Linear layers to BTT (rank=full, decomp_mode=input_one_block, init_mode=default, forward_impl=einsum)
+Finished Linear->BTT conversion
+Converted modules: 196
+Trainable params: 1,455,161,344 / 1,766,450,176 (82.3777%)
+Tuned cores: left=196, right=196, biases=0
+INFO 03-12 10:53:02 [__init__.py:216] Automatically detected platform cuda.
+INFO 03-12 10:53:03 [utils.py:328] non-default args: {'max_model_len': 2048, 'gpu_memory_utilization': 0.4, 'max_num_batched_tokens': 4096, 'logprobs_mode': 'processed_logprobs', 'disable_log_stats': True, 'model': 'Qwen/Qwen3-1.7B'}
+INFO 03-12 10:53:09 [__init__.py:742] Resolved architecture: Qwen3ForCausalLM
+INFO 03-12 10:53:09 [__init__.py:1815] Using max model len 2048
+INFO 03-12 10:53:09 [llm_engine.py:221] Initializing a V0 LLM engine (v0.10.2) with config: model='Qwen/Qwen3-1.7B', speculative_config=None, tokenizer='Qwen/Qwen3-1.7B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, kv_cache_dtype=auto, device_config=cuda, decoding_config=DecodingConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_backend=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=None, served_model_name=Qwen/Qwen3-1.7B, enable_prefix_caching=None, chunked_prefill_enabled=False, use_async_output_proc=True, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":[],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":0,"cudagraph_capture_sizes":[256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"pass_config":{},"max_capture_size":256,"local_cache_dir":null}, use_cached_outputs=False, 
+INFO 03-12 10:53:10 [cuda.py:456] Using Flash Attention backend.
+[W312 10:53:11.183830229 ProcessGroupNCCL.cpp:981] Warning: TORCH_NCCL_AVOID_RECORD_STREAMS is the default now, this environment variable is thus deprecated. (function operator())
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+INFO 03-12 10:53:11 [parallel_state.py:1165] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+INFO 03-12 10:53:11 [model_runner.py:1051] Starting to load model Qwen/Qwen3-1.7B...
+INFO 03-12 10:53:11 [weight_utils.py:348] Using model weights format ['*.safetensors']
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00,  3.61it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:00<00:00,  3.60it/s]
+
+INFO 03-12 10:53:12 [default_loader.py:268] Loading weights took 0.72 seconds
+INFO 03-12 10:53:13 [model_runner.py:1083] Model loading took 3.2147 GiB and 1.140990 seconds
+INFO 03-12 10:53:14 [worker.py:290] Memory profiling takes 0.70 seconds
+INFO 03-12 10:53:14 [worker.py:290] the current vLLM instance can use total_gpu_memory (93.10GiB) x gpu_memory_utilization (0.40) = 37.24GiB
+INFO 03-12 10:53:14 [worker.py:290] model weights take 3.21GiB; non_torch_memory takes 0.06GiB; PyTorch activation peak memory takes 1.42GiB; the rest of the memory reserved for KV Cache is 32.54GiB.
+INFO 03-12 10:53:15 [executor_base.py:114] # cuda blocks: 19038, # CPU blocks: 2340
+INFO 03-12 10:53:15 [executor_base.py:119] Maximum concurrency for 2048 tokens per request: 148.73x
+INFO 03-12 10:53:18 [model_runner.py:1355] Capturing cudagraphs for decoding. This may lead to unexpected consequences if the model is not static. To run the model in eager mode, set 'enforce_eager=True' or use '--enforce-eager' in the CLI. If out-of-memory error occurs during cudagraph capture, consider decreasing `gpu_memory_utilization` or switching to eager mode. You can also reduce the `max_num_seqs` as needed to decrease memory usage.
+Capturing CUDA graph shapes:   0%|          | 0/35 [00:00<?, ?it/s]Capturing CUDA graph shapes:   3%|▎         | 1/35 [00:00<00:24,  1.37it/s]Capturing CUDA graph shapes:   6%|▌         | 2/35 [00:01<00:21,  1.54it/s]Capturing CUDA graph shapes:   9%|▊         | 3/35 [00:01<00:19,  1.61it/s]Capturing CUDA graph shapes:  11%|█▏        | 4/35 [00:02<00:18,  1.63it/s]Capturing CUDA graph shapes:  14%|█▍        | 5/35 [00:03<00:18,  1.64it/s]Capturing CUDA graph shapes:  17%|█▋        | 6/35 [00:03<00:17,  1.64it/s]Capturing CUDA graph shapes:  20%|██        | 7/35 [00:04<00:17,  1.60it/s]Capturing CUDA graph shapes:  23%|██▎       | 8/35 [00:04<00:16,  1.61it/s]Capturing CUDA graph shapes:  26%|██▌       | 9/35 [00:05<00:15,  1.63it/s]Capturing CUDA graph shapes:  29%|██▊       | 10/35 [00:06<00:15,  1.60it/s]Capturing CUDA graph shapes:  31%|███▏      | 11/35 [00:06<00:14,  1.61it/s]Capturing CUDA graph shapes:  34%|███▍      | 12/35 [00:07<00:14,  1.63it/s]Capturing CUDA graph shapes:  37%|███▋      | 13/35 [00:08<00:13,  1.63it/s]Capturing CUDA graph shapes:  40%|████      | 14/35 [00:08<00:13,  1.61it/s]Capturing CUDA graph shapes:  43%|████▎     | 15/35 [00:09<00:12,  1.62it/s]Capturing CUDA graph shapes:  46%|████▌     | 16/35 [00:09<00:11,  1.64it/s]Capturing CUDA graph shapes:  49%|████▊     | 17/35 [00:10<00:10,  1.64it/s]Capturing CUDA graph shapes:  51%|█████▏    | 18/35 [00:11<00:10,  1.60it/s]Capturing CUDA graph shapes:  54%|█████▍    | 19/35 [00:11<00:09,  1.60it/s]Capturing CUDA graph shapes:  57%|█████▋    | 20/35 [00:12<00:09,  1.62it/s]Capturing CUDA graph shapes:  60%|██████    | 21/35 [00:12<00:08,  1.64it/s]Capturing CUDA graph shapes:  63%|██████▎   | 22/35 [00:13<00:07,  1.65it/s]Capturing CUDA graph shapes:  66%|██████▌   | 23/35 [00:14<00:07,  1.65it/s]Capturing CUDA graph shapes:  69%|██████▊   | 24/35 [00:14<00:06,  1.62it/s]Capturing CUDA graph shapes:  71%|███████▏  | 25/35 [00:15<00:06,  1.63it/s]Capturing CUDA graph shapes:  74%|███████▍  | 26/35 [00:16<00:05,  1.65it/s]Capturing CUDA graph shapes:  77%|███████▋  | 27/35 [00:16<00:04,  1.66it/s]Capturing CUDA graph shapes:  80%|████████  | 28/35 [00:17<00:04,  1.66it/s]Capturing CUDA graph shapes:  83%|████████▎ | 29/35 [00:17<00:03,  1.66it/s]Capturing CUDA graph shapes:  86%|████████▌ | 30/35 [00:18<00:03,  1.66it/s]Capturing CUDA graph shapes:  89%|████████▊ | 31/35 [00:19<00:02,  1.63it/s]Capturing CUDA graph shapes:  91%|█████████▏| 32/35 [00:19<00:01,  1.63it/s]Capturing CUDA graph shapes:  94%|█████████▍| 33/35 [00:20<00:01,  1.65it/s]Capturing CUDA graph shapes:  97%|█████████▋| 34/35 [00:20<00:00,  1.66it/s]Capturing CUDA graph shapes: 100%|██████████| 35/35 [00:21<00:00,  1.66it/s]Capturing CUDA graph shapes: 100%|██████████| 35/35 [00:21<00:00,  1.63it/s]
+INFO 03-12 10:53:39 [model_runner.py:1507] Graph capturing finished in 21 secs, took 0.30 GiB
+INFO 03-12 10:53:39 [worker.py:467] Free memory on device (81.33/93.1 GiB) on startup. Desired GPU memory utilization is (0.4, 37.24 GiB). Actual usage is 3.21 GiB for weight, 1.42 GiB for peak activation, 0.06 GiB for non-torch memory, and 0.3 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=34455694950` to fit into requested memory, or `--kv-cache-memory=81796646912` to fully utilize gpu memory. Current kv cache memory in use is 34935942758 bytes.
+INFO 03-12 10:53:39 [llm_engine.py:420] init engine (profile, create kv cache, warmup model) took 26.32 seconds
+INFO 03-12 10:53:39 [llm.py:295] Supported_tasks: ['generate']
+INFO 03-12 10:53:39 [__init__.py:36] No IOProcessor plugins requested by the model
+Starting initial evaluation...
+Adding requests:   0%|          | 0/1000 [00:00<?, ?it/s]Adding requests:  34%|███▍      | 338/1000 [00:00<00:00, 3370.92it/s]Adding requests:  79%|███████▉  | 793/1000 [00:00<00:00, 4058.23it/s]Adding requests: 100%|██████████| 1000/1000 [00:00<00:00, 4114.68it/s]
+Processed prompts:   0%|          | 0/1000 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:   0%|          | 1/1000 [00:13<3:37:09, 13.04s/it, est. speed input: 4.68 toks/s, output: 53.52 toks/s]Processed prompts:   0%|          | 2/1000 [00:13<1:35:53,  5.77s/it, est. speed input: 9.99 toks/s, output: 103.91 toks/s]Processed prompts:   0%|          | 3/1000 [00:13<53:23,  3.21s/it, est. speed input: 14.11 toks/s, output: 155.45 toks/s] Processed prompts:   0%|          | 4/1000 [00:16<51:27,  3.10s/it, est. speed input: 16.53 toks/s, output: 179.78 toks/s]Processed prompts:   1%|          | 6/1000 [00:19<35:38,  2.15s/it, est. speed input: 20.38 toks/s, output: 249.19 toks/s]Processed prompts:   1%|          | 7/1000 [00:19<26:29,  1.60s/it, est. speed input: 23.74 toks/s, output: 296.26 toks/s]Processed prompts:   1%|          | 9/1000 [00:19<15:25,  1.07it/s, est. speed input: 29.37 toks/s, output: 391.21 toks/s]Processed prompts:   1%|          | 10/1000 [00:19<12:41,  1.30it/s, est. speed input: 32.65 toks/s, output: 435.01 toks/s]Processed prompts:   1%|          | 11/1000 [00:20<11:04,  1.49it/s, est. speed input: 35.57 toks/s, output: 475.24 toks/s]Processed prompts:   1%|          | 12/1000 [00:20<08:44,  1.88it/s, est. speed input: 38.25 toks/s, output: 520.34 toks/s]Processed prompts:   1%|▏         | 13/1000 [00:20<08:13,  2.00it/s, est. speed input: 40.30 toks/s, output: 558.12 toks/s]Processed prompts:   1%|▏         | 14/1000 [00:21<07:25,  2.21it/s, est. speed input: 43.06 toks/s, output: 597.42 toks/s]Processed prompts:   2%|▏         | 15/1000 [00:21<05:49,  2.82it/s, est. speed input: 45.87 toks/s, output: 642.12 toks/s]/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/home/yequan/Project/lora/lora-without-regret/.venv/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+wandb: Currently logged in as: yequan_zhao (yequan_zhao-university-of-california-santa-barbara) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run auvfvvf9
+wandb: Tracking run with wandb version 0.22.2
+wandb: Run data is saved locally in runs/14/wandb/run-20260312_105409-auvfvvf9
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run blocktt-lr_8e-5-input_one_block-s_to_trainable-train_small
+wandb: ⭐️ View project at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL
+wandb: 🚀 View run at https://wandb.ai/yequan_zhao-university-of-california-santa-barbara/qwen3-1_7B-RL/runs/auvfvvf9
+`torch_dtype` is deprecated! Use `dtype` instead!
+Training configuration:
+  Train mode: blocktt
+  Model ID: Qwen/Qwen3-1.7B
+  Learning rate: 8e-05
+  GRPO steps: 50
+  Prompts per step: 32
+  Group size: 8
+  Epochs per step: 1
+  Micro batch size: 2
+  Gradient accumulation: 128
+  BlockTT rank: full
+  Trainable type: all
+  Decomp mode: input_one_block
+  Train position: small
+  S merged to: trainable
+  Train BTT bias: True
+  Target modules: ('gate_proj', 'up_proj', 'down_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj')
+  Save checkpoint: disabled
+  W&B logging: enabled
+
+Created: runs/14
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  1.48it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  2.70it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  2.40it/s]

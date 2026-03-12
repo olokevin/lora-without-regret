@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Global mode selector (outside LR iteration): full | lora | blocktt
+# Global mode selector (outside LR iteration): full | lora | svd | blocktt
 TRAIN_MODE="${TRAIN_MODE:-lora}"
 
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-4B}"
@@ -29,21 +29,31 @@ case "${TRAIN_MODE}" in
   lora)
     MODE_ARGS+=(
       --lora-rank "${LORA_RANK:-64}"
-      --lora-type "${LORA_TYPE:-all}"
+      --trainable-type "${TRAINABLE_TYPE:-all}"
     )
+    run_name="${TRAIN_MODE}—rank_${LORA_RANK:-64}"
+    ;;
+  svd)
+    MODE_ARGS+=(
+      --trainable-type "${TRAINABLE_TYPE:-all}"
+      --train-position "${TRAIN_POSITION:-output}"
+    )
+    run_name="${TRAIN_MODE}—${TRAIN_POSITION:-output}"
     ;;
   blocktt)
     MODE_ARGS+=(
-      --blocktt-type "${BLOCKTT_TYPE:-all}"
+      --trainable-type "${TRAINABLE_TYPE:-all}"
       --decomp-mode "${DECOMP_MODE:-input_one_block}"
+      --train-position "${TRAIN_POSITION:-small}"
       --blocktt-rank "${BLOCKTT_RANK:-full}"
     )
     if [[ "${NO_TRAIN_BIAS:-0}" == "1" ]]; then
       MODE_ARGS+=(--no-train-bias)
     fi
+    run_name="${TRAIN_MODE}—${DECOMP_MODE}—${TRAIN_POSITION:-small}"
     ;;
   *)
-    echo "Unsupported TRAIN_MODE: ${TRAIN_MODE}. Use full|lora|blocktt." >&2
+    echo "Unsupported TRAIN_MODE: ${TRAIN_MODE}. Use full|lora|svd|blocktt." >&2
     exit 1
     ;;
 esac
@@ -69,7 +79,7 @@ echo "  LRs=${LRS[*]}"
 
 for lr in "${LRS[@]}"; do
   safe_lr="${lr//./p}"
-  run_name="${TRAIN_MODE}_lr_${safe_lr}"
+  run_name="${run_name}_lr_${safe_lr}"
   output_dir="${OUTPUT_ROOT}/${TRAIN_MODE}/lr_${safe_lr}"
 
   cmd=(

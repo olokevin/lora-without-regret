@@ -5,7 +5,8 @@ This repository is a compact Python research codebase for reproducing LoRA vs fu
 
 - Top-level training scripts:
   - `run_sft.py` for supervised fine-tuning (SFT) with `--train-mode full|lora|blocktt`
-  - `rl_full.py`, `rl_lora.py` for GRPO-style reinforcement learning (RL)
+  - `run_rl.py` for GRPO-style reinforcement learning (RL) with `--train-mode full|lora|blocktt`
+  - `rl_full.py`, `rl_lora.py`, `rl_blocktt.py` remain available as legacy RL entrypoints
 - Shared utilities: `math_utils.py` (boxed-answer extraction and equivalence checks)
 - Prompt template: `boxed.prompt`
 - Experiment artifacts:
@@ -19,8 +20,9 @@ Keep new training or analysis scripts at repo root unless a clear module split i
 - `uv sync`: install and lock project dependencies.
 - `uv run run_sft.py --train-mode lora --lr 2e-4 --lora-rank 1 --lora-type all --no-wandb`: run a baseline LoRA SFT experiment.
 - `uv run run_sft.py --train-mode full --lr 2.5e-5 --no-wandb`: run full SFT baseline.
-- `uv run rl_lora.py --lr 1e-4 --lora_r 1 --disable_wandb`: run LoRA RL (requires local vLLM server).
-- `uv run rl_full.py --lr 1e-5 --disable_wandb`: run full RL baseline.
+- `uv run run_rl.py --train-mode lora --lr 1e-4 --lora-rank 1 --lora-type all --no-wandb`: run LoRA RL (requires local vLLM server).
+- `uv run run_rl.py --train-mode full --lr 1e-5 --no-wandb`: run full RL baseline.
+- `uv run run_rl.py --train-mode blocktt --lr 1e-4 --blocktt-type all --decomp-mode input_one_block --no-wandb`: run BlockTT RL baseline.
 - `python -m py_compile *.py`: quick syntax sanity check across scripts.
 
 ## Coding Style & Naming Conventions
@@ -35,8 +37,15 @@ No formatter/linter is currently enforced in repo config; keep changes stylistic
 There is no dedicated `tests/` directory yet. For contributions:
 
 - Run `python -m py_compile *.py` before opening a PR.
-- Smoke-test the touched script with a minimal run (typically with `--no-wandb` / `--disable_wandb`).
+- Smoke-test the touched script with a minimal run (typically with `--no-wandb`).
 - When changing reward/data logic, validate against small dataset slices first.
+- For BlockTT/Muon changes, keep canonical BTT layout compatibility:
+  - `btt_r` shape: `(n, b, m * rank)`
+  - `btt_l` shape: `(m, n * rank, a)`
+  - RL rollout export must materialize dense linear weights in `(out_features, in_features)` order.
+- Quick compatibility checks for BlockTT changes:
+  - `python -m py_compile *.py optim/*.py`
+  - `python -m unittest tests/test_btt_pipeline_compat.py`
 
 If adding tests, use `tests/test_<module>.py` naming and focus on deterministic utility logic (`math_utils.py`) before long-running training paths.
 

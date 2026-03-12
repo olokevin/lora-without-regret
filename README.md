@@ -87,16 +87,16 @@ We observe that LoRA fine tuning can match the performance of full fine tuning, 
 Quickstart:
 ```
 uv sync # install dependencies
-CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode lora --lr 2e-4 --lora-rank 1 --lora-type all --no-wandb
+CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode lora --lr 2e-4 --lora-rank 1 --trainable-type all --no-wandb
 ```
 
 I ran my experiments on Azure NC H100 instances which are 2xH100 NVL nodes. Each device has 94 GB memory so you may need to adjust parameters or add gradient checkpointing if running on a lower memory device. All of my experiments were done on a single device.
 
 training scripts:
-- `run_sft.py`: unified SFT training script (`--train-mode full|lora|blocktt`)
-- `sft_full.py`, `sft_lora.py`, `sft_blocktt.py`: compatibility wrappers around `run_sft.py`
-- `rl_full.py`: RL training script for full fine tuning
-- `rl_lora.py`: RL training script for LoRA fine tuning
+- `run_sft.py`: unified SFT training script (`--train-mode full|lora|blocktt|svd`)
+- `sft_full.py`, `sft_lora.py`, `sft_blocktt.py`, `sft_svd.py`: compatibility wrappers around `run_sft.py`
+- `run_rl.py`: unified RL training script (`--train-mode full|lora|blocktt|svd`)
+- `rl_full.py`, `rl_lora.py`, `rl_blocktt.py`: legacy RL scripts
 
 misc:
 - `math_utils.py`: utilities for extracting boxed math answers and comparing equivalence of two math expression strings

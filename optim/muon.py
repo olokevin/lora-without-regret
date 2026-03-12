@@ -6,6 +6,7 @@
 import torch
 from functools import partial
 import math
+import ast
 import warnings
 from .polar_express import PolarExpress, FastApplyPolarExpress
 
@@ -111,14 +112,26 @@ class Muon(torch.optim.Optimizer):
         {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
         lr_adam: Optional learning rate for AdamW-updated parameters.
         If None, AdamW-updated parameters share `lr`.
+        lr_embedding: Optional learning rate for embedding parameters updated by AdamW.
+        If None, embedding parameters share AdamW lr.
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
         adamw_wd: The weight decay for the internal AdamW.
+        norm_method: Optional update normalization method for Muon-style updates.
+        "shape" selects row/col normalization by update shape:
+        m>n -> row, m<n -> col, m==n -> none.
+        norm_layers: "all" or a list of layer-name substrings to gate normalization.
+        cola_ortho_method: "default" uses CoLA LR scaling sqrt(shape[1] / shape[0]);
+        "outin" uses CoLA LR scaling shape[1] / shape[0];
+        "spectron" uses lr/(sigma_a + sigma_b + 1) for CoLA params;
+        "spectron-rms" uses rho-based LR with CoLA factor-shape scaling;
+        "spectron-scale" uses spectron denominator with CoLA factor-shape scaling.
     """
     def __init__(self,
                  named_params,
                  lr=1e-3,
                  lr_adam=None,
+                 lr_embedding=None,
                  weight_decay=0.1,
                  momentum=0.95,
                  nesterov=True,
@@ -130,20 +143,47 @@ class Muon(torch.optim.Optimizer):
                  adamw_eps=1e-8,
                  split_heads=False,
                  nheads=None,
+                 norm_method=None,
+                 norm_layers="all",
                  polar_args={},
                  polar_params=None,
                  structured_ortho_method="mup",
+                 cola_ortho_method="default",
                 ):
         """
         Arguments:
             polar_method: The name of the polar factorization method to use (e.g., "NewtonSchultz", "Keller", "Pole") where PolE = PolarExpress
         """
+        if norm_method is not None:
+            norm_method = norm_method.lower()
+        norm_layers = self._normalize_norm_layers(norm_layers)
+        named_params = list(named_params)
+        allowed_norm_methods = {None, "row", "col", "row-col", "col-row", "shape"}
+        if norm_method not in allowed_norm_methods:
+            raise ValueError(
+                f"Unknown norm_method: {norm_method}. "
+                f"Expected one of {sorted(m for m in allowed_norm_methods if m is not None)} or None."
+            )
+        norm_layers_for_defaults = "all" if norm_layers == "all" else tuple(norm_layers)
         structured_ortho_method = structured_ortho_method.lower()
-        allowed_structured_ortho_methods = {"mup", "svd", "naive"}
+        allowed_structured_ortho_methods = {"mup", "svd", "rms", "naive"}
         if structured_ortho_method not in allowed_structured_ortho_methods:
             raise ValueError(
                 f"Unknown structured_ortho_method: {structured_ortho_method}. "
                 f"Expected one of {sorted(allowed_structured_ortho_methods)}."
+            )
+        cola_ortho_method = cola_ortho_method.lower()
+        allowed_cola_ortho_methods = {
+            "default",
+            "outin",
+            "spectron",
+            "spectron-rms",
+            "spectron-scale",
+        }
+        if cola_ortho_method not in allowed_cola_ortho_methods:
+            raise ValueError(
+                f"Unknown cola_ortho_method: {cola_ortho_method}. "
+                f"Expected one of {sorted(allowed_cola_ortho_methods)}."
             )
         defaults = dict(
                 lr=lr,
@@ -155,84 +195,154 @@ class Muon(torch.optim.Optimizer):
                 nuclear_scaling=nuclear_scaling,
                 adamw_betas=adamw_betas,
                 adamw_eps=adamw_eps,
+                norm_method=norm_method,
+                norm_layers=norm_layers_for_defaults,
                 structured_ortho_method=structured_ortho_method,
+                cola_ortho_method=cola_ortho_method,
         )
-        split_adamw_lr = lr_adam is not None
-        if lr_adam is None:
-            lr_adam = lr
+        adamw_lr = lr if lr_adam is None else lr_adam
+        embedding_lr = adamw_lr if lr_embedding is None else lr_embedding
+        self._param_names_by_id = {}
+        for name, p in named_params:
+            self._param_names_by_id.setdefault(id(p), []).append(name)
+        self._norm_layers = norm_layers_for_defaults
+        self._norm_layer_tokens = (
+            tuple(layer.lower() for layer in norm_layers)
+            if norm_layers != "all"
+            else ()
+        )
+        if norm_layers == "all":
+            self._norm_param_ids = set(self._param_names_by_id.keys())
+        else:
+            self._norm_param_ids = set()
+            for param_id, names in self._param_names_by_id.items():
+                if any(
+                    token in name.lower()
+                    for token in self._norm_layer_tokens
+                    for name in names
+                ):
+                    self._norm_param_ids.add(param_id)
+        self._cola_ab_by_base_name = {}
+        cola_a_by_base = {}
+        cola_b_by_base = {}
+        for name, p in named_params:
+            if name.endswith("cola_a"):
+                cola_a_by_base[name[: -len("cola_a")]] = p
+            elif name.endswith("cola_b"):
+                cola_b_by_base[name[: -len("cola_b")]] = p
+        for base_name, cola_a in cola_a_by_base.items():
+            cola_b = cola_b_by_base.get(base_name, None)
+            if cola_b is None:
+                continue
+            self._cola_ab_by_base_name[base_name] = (cola_a, cola_b)
+        self.cola_ortho_method = cola_ortho_method
+        self._record_step = None
+        self._active_record = {}
+        self._active_momentum_record = {}
+        self._active_applied_update_record = {}
+        self._last_record = {}
+        self._last_momentum_record = {}
+        self._last_applied_update_record = {}
         
         # print("EMBED TOKENS AND LM_HEAD ARE NOT HANDLED CORRECTLY FOR MUON, THEY SHOULD BE WITH ADAMW.")
         muon_params, muon_params_names = [], []
-        btt_r_params, btt_r_names = [], []
-        btt_l_params, btt_l_names = [], []
-        adamw_params, adamw_params_names = [], []
+        btt_r_params = []
+        btt_g_params = []
+        btt_l_params = []
+        adamw_params = []
+        embedding_params = []
         for name, p in named_params:
-            is_excluded = any(
-                excluded in name
-                for excluded in ["embeddings", "embed_tokens", "wte", "lm_head", "wpe"]
+            is_embedding = any(
+                token in name for token in ["embeddings", "embed_tokens", "wte", "wpe"]
             )
+            is_excluded = is_embedding or ("lm_head" in name)
             if "btt_r" in name:
                 btt_r_params.append(p)
-                btt_r_names.append(name)
+            elif "btt_g" in name:
+                btt_g_params.append(p)
             elif "btt_l" in name:
                 btt_l_params.append(p)
-                btt_l_names.append(name)
-            elif p.ndim >= 2 and not is_excluded:
+            elif p.ndim == 2 and not is_excluded:
                 muon_params.append(p)
                 muon_params_names.append(name)
+            elif is_embedding:
+                embedding_params.append(p)
             else:
                 adamw_params.append(p)
-                adamw_params_names.append(name)
         muon_like_params = list(muon_params)
         muon_like_params.extend(btt_r_params)
+        muon_like_params.extend(btt_g_params)
         muon_like_params.extend(btt_l_params)
-        if split_adamw_lr:
-            params = []
-            if len(muon_like_params) > 0:
-                params.append({"params": muon_like_params, "lr": lr})
-            if len(adamw_params) > 0:
-                params.append({"params": adamw_params, "lr": lr_adam})
-        else:
-            params = muon_like_params + adamw_params
-        self.split_heads = split_heads
-        if self.split_heads:
-            assert nheads is not None, "nheads must be specified if split_heads is True"
-            self.nheads = nheads
+        params = []
+        if len(muon_like_params) > 0:
+            params.append({"params": muon_like_params, "lr": lr})
+        if len(adamw_params) > 0:
+            params.append({"params": adamw_params, "lr": adamw_lr})
+        if len(embedding_params) > 0:
+            params.append({"params": embedding_params, "lr": embedding_lr})
+        if split_heads or (nheads is not None):
+            warnings.warn(
+                "[Muon] split_heads/nheads are deprecated and ignored; "
+                "Muon now runs matrix-only updates without split-head logic.",
+                stacklevel=2,
+            )
         super().__init__(params, defaults)
+        self._warned_uncategorized_param_ids = set()
+        self._warned_cola_lr_fallback_pair_keys = set()
+        self._embedding_param_ids = {id(p) for p in embedding_params}
         
-        # Sort parameters into those for which we will use Muon, and those for which we will not
-        # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
+        # Sort parameters into those for which we will use Muon, and those for which we will not.
+        # Muon applies to matrix-shaped (2D) non-excluded parameters in muon_params.
         for p, p_name in zip(muon_params, muon_params_names):
-            if not self.split_heads:
-                assert p.ndim == 2, p.ndim
             self.state[p]["use_muon"] = True
-            if p_name.endswith("attn.c_attn.weight"):
-                self.state[p]["is_W_QKV"] = True
-            elif p_name.endswith("attn.c_proj.weight"):
-                self.state[p]["is_W_O"] = True
+            self.state[p]["apply_muon_norm"] = id(p) in self._norm_param_ids
+            if p_name.endswith("cola_a"):
+                self.state[p]["is_cola_a"] = True
+                self.state[p]["cola_pair_key"] = p_name[: -len("cola_a")]
+            elif p_name.endswith("cola_b"):
+                self.state[p]["is_cola_b"] = True
+                self.state[p]["cola_pair_key"] = p_name[: -len("cola_b")]
+            elif p_name.endswith("cola_g"):
+                self.state[p]["is_cola_g"] = True
+                self.state[p]["cola_pair_key"] = p_name[: -len("cola_g")]
         for p in btt_r_params:
             self.state[p]["use_muon"] = False
+            self.state[p]["apply_muon_norm"] = id(p) in self._norm_param_ids
+            self.state[p]["is_btt_r"] = True
+        for p in btt_g_params:
+            self.state[p]["use_muon"] = False
+            self.state[p]["apply_muon_norm"] = id(p) in self._norm_param_ids
             self.state[p]["is_btt_r"] = True
         for p in btt_l_params:
             self.state[p]["use_muon"] = False
+            self.state[p]["apply_muon_norm"] = id(p) in self._norm_param_ids
             self.state[p]["is_btt_l"] = True
 
         for p in adamw_params:
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
+            self.state[p]["apply_muon_norm"] = False
+        for p in embedding_params:
+            # Do not use Muon for parameters in embedding_params
+            self.state[p]["use_muon"] = False
+            self.state[p]["apply_muon_norm"] = False
 
-        print("[Muon] Parameters optimized by Muon:")
-        for name in muon_params_names:
-            print(f"  {name}")
-        print("[Muon] Parameters marked as BTT-R (custom update):")
-        for name in btt_r_names:
-            print(f"  {name}")
-        print("[Muon] Parameters marked as BTT-L (custom update):")
-        for name in btt_l_names:
-            print(f"  {name}")
-        print("[Muon] Parameters optimized by AdamW:")
-        for name in adamw_params_names:
-            print(f"  {name}")
+        self._initialize_update_buckets()
+
+        print("[Muon] Parameters updated by Muon (standard 2-D matrices):")
+        self._print_param_names(self._flatten_params(self._bucket_muon_matrix_by_group))
+        print("[Muon] Parameters updated by Muon CoLA:")
+        self._print_param_names(
+            self._flatten_params(self._bucket_muon_cola_a_by_group)
+            + self._flatten_params(self._bucket_muon_cola_b_by_group)
+            + self._flatten_params(self._bucket_muon_cola_g_by_group)
+        )
+        print("[Muon] Parameters updated by Muon BTT:")
+        self._print_param_names(self._flatten_params(self._bucket_btt_by_group))
+        print("[Muon] Parameters updated by AdamW:")
+        self._print_param_names(self._flatten_params(self._bucket_adamw_by_group))
+        print("[Muon] Embedding parameters updated by AdamW:")
+        self._print_param_names(self._flatten_params(self._bucket_embedding_adamw_by_group))
 
         # Instantiate the polar factorization method
         self.polar_factorizer = self._initialize_polar_factorizer(polar_method, polar_args)
@@ -280,6 +390,112 @@ class Muon(torch.optim.Optimizer):
             scale *= btt_scale
         return lr * scale
 
+    def adjust_lr_for_cola_default(
+        self,
+        lr,
+        rms_scaling,
+        nuclear_scaling,
+        p,
+        grad,
+        grad_sign,
+    ):
+        scale = 1.0
+        if rms_scaling:
+            rows, cols = p.shape[:2]
+            # CoLA factor shapes:
+            # cola_a / cola_g: (in_features, rank) -> sqrt(rank / in_features)
+            # cola_b: (rank, out_features) -> sqrt(out_features / rank)
+            scale *= math.sqrt(cols / rows)
+        if nuclear_scaling:
+            scale *= torch.trace(grad.T @ grad_sign)
+        return lr * scale
+
+    def adjust_lr_for_cola_outin(
+        self,
+        lr,
+        rms_scaling,
+        nuclear_scaling,
+        p,
+        grad,
+        grad_sign,
+    ):
+        scale = 1.0
+        if rms_scaling:
+            rows, cols = p.shape[:2]
+            # CoLA factor shapes:
+            # cola_a / cola_g: (in_features, rank) -> rank / in_features
+            # cola_b: (rank, out_features) -> out_features / rank
+            scale *= cols / rows
+        if nuclear_scaling:
+            scale *= torch.trace(grad.T @ grad_sign)
+        return lr * scale
+
+    def _normalize_u(self, u, norm_method):
+        if norm_method is None:
+            return u
+        eps = 1e-7
+        if norm_method == "row":
+            return u / (u.norm(dim=-1, keepdim=True) + eps)
+        if norm_method == "col":
+            return u / (u.norm(dim=-2, keepdim=True) + eps)
+        if norm_method == "shape":
+            m, n = u.shape[-2], u.shape[-1]
+            if m > n:
+                return u / (u.norm(dim=-1, keepdim=True) + eps)
+            if m < n:
+                return u / (u.norm(dim=-2, keepdim=True) + eps)
+            return u
+        if norm_method == "row-col":
+            u = u / (u.norm(dim=-1, keepdim=True) + eps)
+            return u / (u.norm(dim=-2, keepdim=True) + eps)
+        if norm_method == "col-row":
+            u = u / (u.norm(dim=-2, keepdim=True) + eps)
+            return u / (u.norm(dim=-1, keepdim=True) + eps)
+        raise ValueError(f"Unknown norm_method: {norm_method}")
+
+    def _normalize_norm_layers(self, norm_layers):
+        if norm_layers is None:
+            return "all"
+        if isinstance(norm_layers, str):
+            stripped = norm_layers.strip()
+            if stripped.lower() == "all":
+                return "all"
+            if stripped == "":
+                return []
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(stripped)
+                except (SyntaxError, ValueError) as exc:
+                    raise ValueError(
+                        "norm_layers string list must be parseable as a Python list of strings."
+                    ) from exc
+                if not isinstance(parsed, (list, tuple, set)):
+                    raise ValueError(
+                        "norm_layers string list must be parseable as a Python list of strings."
+                    )
+                return self._normalize_norm_layers(parsed)
+            return [layer.strip() for layer in stripped.split(",") if layer.strip()]
+        if isinstance(norm_layers, (list, tuple, set)):
+            layers = []
+            for layer in norm_layers:
+                if not isinstance(layer, str):
+                    raise ValueError(
+                        "norm_layers must be 'all' or a sequence of strings."
+                    )
+                stripped = layer.strip()
+                if stripped:
+                    layers.append(stripped)
+            return layers
+        raise ValueError("norm_layers must be 'all' or a sequence of strings.")
+
+    def _maybe_normalize_u(self, p, u, group):
+        if group["norm_method"] is None:
+            return u
+        state = self.state[p]
+        if not state.get("apply_muon_norm", False):
+            return u
+        return self._normalize_u(u, group["norm_method"])
+
     def _apply_polar_per_matrix(self, mats, steps):
         # mats: (K, M, N)
         if hasattr(torch, "vmap"):
@@ -323,6 +539,474 @@ class Muon(torch.optim.Optimizer):
         p.data.mul_(1 - lr * weight_decay)
         p.data.add_(g, alpha=-lr / scale)
 
+    def _spectral_norm_power_iteration(self, p, n_iters):
+        w = p.data
+        if w.ndim == 0:
+            return w.abs().to(torch.float32)
+        if w.ndim == 1:
+            return w.norm().to(torch.float32)
+        if w.ndim > 2:
+            w = w.reshape(w.shape[0], -1)
+        w = w.to(torch.float32)
+        _, n = w.shape
+        eps = 1e-12
+        state = self.state[p]
+        v = state.get("spectron_v", None)
+        if (v is None) or (v.numel() != n) or (v.device != w.device):
+            v = torch.randn(n, device=w.device, dtype=w.dtype)
+        else:
+            v = v.to(device=w.device, dtype=w.dtype)
+        v = v / (v.norm() + eps)
+
+        n_iters = max(1, int(n_iters))
+        u = None
+        for _ in range(n_iters):
+            u = w @ v
+            u = u / (u.norm() + eps)
+            v = w.t() @ u
+            v = v / (v.norm() + eps)
+        sigma = torch.dot(u, w @ v).abs()
+        state["spectron_v"] = v.detach()
+        return sigma
+
+    def adjust_lr_for_cola_spectron(self, lr, p, ns_steps, pair_lr_cache):
+        pair_key = self.state[p].get("cola_pair_key", None)
+        if pair_key is None:
+            return float(lr)
+
+        cached_lr = pair_lr_cache.get(pair_key, None)
+        if cached_lr is not None:
+            return cached_lr
+
+        cola_ab = self._cola_ab_by_base_name.get(pair_key, None)
+        if cola_ab is None:
+            adjusted_lr = float(lr)
+        else:
+            cola_a, cola_b = cola_ab
+            sigma_a = float(self._spectral_norm_power_iteration(cola_a, ns_steps).item())
+            sigma_b = float(self._spectral_norm_power_iteration(cola_b, ns_steps).item())
+            adjusted_lr = float(lr) / (sigma_a + sigma_b + 1.0)
+        pair_lr_cache[pair_key] = adjusted_lr
+        return adjusted_lr
+
+    def _warn_cola_lr_fallback(self, pair_key, reason, method_name):
+        warn_key = (method_name, pair_key)
+        if warn_key in self._warned_cola_lr_fallback_pair_keys:
+            return
+        warnings.warn(
+            f"[Muon] CoLA {method_name} LR fallback to base lr for pair {pair_key}: {reason}",
+            stacklevel=2,
+        )
+        self._warned_cola_lr_fallback_pair_keys.add(warn_key)
+
+    def adjust_lr_for_cola_spectron_rms(self, lr, p, ns_steps, pair_lr_cache):
+        pair_key = self.state[p].get("cola_pair_key", None)
+        if pair_key is None:
+            return float(lr)
+
+        cached_lr_by_type = pair_lr_cache.get(pair_key, None)
+        if cached_lr_by_type is None:
+            cola_ab = self._cola_ab_by_base_name.get(pair_key, None)
+            if cola_ab is None:
+                cached_lr_by_type = {"cola_a_like": float(lr), "cola_b": float(lr)}
+            else:
+                cola_a, cola_b = cola_ab
+                if cola_a.ndim != 2 or cola_b.ndim != 2:
+                    self._warn_cola_lr_fallback(
+                        pair_key,
+                        "spectron-rms requires 2-D CoLA factors",
+                        "spectron-rms",
+                    )
+                    cached_lr_by_type = {"cola_a_like": float(lr), "cola_b": float(lr)}
+                else:
+                    r_from_a, n = cola_a.shape
+                    m, r_from_b = cola_b.shape
+                    if r_from_a != r_from_b:
+                        self._warn_cola_lr_fallback(
+                            pair_key,
+                            "spectron-rms requires cola_a.shape[0] == cola_b.shape[1]",
+                            "spectron-rms",
+                        )
+                        cached_lr_by_type = {
+                            "cola_a_like": float(lr),
+                            "cola_b": float(lr),
+                        }
+                    else:
+                        r = float(r_from_a)
+                        m = float(m)
+                        n = float(n)
+                        sigma_a = float(
+                            self._spectral_norm_power_iteration(cola_a, ns_steps).item()
+                        )
+                        sigma_b = float(
+                            self._spectral_norm_power_iteration(cola_b, ns_steps).item()
+                        )
+                        eps = 1e-12
+                        denom = (
+                            math.sqrt(max(r / max(m, eps), 0.0)) * sigma_b
+                            + math.sqrt(max(n / max(r, eps), 0.0)) * sigma_a
+                            + 1.0
+                        )
+                        rho = 1.0 / max(denom, eps)
+                        cached_lr_by_type = {
+                            "cola_a_like": float(lr) * rho * math.sqrt(max(r / max(n, eps), 0.0)),
+                            "cola_b": float(lr) * rho * math.sqrt(max(m / max(r, eps), 0.0)),
+                        }
+            pair_lr_cache[pair_key] = cached_lr_by_type
+
+        state = self.state[p]
+        if state.get("is_cola_b", False):
+            return cached_lr_by_type["cola_b"]
+        return cached_lr_by_type["cola_a_like"]
+
+    def adjust_lr_for_cola_spectron_scale(self, lr, p, ns_steps, pair_lr_cache):
+        pair_key = self.state[p].get("cola_pair_key", None)
+        if pair_key is None:
+            return float(lr)
+
+        cached_lr_by_type = pair_lr_cache.get(pair_key, None)
+        if cached_lr_by_type is None:
+            cola_ab = self._cola_ab_by_base_name.get(pair_key, None)
+            if cola_ab is None:
+                cached_lr_by_type = {"cola_a_like": float(lr), "cola_b": float(lr)}
+            else:
+                cola_a, cola_b = cola_ab
+                if cola_a.ndim != 2 or cola_b.ndim != 2:
+                    self._warn_cola_lr_fallback(
+                        pair_key,
+                        "spectron-scale requires 2-D CoLA factors",
+                        "spectron-scale",
+                    )
+                    cached_lr_by_type = {"cola_a_like": float(lr), "cola_b": float(lr)}
+                else:
+                    in_features, r_from_a = cola_a.shape
+                    r_from_b, out_features = cola_b.shape
+                    if r_from_a != r_from_b:
+                        self._warn_cola_lr_fallback(
+                            pair_key,
+                            "spectron-scale requires cola_a.shape[1] == cola_b.shape[0]",
+                            "spectron-scale",
+                        )
+                        cached_lr_by_type = {
+                            "cola_a_like": float(lr),
+                            "cola_b": float(lr),
+                        }
+                    else:
+                        sigma_a = float(
+                            self._spectral_norm_power_iteration(cola_a, ns_steps).item()
+                        )
+                        sigma_b = float(
+                            self._spectral_norm_power_iteration(cola_b, ns_steps).item()
+                        )
+                        eps = 1e-12
+                        rank = float(r_from_a)
+                        in_features = float(in_features)
+                        out_features = float(out_features)
+                        rho = 1.0 / max(sigma_a + sigma_b + 1.0, eps)
+                        # rho = max(1.0 / max(sigma_a + sigma_b + 1.0, eps), 0.1)
+                        spectron_lr = float(lr) * rho
+                        cached_lr_by_type = {
+                            "cola_a_like": spectron_lr
+                            * math.sqrt(max(rank / max(in_features, eps), 0.0)),
+                            "cola_b": spectron_lr
+                            * math.sqrt(max(out_features / max(rank, eps), 0.0)),
+                        }
+            pair_lr_cache[pair_key] = cached_lr_by_type
+
+        state = self.state[p]
+        if state.get("is_cola_b", False):
+            return cached_lr_by_type["cola_b"]
+        return cached_lr_by_type["cola_a_like"]
+
+    def _warn_uncategorized_param(self, p, reason):
+        param_id = id(p)
+        if param_id in self._warned_uncategorized_param_ids:
+            return
+        names = self._param_names_by_id.get(param_id, [])
+        name = names[0] if len(names) > 0 else "<unnamed>"
+        warnings.warn(
+            f"[Muon] Falling back to AdamW for param {name} "
+            f"shape={tuple(p.shape)}: {reason}",
+            stacklevel=2,
+        )
+        self._warned_uncategorized_param_ids.add(param_id)
+
+    def _append_adamw_bucket(self, p, adamw_bucket, embedding_adamw_bucket):
+        if id(p) in self._embedding_param_ids:
+            embedding_adamw_bucket.append(p)
+        else:
+            adamw_bucket.append(p)
+
+    def _initialize_update_buckets(self):
+        self._bucket_muon_matrix_by_group = []
+        self._bucket_muon_cola_a_by_group = []
+        self._bucket_muon_cola_b_by_group = []
+        self._bucket_muon_cola_g_by_group = []
+        self._bucket_btt_by_group = []
+        self._bucket_adamw_by_group = []
+        self._bucket_embedding_adamw_by_group = []
+
+        for group in self.param_groups:
+            muon_matrix_params = []
+            muon_cola_a_params = []
+            muon_cola_b_params = []
+            muon_cola_g_params = []
+            btt_params = []
+            adamw_params = []
+            embedding_adamw_params = []
+
+            for p in group["params"]:
+                state = self.state[p]
+                is_btt = state.get("is_btt_r", False) or state.get("is_btt_l", False)
+                is_cola_a = state.get("is_cola_a", False)
+                is_cola_b = state.get("is_cola_b", False)
+                is_cola_g = state.get("is_cola_g", False)
+                is_cola = is_cola_a or is_cola_b or is_cola_g
+
+                if is_btt:
+                    btt_params.append(p)
+                    continue
+
+                if is_cola:
+                    if state.get("use_muon", False) and p.ndim == 2:
+                        if is_cola_a:
+                            muon_cola_a_params.append(p)
+                        elif is_cola_b:
+                            muon_cola_b_params.append(p)
+                        else:
+                            muon_cola_g_params.append(p)
+                    else:
+                        self._warn_uncategorized_param(
+                            p,
+                            "CoLA parameter did not meet matrix Muon criteria; using AdamW fallback",
+                        )
+                        state["use_muon"] = False
+                        self._append_adamw_bucket(p, adamw_params, embedding_adamw_params)
+                    continue
+
+                if state.get("use_muon", False) and p.ndim == 2:
+                    muon_matrix_params.append(p)
+                    continue
+
+                if state.get("use_muon", False):
+                    self._warn_uncategorized_param(
+                        p,
+                        "Muon parameter was not matrix-shaped and was routed to AdamW fallback",
+                    )
+                    state["use_muon"] = False
+                self._append_adamw_bucket(p, adamw_params, embedding_adamw_params)
+
+            self._bucket_muon_matrix_by_group.append(muon_matrix_params)
+            self._bucket_muon_cola_a_by_group.append(muon_cola_a_params)
+            self._bucket_muon_cola_b_by_group.append(muon_cola_b_params)
+            self._bucket_muon_cola_g_by_group.append(muon_cola_g_params)
+            self._bucket_btt_by_group.append(btt_params)
+            self._bucket_adamw_by_group.append(adamw_params)
+            self._bucket_embedding_adamw_by_group.append(embedding_adamw_params)
+
+    def _flatten_params(self, params_by_group):
+        flat = []
+        for params in params_by_group:
+            flat.extend(params)
+        return flat
+
+    def _print_param_names(self, params):
+        printed_ids = set()
+        for p in params:
+            param_id = id(p)
+            if param_id in printed_ids:
+                continue
+            printed_ids.add(param_id)
+            names = self._param_names_by_id.get(param_id, [])
+            if len(names) == 0:
+                print(f"  <unnamed:{param_id}>")
+                continue
+            for name in names:
+                print(f"  {name}")
+
+    def _muon_update_params(self, params, group):
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        momentum = group["momentum"]
+
+        for p in params:
+            g = p.grad
+            if g is None:
+                continue
+            if g.ndim != 2:
+                self._warn_uncategorized_param(
+                    p, "_muon_update_params expects matrix-shaped gradients"
+                )
+                continue
+
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(g)
+            buf = state["momentum_buffer"]
+            buf.mul_(momentum).add_(g)
+            if group["nesterov"]:
+                g = g.add(buf, alpha=momentum)
+            else:
+                g = buf
+
+            u = self.polar_factorizer(g, group["ns_steps"])
+
+            adjusted_lr = self.adjust_lr_for_muon(
+                lr,
+                group["rms_scaling"],
+                group["nuclear_scaling"],
+                p.shape,
+                g.bfloat16(),
+                u,
+            )
+            if isinstance(adjusted_lr, torch.Tensor):
+                adjusted_lr = float(adjusted_lr.item())
+
+            p.data.mul_(1 - lr * weight_decay)
+
+            u = self._maybe_normalize_u(p, u, group)
+            if self._record_step is not None:
+                param_names = self._param_names_by_id.get(id(p), [])
+                if len(param_names) > 0:
+                    u_cpu = u.detach().cpu()
+                    applied_update_cpu = u.detach().mul(float(adjusted_lr)).cpu()
+                    buf_cpu = buf.detach().cpu() if p.ndim == 2 else None
+                    for name in param_names:
+                        if p.ndim == 2:
+                            self._active_record[name] = u_cpu
+                            self._active_applied_update_record[name] = applied_update_cpu
+                            self._active_momentum_record[name] = buf_cpu
+            p.data.add_(u, alpha=-adjusted_lr)
+
+    def _cola_muon_update_params(self, cola_a_params, cola_b_params, cola_g_params, group):
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        momentum = group["momentum"]
+        cola_params = cola_a_params + cola_b_params + cola_g_params
+        if len(cola_params) == 0:
+            return
+        cola_ortho_method = self.cola_ortho_method
+        pair_lr_cache = {}
+
+        def _update_one_param(p):
+            g = p.grad
+            if g is None:
+                return
+            if g.ndim != 2:
+                self._warn_uncategorized_param(
+                    p, "_cola_muon_update_params expects matrix-shaped gradients"
+                )
+                return
+
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(g)
+            buf = state["momentum_buffer"]
+            buf.mul_(momentum).add_(g)
+            if group["nesterov"]:
+                g = g.add(buf, alpha=momentum)
+            else:
+                g = buf
+
+            u = self.polar_factorizer(g, group["ns_steps"])
+
+            if cola_ortho_method == "spectron":
+                adjusted_lr = self.adjust_lr_for_cola_spectron(
+                    lr=lr,
+                    p=p,
+                    ns_steps=group["ns_steps"],
+                    pair_lr_cache=pair_lr_cache,
+                )
+            elif cola_ortho_method == "spectron-rms":
+                adjusted_lr = self.adjust_lr_for_cola_spectron_rms(
+                    lr=lr,
+                    p=p,
+                    ns_steps=group["ns_steps"],
+                    pair_lr_cache=pair_lr_cache,
+                )
+            elif cola_ortho_method == "spectron-scale":
+                adjusted_lr = self.adjust_lr_for_cola_spectron_scale(
+                    lr=lr,
+                    p=p,
+                    ns_steps=group["ns_steps"],
+                    pair_lr_cache=pair_lr_cache,
+                )
+            elif cola_ortho_method == "outin":
+                adjusted_lr = self.adjust_lr_for_cola_outin(
+                    lr,
+                    group["rms_scaling"],
+                    group["nuclear_scaling"],
+                    p,
+                    g.bfloat16(),
+                    u,
+                )
+            else:
+                adjusted_lr = self.adjust_lr_for_cola_default(
+                    lr,
+                    group["rms_scaling"],
+                    group["nuclear_scaling"],
+                    p,
+                    g.bfloat16(),
+                    u,
+                )
+                if isinstance(adjusted_lr, torch.Tensor):
+                    adjusted_lr = float(adjusted_lr.item())
+            p.data.mul_(1 - lr * weight_decay)
+
+            u = self._maybe_normalize_u(p, u, group)
+            if self._record_step is not None:
+                param_names = self._param_names_by_id.get(id(p), [])
+                if len(param_names) > 0:
+                    u_cpu = u.detach().cpu()
+                    applied_update_cpu = u.detach().mul(float(adjusted_lr)).cpu()
+                    buf_cpu = buf.detach().cpu() if p.ndim == 2 else None
+                    for name in param_names:
+                        if p.ndim == 2:
+                            self._active_record[name] = u_cpu
+                            self._active_applied_update_record[name] = applied_update_cpu
+                            self._active_momentum_record[name] = buf_cpu
+            p.data.add_(u, alpha=-adjusted_lr)
+
+        for p in cola_a_params:
+            _update_one_param(p)
+        for p in cola_b_params:
+            _update_one_param(p)
+        for p in cola_g_params:
+            _update_one_param(p)
+
+    def begin_record_step(self, step):
+        self._record_step = int(step)
+        self._active_record = {}
+        self._active_momentum_record = {}
+        self._active_applied_update_record = {}
+
+    def end_record_step(self):
+        self._record_step = None
+        self._last_record = self._active_record
+        self._last_momentum_record = self._active_momentum_record
+        self._last_applied_update_record = self._active_applied_update_record
+        self._active_record = {}
+        self._active_momentum_record = {}
+        self._active_applied_update_record = {}
+
+    def consume_last_record(self):
+        out = self._last_record
+        self._last_record = {}
+        self._last_momentum_record = {}
+        self._last_applied_update_record = {}
+        return out
+
+    def consume_last_record_details(self):
+        out = {
+            "muon_u": self._last_record,
+            "momentum_buffer": self._last_momentum_record,
+            "applied_update": self._last_applied_update_record,
+        }
+        self._last_record = {}
+        self._last_momentum_record = {}
+        self._last_applied_update_record = {}
+        return out
+
     def step(self, closure=None):
         """Perform a single optimization step.
             Args:
@@ -335,86 +1019,36 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
                         
-        for group in self.param_groups:
+        for group_idx, group in enumerate(self.param_groups):
+            muon_matrix_params = self._bucket_muon_matrix_by_group[group_idx]
+            muon_cola_a_params = self._bucket_muon_cola_a_by_group[group_idx]
+            muon_cola_b_params = self._bucket_muon_cola_b_by_group[group_idx]
+            muon_cola_g_params = self._bucket_muon_cola_g_by_group[group_idx]
+            btt_params = self._bucket_btt_by_group[group_idx]
+            adamw_params = self._bucket_adamw_by_group[group_idx]
+            embedding_adamw_params = self._bucket_embedding_adamw_by_group[group_idx]
+
             ############################
             #           Muon           #
             ############################
+            
+            self._muon_update_params(muon_matrix_params, group)
 
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
-            momentum = group["momentum"]
+            ############################
+            #           Cola Muon           #
+            ############################
 
-            # generate weight updates in distributed fashion
-            for p in params:
-                g = p.grad
-                if g is None:
-                    continue
-                if (g.ndim > 2) and not (self.split_heads):
-                    g = g.view(g.size(0), -1)
-
-                assert g is not None
-                
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-
-                if self.split_heads and self.state[p].get("is_W_QKV", False):
-                    # For W_QKV, we split the gradients into 3 heads and process them separately
-                    # print("before", g.shape, self.nheads)
-                    old_shape = g.shape
-                    g = g.reshape(3 * self.nheads, g.shape[0] // (3 * self.nheads), g.shape[1])
-                    # print("after", g.shape)
-                elif self.split_heads and self.state[p].get("is_W_O", False) and self.split_heads:
-                    # print("before", g.shape, self.nheads)
-                    old_shape = g.shape
-                    g = g.reshape(g.shape[0], self.nheads, g.shape[1] // self.nheads).transpose(0, 1)
-                    # print("after", g.shape)
-                    # For W_O, we split the gradients into 3 heads and process them separately
-
-                # Use the selected polar factorization method. u is always in bfloat16 for efficiency.
-                u = self.polar_factorizer(g, group["ns_steps"])
-                
-                if self.split_heads and self.state[p].get("is_W_QKV", False):
-                    g = g.reshape(old_shape)
-                    u = u.reshape(old_shape)
-                elif self.split_heads and self.state[p].get("is_W_O", False):
-                    g = g.transpose(0, 1).reshape(old_shape)
-                    u = u.transpose(0, 1).reshape(old_shape)
-
-                # scale update
-                adjusted_lr = self.adjust_lr_for_muon(
-                    lr,
-                    group["rms_scaling"],
-                    group["nuclear_scaling"],
-                    p.shape,
-                    g.bfloat16(),  # convert to float16 to be compatible with u
-                    u
-                )
-                
-                # apply weight decay
-                p.data.mul_(1 - lr * weight_decay)
-                
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
+            self._cola_muon_update_params(
+                muon_cola_a_params,
+                muon_cola_b_params,
+                muon_cola_g_params,
+                group,
+            )
                 
             ############################
             #         BTT Muon         #
             ############################
 
-            btt_params = [
-                p
-                for p in group["params"]
-                if self.state[p].get("is_btt_r", False)
-                or self.state[p].get("is_btt_l", False)
-            ]
             lr = group["lr"]
             weight_decay = group["weight_decay"]
             momentum = group["momentum"]
@@ -451,7 +1085,7 @@ class Muon(torch.optim.Optimizer):
                             u = self._apply_polar_per_matrix(
                                 mats, group["ns_steps"]
                             ).reshape(m, n, r, b)
-                            btt_scale = math.sqrt(r / b / n)
+                            btt_scale = math.sqrt(r / b / n)  
                         elif method == "naive":
                             u = self.polar_factorizer(
                                 g.transpose(1, 2).reshape(m * r, n * b),
@@ -461,7 +1095,7 @@ class Muon(torch.optim.Optimizer):
                         else:
                             raise ValueError(f"Unknown structured_ortho_method: {method}")
                     elif g.dim() == 3:
-                        # New layout: (n, b, m*r)
+                        # Canonical new layout: (n, b, m*r)
                         n, b, mr = g.shape
                         if method == "mup":
                             u = self._apply_polar_per_matrix(
@@ -470,20 +1104,46 @@ class Muon(torch.optim.Optimizer):
                             btt_scale = math.sqrt(mr / b)
                         elif method == "svd":
                             rank = getattr(p, "btt_rank", None)
-                            ns0 = getattr(p, "btt_ns0", None)
-                            if rank is None or ns0 is None or rank * ns0 != mr:
-                                mats = g.permute(0, 2, 1)
-                                u = self._apply_polar_per_matrix(
-                                    mats, group["ns_steps"]
-                                ).permute(0, 2, 1)
-                                btt_scale = math.sqrt(mr / b)
-                            else:
-                                mats = g.permute(0, 2, 1).reshape(n, ns0, rank, b)
-                                mats = mats.reshape(n * ns0, rank, b)
-                                u = self._apply_polar_per_matrix(mats, group["ns_steps"])
-                                u = u.reshape(n, ns0, rank, b).reshape(n, mr, b)
-                                u = u.permute(0, 2, 1)
-                                btt_scale = math.sqrt(rank / b / n)
+                            m = getattr(p, "btt_m", None)
+                            if (
+                                not isinstance(rank, int)
+                                or rank <= 0
+                                or not isinstance(m, int)
+                                or m <= 0
+                                or (m * rank) != mr
+                            ):
+                                raise ValueError(
+                                    "BTT svd update expects btt_r metadata "
+                                    "(btt_rank, btt_m) with m * rank == g.shape[2]."
+                                )
+
+                            mats = g.permute(0, 2, 1).reshape(n, m, rank, b)
+                            mats = mats.reshape(n * m, rank, b)
+                            u = self._apply_polar_per_matrix(mats, group["ns_steps"])
+                            u = u.reshape(n, m, rank, b).reshape(n, mr, b)
+                            u = u.permute(0, 2, 1)
+                            btt_scale = math.sqrt(rank / b)
+                        elif method == "rms":
+                            rank = getattr(p, "btt_rank", None)
+                            m = getattr(p, "btt_m", None)
+                            if (
+                                not isinstance(rank, int)
+                                or rank <= 0
+                                or not isinstance(m, int)
+                                or m <= 0
+                                or (m * rank) != mr
+                            ):
+                                raise ValueError(
+                                    "BTT rms update expects btt_r metadata "
+                                    "(btt_rank, btt_m) with m * rank == g.shape[2]."
+                                )
+
+                            mats = g.permute(0, 2, 1).reshape(n, m, rank, b)
+                            mats = mats.reshape(n * m, rank, b)
+                            u = self._apply_polar_per_matrix(mats, group["ns_steps"])
+                            u = u.reshape(n, m, rank, b).reshape(n, mr, b)
+                            u = u.permute(0, 2, 1)
+                            btt_scale = math.sqrt(rank / b)
                         elif method == "naive":
                             u = self.polar_factorizer(
                                 g.permute(2, 0, 1).reshape(mr, n * b),
@@ -523,7 +1183,7 @@ class Muon(torch.optim.Optimizer):
                         else:
                             raise ValueError(f"Unknown structured_ortho_method: {method}")
                     elif g.dim() == 3:
-                        # New layout: (m, n*r, a)
+                        # Canonical new layout: (m, n*r, a)
                         m, nr, a = g.shape
                         if method == "mup":
                             u = self._apply_polar_per_matrix(
@@ -532,20 +1192,46 @@ class Muon(torch.optim.Optimizer):
                             btt_scale = math.sqrt(a / nr)
                         elif method == "svd":
                             rank = getattr(p, "btt_rank", None)
-                            ms1 = getattr(p, "btt_ms1", None)
-                            if rank is None or ms1 is None or rank * ms1 != nr:
-                                mats = g.transpose(1, 2)
-                                u = self._apply_polar_per_matrix(
-                                    mats, group["ns_steps"]
-                                ).transpose(1, 2)
-                                btt_scale = math.sqrt(a / nr)
-                            else:
-                                mats = g.reshape(m, ms1, rank, a).permute(0, 1, 3, 2)
-                                mats = mats.reshape(m * ms1, a, rank)
-                                u = self._apply_polar_per_matrix(mats, group["ns_steps"])
-                                u = u.reshape(m, ms1, a, rank).permute(0, 1, 3, 2)
-                                u = u.reshape(m, nr, a)
-                                btt_scale = math.sqrt(a / nr)
+                            n = getattr(p, "btt_n", None)
+                            if (
+                                not isinstance(rank, int)
+                                or rank <= 0
+                                or not isinstance(n, int)
+                                or n <= 0
+                                or (n * rank) != nr
+                            ):
+                                raise ValueError(
+                                    "BTT svd update expects btt_l metadata "
+                                    "(btt_rank, btt_n) with n * rank == g.shape[1]."
+                                )
+
+                            mats = g.reshape(m, n, rank, a).permute(0, 1, 3, 2)
+                            mats = mats.reshape(m * n, a, rank)
+                            u = self._apply_polar_per_matrix(mats, group["ns_steps"])
+                            u = u.reshape(m, n, a, rank).permute(0, 1, 3, 2)
+                            u = u.reshape(m, nr, a)
+                            btt_scale = math.sqrt(a / rank)
+                        elif method == "rms":
+                            rank = getattr(p, "btt_rank", None)
+                            n = getattr(p, "btt_n", None)
+                            if (
+                                not isinstance(rank, int)
+                                or rank <= 0
+                                or not isinstance(n, int)
+                                or n <= 0
+                                or (n * rank) != nr
+                            ):
+                                raise ValueError(
+                                    "BTT rms update expects btt_l metadata "
+                                    "(btt_rank, btt_n) with n * rank == g.shape[1]."
+                                )
+
+                            mats = g.reshape(m, n, rank, a).permute(0, 1, 3, 2)
+                            mats = mats.reshape(m * n, a, rank)
+                            u = self._apply_polar_per_matrix(mats, group["ns_steps"])
+                            u = u.reshape(m, n, a, rank).permute(0, 1, 3, 2)
+                            u = u.reshape(m, nr, a)
+                            btt_scale = math.sqrt(a / rank / n)
                         elif method == "naive":
                             u = self.polar_factorizer(
                                 g.transpose(1, 2).reshape(m * a, nr),
@@ -562,32 +1248,32 @@ class Muon(torch.optim.Optimizer):
                     self._adamw_update(p, g, group)
                     continue
 
-                adjusted_lr = self.adjust_lr_for_muon(
-                    lr,
-                    False,
-                    False,
-                    (1, 1),
-                    g.bfloat16(),
-                    u,
-                    btt_scale=btt_scale,
-                )
+                # adjusted_lr = self.adjust_lr_for_muon(
+                #     lr,
+                #     False,
+                #     False,
+                #     (1, 1),
+                #     g.bfloat16(),
+                #     u,
+                #     btt_scale=btt_scale,
+                # )
+                
+                adjusted_lr = lr * btt_scale
 
                 p.data.mul_(1 - lr * weight_decay)
+                u = self._maybe_normalize_u(p, u, group)
                 p.data.add_(u, alpha=-adjusted_lr)
 
             ############################
             #       AdamW backup       #
             ############################
 
-            params = [
-                p
-                for p in group["params"]
-                if (not self.state[p]["use_muon"])
-                and (not self.state[p].get("is_btt_r", False))
-                and (not self.state[p].get("is_btt_l", False))
-            ]
-
-            for p in params:
+            for p in adamw_params:
+                g = p.grad
+                if g is None:
+                    continue
+                self._adamw_update(p, g, group)
+            for p in embedding_adamw_params:
                 g = p.grad
                 if g is None:
                     continue

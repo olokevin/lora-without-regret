@@ -165,20 +165,9 @@ def resolve_blocktt_rank(rank_arg: str):
 
 @torch.no_grad()
 def materialize_btt_weight(layer: BTTLayer) -> torch.Tensor:
-    if hasattr(layer, "lr_act"):
+    if getattr(layer, "lr_act", False):
         raise ValueError("BlockTT rollout export requires lr_act=False")
-
-    ms0, ms1 = layer.ms
-    ns0, ns1 = layer.ns
-    rank = layer.rank
-
-    r = layer.btt_r.reshape(ms1, ms0, ns0, rank).permute(2, 0, 1, 3)
-    l = layer.btt_l.reshape(ns0, ms1, rank, ns1)
-
-    # Produces per-block transposed matrices (ns0, ms1, ms0, ns1), then transpose.
-    block_t = torch.matmul(r, l)
-    block = block_t.permute(0, 3, 1, 2).contiguous()
-    return block.reshape(ns0 * ns1, ms1 * ms0)
+    return layer.materialize_dense_weight()
 
 
 @torch.no_grad()

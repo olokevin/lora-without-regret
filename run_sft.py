@@ -3,8 +3,9 @@ Unified SFT training entrypoint.
 
 Examples:
   CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode full --no-wandb
-  CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode lora --lora-rank 64 --lora-type all --no-wandb
-  CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode blocktt --blocktt-type all --decomp-mode input_one_block --no-wandb
+  CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode lora --lora-rank 64 --trainable-type all --no-wandb
+  CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode blocktt --trainable-type all --decomp-mode input_one_block --train-position small --no-wandb
+  CUDA_VISIBLE_DEVICES=0 uv run run_sft.py --train-mode svd --trainable-type all --train-position output --no-wandb
 """
 
 import argparse
@@ -20,7 +21,13 @@ from btt_layer import (
     get_blocktt_target_module_names,
 )
 from datasets import load_dataset
+from optim.muon import Muon
 from peft import LoraConfig, get_peft_model
+from svd_layer import (
+    configure_svd_trainability,
+    convert_linear_to_svd,
+    get_svd_target_module_names,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -41,6 +48,11 @@ MODE_DEFAULTS = {
         "wandb_project": "blocktt-finetuning",
         "output_dir": "./blocktt_model",
     },
+    "svd": {
+        "lr": 1e-4,
+        "wandb_project": "svd-finetuning",
+        "output_dir": "./svd_model",
+    },
 }
 
 
@@ -60,8 +72,8 @@ def parse_args(argv=None):
         "--train-mode",
         type=str,
         required=True,
-        choices=["full", "lora", "blocktt"],
-        help="Training mode: full, lora, or blocktt",
+        choices=["full", "lora", "blocktt", "svd"],
+        help="Training mode: full, lora, blocktt, or svd",
     )
     parser.add_argument(
         "--model-id",
@@ -75,27 +87,20 @@ def parse_args(argv=None):
         default=None,
         help="Learning rate (default depends on train mode)",
     )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "muon"],
+        help="Optimizer to use: adamw or muon (default: adamw)",
+    )
 
     # LoRA-only args
     parser.add_argument(
         "--lora-rank", type=int, default=128, help="LoRA rank (default: 128)"
     )
-    parser.add_argument(
-        "--lora-type",
-        type=str,
-        default="all",
-        choices=["all", "mlp", "attn"],
-        help="LoRA target modules: all, mlp, or attn (default: all)",
-    )
 
     # BlockTT-only args
-    parser.add_argument(
-        "--blocktt-type",
-        type=str,
-        default="all",
-        choices=["all", "mlp", "attn"],
-        help="BlockTT target modules: all, mlp, or attn (default: all)",
-    )
     parser.add_argument(
         "--decomp-mode",
         type=str,
@@ -113,6 +118,32 @@ def parse_args(argv=None):
         "--no-train-bias",
         action="store_true",
         help="Freeze BTT biases; by default biases are trainable",
+    )
+
+    # Shared trainable module selector for LoRA/BlockTT/SVD
+    parser.add_argument(
+        "--trainable-type",
+        type=str,
+        default="all",
+        choices=["all", "mlp", "attn"],
+        help="Trainable target modules: all, mlp, or attn (default: all)",
+    )
+    parser.add_argument(
+        "--train-position",
+        type=str,
+        default=None,
+        choices=["output", "input", "small", "large", "both"],
+        help="Trainable side selector: svd uses output|input, blocktt uses small|large|both",
+    )
+    parser.add_argument(
+        "--s-merged-to",
+        type=str,
+        default=None,
+        choices=["frozen", "trainable", "output", "input", "split"],
+        help=(
+            "Where to merge S during SVD init for svd/blocktt: "
+            "frozen, trainable, output, input, or split"
+        ),
     )
 
     parser.add_argument(
@@ -171,6 +202,15 @@ def apply_mode_defaults(args):
         args.wandb_project = defaults["wandb_project"]
     if args.output_dir is None:
         args.output_dir = defaults["output_dir"]
+    if args.train_mode == "blocktt" and args.train_position is None:
+        args.train_position = "small"
+    if args.train_mode == "svd" and args.train_position is None:
+        args.train_position = "output"
+    if args.train_mode in {"blocktt", "svd"} and args.s_merged_to is None:
+        if args.train_mode == "blocktt" and args.train_position == "both":
+            args.s_merged_to = "split"
+        else:
+            args.s_merged_to = "frozen"
 
 
 def _flag_was_passed(argv, flag_name):
@@ -181,13 +221,13 @@ def _flag_was_passed(argv, flag_name):
 
 def validate_mode_specific_flags(args, argv):
     mode_to_flag_sets = {
-        "lora": ["--lora-rank", "--lora-type"],
+        "lora": ["--lora-rank"],
         "blocktt": [
-            "--blocktt-type",
             "--decomp-mode",
             "--blocktt-rank",
             "--no-train-bias",
         ],
+        "svd": [],
     }
 
     if args.train_mode != "lora":
@@ -204,9 +244,36 @@ def validate_mode_specific_flags(args, argv):
                 f"{', '.join(passed)} is only valid when --train-mode blocktt"
             )
 
+    if args.train_mode == "full" and _flag_was_passed(argv, "--trainable-type"):
+        raise ValueError("--trainable-type is only valid when --train-mode lora, blocktt, or svd")
 
-def get_lora_target_modules(lora_type):
-    if lora_type == "all":
+    train_position_passed = _flag_was_passed(argv, "--train-position")
+    if args.train_mode in {"full", "lora"} and train_position_passed:
+        raise ValueError("--train-position is only valid when --train-mode blocktt or svd")
+    if args.train_mode == "blocktt" and train_position_passed:
+        if args.train_position not in {"small", "large", "both"}:
+            raise ValueError("--train-position for blocktt must be one of: small, large, both")
+    if args.train_mode == "svd" and train_position_passed:
+        if args.train_position not in {"output", "input"}:
+            raise ValueError("--train-position for svd must be one of: output, input")
+
+    s_merged_to_passed = _flag_was_passed(argv, "--s-merged-to")
+    if args.train_mode in {"full", "lora"} and s_merged_to_passed:
+        raise ValueError("--s-merged-to is only valid when --train-mode blocktt or svd")
+    if (
+        args.train_mode == "blocktt"
+        and s_merged_to_passed
+        and args.train_position == "both"
+        and args.s_merged_to in {"frozen", "trainable"}
+    ):
+        raise ValueError(
+            "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
+            "use output, input, or split"
+        )
+
+
+def get_lora_target_modules(trainable_type):
+    if trainable_type == "all":
         return [
             "gate_proj",
             "up_proj",
@@ -216,7 +283,7 @@ def get_lora_target_modules(lora_type):
             "v_proj",
             "o_proj",
         ]
-    if lora_type == "mlp":
+    if trainable_type == "mlp":
         return ["gate_proj", "up_proj", "down_proj"]
     return ["q_proj", "k_proj", "v_proj", "o_proj"]
 
@@ -345,7 +412,7 @@ def prepare_model(args):
         mode_info["print_lines"] = []
 
     elif args.train_mode == "lora":
-        target_modules = get_lora_target_modules(args.lora_type)
+        target_modules = get_lora_target_modules(args.trainable_type)
         peft_config = LoraConfig(
             r=args.lora_rank,
             lora_alpha=32,
@@ -357,19 +424,20 @@ def prepare_model(args):
         mode_info["wandb_extra"] = {
             "lora_rank": args.lora_rank,
             "lora_alpha": 32,
-            "lora_type": args.lora_type,
+            "trainable_type": args.trainable_type,
             "target_modules": target_modules,
         }
         mode_info["print_lines"] = [
             f"  LoRA rank: {args.lora_rank}",
-            f"  LoRA type: {args.lora_type}",
+            f"  Trainable type: {args.trainable_type}",
             f"  Target modules: {target_modules}",
         ]
 
-    else:
+    elif args.train_mode == "blocktt":
         blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
-        target_modules = get_blocktt_target_module_names(args.blocktt_type)
+        target_modules = get_blocktt_target_module_names(args.trainable_type)
         train_bias = not args.no_train_bias
+        train_position = args.train_position
 
         converted_modules = convert_linear_to_btt(
             model,
@@ -379,11 +447,17 @@ def prepare_model(args):
             include_names=target_modules,
             skip_names=("lm_head",),
             lr_act=False,
+            s_merged_to=args.s_merged_to,
+            train_position=train_position,
         )
-        stats = configure_blocktt_trainability(model, train_bias=train_bias)
+        stats = configure_blocktt_trainability(
+            model,
+            train_bias=train_bias,
+            train_position=train_position,
+        )
         if stats["num_btt_layers"] == 0:
             raise ValueError(
-                "No layers were converted to BTT; check --blocktt-type selection."
+                "No layers were converted to BTT; check --trainable-type selection."
             )
 
         trainable_params = stats["trainable_params"]
@@ -400,20 +474,87 @@ def prepare_model(args):
 
         mode_info["wandb_extra"] = {
             "blocktt_rank": blocktt_rank,
-            "blocktt_type": args.blocktt_type,
+            "trainable_type": args.trainable_type,
             "decomp_mode": args.decomp_mode,
+            "train_position": train_position,
+            "s_merged_to": args.s_merged_to,
             "train_bias": train_bias,
             "target_modules": target_modules,
         }
         mode_info["print_lines"] = [
             f"  BlockTT rank: {blocktt_rank}",
-            f"  BlockTT type: {args.blocktt_type}",
+            f"  Trainable type: {args.trainable_type}",
             f"  Decomp mode: {args.decomp_mode}",
+            f"  Train position: {train_position}",
+            f"  S merged to: {args.s_merged_to}",
             f"  Train BTT bias: {train_bias}",
             f"  Target modules: {target_modules}",
         ]
 
-    return model, trainable_params, mode_info
+    else:
+        target_modules = get_svd_target_module_names(args.trainable_type)
+        converted_modules = convert_linear_to_svd(
+            model,
+            include_names=target_modules,
+            skip_names=("lm_head",),
+            s_merged_to=args.s_merged_to,
+            train_position=args.train_position,
+        )
+        stats = configure_svd_trainability(
+            model,
+            train_position=args.train_position,
+            train_bias=True,
+        )
+        if stats["num_svd_layers"] == 0:
+            raise ValueError("No layers were converted to SVD; check --trainable-type selection.")
+
+        trainable_params = stats["trainable_params"]
+        print(f"Converted modules: {len(converted_modules)}")
+        print(
+            f"Trainable params: {stats['trainable_param_count']:,} / "
+            f"{stats['total_param_count']:,} "
+            f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
+        )
+        print(
+            f"Tuned factors: output={stats['tuned_output_cores']}, "
+            f"input={stats['tuned_input_cores']}, biases={stats['tuned_biases']}"
+        )
+
+        mode_info["wandb_extra"] = {
+            "trainable_type": args.trainable_type,
+            "train_position": args.train_position,
+            "s_merged_to": args.s_merged_to,
+            "target_modules": target_modules,
+        }
+        mode_info["print_lines"] = [
+            f"  Trainable type: {args.trainable_type}",
+            f"  Train position: {args.train_position}",
+            f"  S merged to: {args.s_merged_to}",
+            f"  Target modules: {target_modules}",
+        ]
+
+    trainable_named_params = [
+        (name, p) for name, p in model.named_parameters() if p.requires_grad
+    ]
+    trainable_params = [p for _, p in trainable_named_params]
+    return model, trainable_params, trainable_named_params, mode_info
+
+
+def validate_trainable_params(trainable_params):
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found.")
+    if any(not p.requires_grad for p in trainable_params):
+        raise ValueError("Found non-trainable parameter in optimizer parameter list.")
+    if len({id(p) for p in trainable_params}) != len(trainable_params):
+        raise ValueError("Duplicate trainable parameters found.")
+
+
+def build_optimizer(args, trainable_params, trainable_named_params):
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(trainable_params, lr=args.lr)
+    if args.optimizer == "muon":
+        return Muon(trainable_named_params, lr=args.lr, weight_decay=0.01)
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
 def main(argv=None):
@@ -425,7 +566,8 @@ def main(argv=None):
     set_seed(args.seed)
 
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
-    model, trainable_params, mode_info = prepare_model(args)
+    model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
+    validate_trainable_params(trainable_params)
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -441,7 +583,7 @@ def main(argv=None):
                 "effective_batch_size": effective_batch_size,
                 "num_epochs": args.num_epochs,
                 "max_length": 2048,
-                "optimizer": "AdamW",
+                "optimizer": args.optimizer,
                 "seed": args.seed,
                 "enable_save_ckpt": args.enable_save_ckpt,
                 **mode_info["wandb_extra"],
@@ -452,6 +594,7 @@ def main(argv=None):
     print("Training configuration:")
     print(f"  Train mode: {args.train_mode}")
     print(f"  Model ID: {args.model_id}")
+    print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
     for line in mode_info["print_lines"]:
         print(line)
@@ -502,7 +645,7 @@ def main(argv=None):
 
     gradient_accumulation_steps = args.gradient_accumulation_steps
     device = model.device
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    optimizer = build_optimizer(args, trainable_params, trainable_named_params)
 
     def eval_model(step=None):
         model.eval()
