@@ -3,6 +3,7 @@ Unified RL training entrypoint.
 
 Examples:
   uv run run_rl.py --train-mode full --lr 1e-5 --no-wandb
+  uv run run_rl.py --train-mode full --optimizer muon --lr 1e-5 --no-wandb
   uv run run_rl.py --train-mode lora --lr 1e-4 --lora-rank 1 --trainable-type all --no-wandb
   uv run run_rl.py --train-mode blocktt --lr 1e-4 --trainable-type all --decomp-mode input_one_block --train-position small --no-wandb
   uv run run_rl.py --train-mode svd --lr 1e-4 --trainable-type all --train-position output --no-wandb
@@ -26,6 +27,7 @@ from btt_layer import (
 )
 from datasets import load_dataset
 from math_utils import is_equiv, last_boxed_only_string, remove_boxed
+from optim.muon import Muon
 from svd_layer import (
     SVDLayer,
     configure_svd_trainability,
@@ -85,6 +87,38 @@ def parse_args(argv=None):
         type=float,
         default=None,
         help="Learning rate (default depends on train mode)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "muon"],
+        help="Optimizer to use: adamw or muon (default: adamw)",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for optimizer (default: 0.0)",
+    )
+    parser.add_argument(
+        "--lr-adam",
+        type=float,
+        default=None,
+        help="Muon-only: AdamW fallback learning rate (default: inherit --lr)",
+    )
+    parser.add_argument(
+        "--lr-embedding",
+        type=float,
+        default=None,
+        help="Muon-only: embedding AdamW learning rate (default: inherit AdamW lr)",
+    )
+    parser.add_argument(
+        "--norm-method",
+        type=str,
+        default=None,
+        choices=["row", "col", "row-col", "col-row", "shape"],
+        help="Muon-only: optional update normalization method",
     )
     parser.add_argument(
         "--n-grpo-steps",
@@ -488,6 +522,11 @@ def maybe_init_wandb(args, run_name, mode_info):
             "train_mode": args.train_mode,
             "model_id": args.model_id,
             "learning_rate": args.lr,
+            "optimizer": args.optimizer,
+            "weight_decay": args.weight_decay,
+            "lr_adam": args.lr_adam,
+            "lr_embedding": args.lr_embedding,
+            "norm_method": args.norm_method,
             "n_grpo_steps": args.n_grpo_steps,
             "n_prompts_per_step": args.n_prompts_per_step,
             "group_size": args.group_size,
@@ -704,6 +743,96 @@ def validate_trainable_params(trainable_params):
         raise ValueError("Duplicate trainable parameters found.")
 
 
+def _flatten_param_ids(params_by_group):
+    return {id(p) for group in params_by_group for p in group}
+
+
+def assert_muon_routing(train_mode, trainable_named_params, optimizer):
+    if not isinstance(optimizer, Muon):
+        return
+
+    matrix_ids = _flatten_param_ids(optimizer._bucket_muon_matrix_by_group)
+    cola_ids = _flatten_param_ids(optimizer._bucket_muon_cola_a_by_group)
+    cola_ids |= _flatten_param_ids(optimizer._bucket_muon_cola_b_by_group)
+    cola_ids |= _flatten_param_ids(optimizer._bucket_muon_cola_g_by_group)
+    btt_ids = _flatten_param_ids(optimizer._bucket_btt_by_group)
+
+    def _param_ids_by_suffix(suffixes):
+        ids = set()
+        for name, p in trainable_named_params:
+            if any(s in name for s in suffixes):
+                ids.add(id(p))
+        return ids
+
+    if train_mode == "svd":
+        svd_ids = _param_ids_by_suffix((".svd_a", ".svd_b"))
+        if len(svd_ids) == 0:
+            raise ValueError(
+                "Muon routing check failed: no trainable SVD factors were found."
+            )
+        missing = sorted(pid for pid in svd_ids if pid not in matrix_ids)
+        if missing:
+            raise ValueError(
+                "Muon routing check failed: some SVD factors are not in matrix-Muon buckets."
+            )
+        if svd_ids & cola_ids:
+            raise ValueError(
+                "Muon routing check failed: SVD factors were routed to CoLA buckets."
+            )
+        return
+
+    if train_mode == "blocktt":
+        btt_trainable_ids = _param_ids_by_suffix((".btt_l", ".btt_r"))
+        if len(btt_trainable_ids) == 0:
+            raise ValueError(
+                "Muon routing check failed: no trainable BlockTT factors were found."
+            )
+        missing = sorted(pid for pid in btt_trainable_ids if pid not in btt_ids)
+        if missing:
+            raise ValueError(
+                "Muon routing check failed: some BlockTT factors are not in BTT-Muon buckets."
+            )
+        return
+
+    if train_mode == "lora":
+        lora_ids = _param_ids_by_suffix(("lora_A", "lora_B"))
+        if len(lora_ids) == 0:
+            raise ValueError(
+                "Muon routing check failed: no trainable LoRA factors were found."
+            )
+        missing = sorted(pid for pid in lora_ids if pid not in matrix_ids)
+        if missing:
+            raise ValueError(
+                "Muon routing check failed: some LoRA factors are not in matrix-Muon buckets."
+            )
+        return
+
+    if train_mode == "full":
+        if len(matrix_ids) == 0:
+            raise ValueError(
+                "Muon routing check failed: no matrix-Muon parameters were detected in full mode."
+            )
+
+
+def build_optimizer(args, trainable_params, trainable_named_params):
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    if args.optimizer == "muon":
+        return Muon(
+            trainable_named_params,
+            lr=args.lr,
+            lr_adam=args.lr_adam,
+            lr_embedding=args.lr_embedding,
+            weight_decay=args.weight_decay,
+            norm_method=args.norm_method,
+        )
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
@@ -759,7 +888,13 @@ def main(argv=None):
     print("Training configuration:")
     print(f"  Train mode: {args.train_mode}")
     print(f"  Model ID: {args.model_id}")
+    print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  Weight decay: {args.weight_decay}")
+    if args.optimizer == "muon":
+        print(f"  Muon lr_adam: {args.lr_adam}")
+        print(f"  Muon lr_embedding: {args.lr_embedding}")
+        print(f"  Muon norm_method: {args.norm_method}")
     print(f"  GRPO steps: {args.n_grpo_steps}")
     print(f"  Prompts per step: {args.n_prompts_per_step}")
     print(f"  Group size: {args.group_size}")
@@ -880,6 +1015,10 @@ def main(argv=None):
     else:
         trainable_params = list(model.parameters())
 
+    trainable_named_params = [
+        (name, p) for name, p in model.named_parameters() if p.requires_grad
+    ]
+    trainable_params = [p for _, p in trainable_named_params]
     validate_trainable_params(trainable_params)
 
     if args.train_mode == "lora":
@@ -897,7 +1036,9 @@ def main(argv=None):
     else:
         generate_for_train, generate_for_eval = build_local_vllm_generators(args, model)
 
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    optimizer = build_optimizer(args, trainable_params, trainable_named_params)
+    if args.optimizer == "muon":
+        assert_muon_routing(args.train_mode, trainable_named_params, optimizer)
 
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
