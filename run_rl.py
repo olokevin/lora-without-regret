@@ -10,10 +10,12 @@ Examples:
 """
 
 import argparse
+import math
 import os
 import random
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import requests
@@ -21,9 +23,11 @@ import torch
 import wandb
 from btt_layer import (
     BTTLayer,
+    BLOCKTT_DECOMP_GROUP_TO_MODULES,
     configure_blocktt_trainability,
     convert_linear_to_btt,
     get_blocktt_target_module_names,
+    resolve_blocktt_decomp_modes,
 )
 from datasets import load_dataset
 from math_utils import is_equiv, last_boxed_only_string, remove_boxed
@@ -34,7 +38,9 @@ from svd_layer import (
     convert_linear_to_svd,
     get_svd_target_module_names,
 )
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 MODE_DEFAULTS = {
@@ -94,6 +100,31 @@ def parse_args(argv=None):
         default="adamw",
         choices=["adamw", "muon"],
         help="Optimizer to use: adamw or muon (default: adamw)",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        default="none",
+        choices=["none", "linear", "cosine"],
+        help="Learning rate scheduler to use (default: none)",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.0,
+        help="Warmup ratio in [0, 1] over total update steps (default: 0.0)",
+    )
+    parser.add_argument(
+        "--cycle-length",
+        type=int,
+        default=None,
+        help="Cycle length for cosine scheduler (default: full training length)",
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.1,
+        help="Minimum LR ratio for cosine scheduler (default: 0.1)",
     )
     parser.add_argument(
         "--weight-decay",
@@ -196,8 +227,11 @@ def parse_args(argv=None):
         "--decomp-mode",
         type=str,
         default="input_one_block",
-        choices=["input_one_block", "output_one_block"],
-        help="BlockTT decomposition mode determining which core is trainable",
+        help=(
+            "BlockTT decomposition mode: scalar input_one_block|output_one_block "
+            "or dict literal with keys qkv,o,mlp_upgate,mlp_down "
+            "(values: input|output|input_one_block|output_one_block)"
+        ),
     )
     parser.add_argument(
         "--blocktt-rank",
@@ -305,6 +339,16 @@ def validate_mode_specific_flags(args, argv):
             raise ValueError(
                 f"{', '.join(passed)} is only valid when --train-mode blocktt"
             )
+    else:
+        blocktt_targets = get_blocktt_target_module_names(args.trainable_type)
+        decomp_mode, module_decomp_modes = resolve_blocktt_decomp_modes(
+            args.decomp_mode,
+            include_names=blocktt_targets,
+            default_mode="input_one_block",
+        )
+        args.decomp_mode = decomp_mode
+        args.blocktt_module_decomp_modes = module_decomp_modes
+        args.decomp_mode_display = format_blocktt_decomp_mode(decomp_mode)
 
     if args.train_mode == "full" and _flag_was_passed(argv, "--trainable-type"):
         raise ValueError("--trainable-type is only valid when --train-mode lora, blocktt, or svd")
@@ -349,6 +393,15 @@ def resolve_blocktt_rank(rank_arg: str):
     if rank <= 0:
         raise ValueError("--blocktt-rank must be > 0")
     return rank
+
+
+def format_blocktt_decomp_mode(decomp_mode):
+    if isinstance(decomp_mode, str):
+        return decomp_mode
+    if isinstance(decomp_mode, dict):
+        order = tuple(BLOCKTT_DECOMP_GROUP_TO_MODULES.keys())
+        return ",".join(f"{group}={decomp_mode[group]}" for group in order)
+    return str(decomp_mode)
 
 
 def get_lora_target_modules(trainable_type):
@@ -496,7 +549,7 @@ def create_run_dir(base_dir: str) -> str:
     return run_name
 
 
-def maybe_init_wandb(args, run_name, mode_info):
+def maybe_init_wandb(args, run_name, mode_info, num_training_steps):
     if args.no_wandb:
         return
 
@@ -507,8 +560,9 @@ def maybe_init_wandb(args, run_name, mode_info):
     elif args.train_mode == "lora":
         wandb_run_name = f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
     elif args.train_mode == "blocktt":
+        decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
         wandb_run_name = (
-            f"{args.model_id}_{args.lr:.1e}_{args.decomp_mode}_{args.train_position}_{args.trainable_type}"
+            f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
         )
     else:
         wandb_run_name = (
@@ -523,6 +577,12 @@ def maybe_init_wandb(args, run_name, mode_info):
             "model_id": args.model_id,
             "learning_rate": args.lr,
             "optimizer": args.optimizer,
+            "lr_scheduler": args.lr_scheduler,
+            "warmup_ratio": args.warmup_ratio,
+            "warmup_steps": resolve_warmup_steps(args.warmup_ratio, num_training_steps),
+            "cycle_length": args.cycle_length,
+            "min_lr_ratio": args.min_lr_ratio,
+            "num_training_steps": num_training_steps,
             "weight_decay": args.weight_decay,
             "lr_adam": args.lr_adam,
             "lr_embedding": args.lr_embedding,
@@ -833,6 +893,104 @@ def build_optimizer(args, trainable_params, trainable_named_params):
     raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
+def _get_cyclical_cosine_schedule_with_min_lr_lambda(
+    current_step,
+    *,
+    num_warmup_steps,
+    cycle_length,
+    min_lr_ratio,
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float((current_step - num_warmup_steps) % cycle_length) / float(
+        max(1, cycle_length - num_warmup_steps)
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def get_cyclical_cosine_schedule_with_min_lr(
+    optimizer,
+    num_warmup_steps,
+    num_training_steps,
+    cycle_length,
+    min_lr_ratio=0.1,
+    last_epoch=-1,
+):
+    assert (
+        cycle_length is not None or num_training_steps is not None
+    ), "You must specify either cycle_length or num_training_steps"
+
+    if cycle_length is None:
+        cycle_length = num_training_steps
+
+    if num_training_steps % cycle_length != 0:
+        raise ValueError(
+            f"num_training_steps ({num_training_steps}) must be divisible by cycle_length ({cycle_length})"
+        )
+
+    lr_lambda = partial(
+        _get_cyclical_cosine_schedule_with_min_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        cycle_length=cycle_length,
+        min_lr_ratio=min_lr_ratio,
+    )
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def build_lr_scheduler(args, optimizer, num_training_steps):
+    warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+
+    if args.lr_scheduler == "none":
+        return None
+
+    if num_training_steps <= 0:
+        raise ValueError(
+            f"num_training_steps must be > 0 when using lr scheduler, got {num_training_steps}"
+        )
+
+    if args.lr_scheduler == "linear":
+        return transformers.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+            last_epoch=-1,
+        )
+    if args.lr_scheduler == "cosine":
+        return get_cyclical_cosine_schedule_with_min_lr(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+            cycle_length=args.cycle_length,
+            min_lr_ratio=args.min_lr_ratio,
+            last_epoch=-1,
+        )
+    raise ValueError(f"Unsupported lr scheduler: {args.lr_scheduler}")
+
+
+def compute_num_training_steps(args):
+    if args.micro_batch_size <= 0:
+        raise ValueError("--micro-batch-size must be > 0")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
+
+    samples_per_step = args.n_prompts_per_step * args.group_size
+    micro_batches_per_epoch = samples_per_step // args.micro_batch_size
+    optimizer_steps_per_epoch = (
+        micro_batches_per_epoch // args.gradient_accumulation_steps
+    )
+    return args.n_grpo_steps * args.epochs_per_step * optimizer_steps_per_epoch
+
+
+def resolve_warmup_steps(warmup_ratio, num_training_steps):
+    if not 0.0 <= warmup_ratio <= 1.0:
+        raise ValueError(f"--warmup-ratio must be in [0, 1], got {warmup_ratio}")
+    if num_training_steps < 0:
+        raise ValueError(f"num_training_steps must be >= 0, got {num_training_steps}")
+    return int(math.ceil(num_training_steps * warmup_ratio))
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
@@ -863,11 +1021,20 @@ def main(argv=None):
         blocktt_targets = get_blocktt_target_module_names(args.trainable_type)
         train_bias = not args.no_train_bias
         train_position = args.train_position
+        decomp_mode = args.decomp_mode
+        decomp_mode_display = getattr(
+            args, "decomp_mode_display", format_blocktt_decomp_mode(decomp_mode)
+        )
+        module_decomp_modes = getattr(args, "blocktt_module_decomp_modes", None)
+        if not isinstance(decomp_mode, dict):
+            module_decomp_modes = None
         mode_info.update(
             {
                 "blocktt_rank": blocktt_rank,
                 "trainable_type": args.trainable_type,
-                "decomp_mode": args.decomp_mode,
+                "decomp_mode": decomp_mode,
+                "decomp_mode_by_module": module_decomp_modes,
+                "decomp_mode_display": decomp_mode_display,
                 "train_position": train_position,
                 "s_merged_to": args.s_merged_to,
                 "target_modules": blocktt_targets,
@@ -890,6 +1057,11 @@ def main(argv=None):
     print(f"  Model ID: {args.model_id}")
     print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  LR scheduler: {args.lr_scheduler}")
+    print(f"  Warmup ratio: {args.warmup_ratio}")
+    if args.lr_scheduler == "cosine":
+        print(f"  Cycle length: {args.cycle_length}")
+        print(f"  Min LR ratio: {args.min_lr_ratio}")
     print(f"  Weight decay: {args.weight_decay}")
     if args.optimizer == "muon":
         print(f"  Muon lr_adam: {args.lr_adam}")
@@ -910,7 +1082,7 @@ def main(argv=None):
     if args.train_mode == "blocktt":
         print(f"  BlockTT rank: {mode_info['blocktt_rank']}")
         print(f"  Trainable type: {args.trainable_type}")
-        print(f"  Decomp mode: {args.decomp_mode}")
+        print(f"  Decomp mode: {mode_info['decomp_mode_display']}")
         print(f"  Train position: {mode_info['train_position']}")
         print(f"  S merged to: {mode_info['s_merged_to']}")
         print(f"  Train BTT bias: {mode_info['train_bias']}")
@@ -924,10 +1096,15 @@ def main(argv=None):
     print(f"  W&B logging: {'enabled' if not args.no_wandb else 'disabled'}")
     print()
 
+    num_training_steps = compute_num_training_steps(args)
+    warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+    print(f"  Optimizer update steps: {num_training_steps}")
+    print(f"  Warmup steps (derived): {warmup_steps}")
+
     run_name = create_run_dir(args.base_dir)
     print(f"Created: {run_name}")
 
-    maybe_init_wandb(args, run_name, mode_info)
+    maybe_init_wandb(args, run_name, mode_info, num_training_steps)
 
     train_dataset, val_dataset, tokenizer = load_datasets_and_tokenizer(
         args.model_id,
@@ -955,10 +1132,15 @@ def main(argv=None):
         model.print_trainable_parameters()
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     elif args.train_mode == "blocktt":
+        decomp_mode_for_convert = (
+            mode_info["decomp_mode_by_module"]
+            if mode_info["decomp_mode_by_module"] is not None
+            else mode_info["decomp_mode"]
+        )
         converted_modules = convert_linear_to_btt(
             model,
             btt_rank=mode_info["blocktt_rank"],
-            decomp_mode=args.decomp_mode,
+            decomp_mode=decomp_mode_for_convert,
             init_mode="default",
             include_names=mode_info["target_modules"],
             skip_names=("lm_head",),
@@ -1039,6 +1221,7 @@ def main(argv=None):
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
     if args.optimizer == "muon":
         assert_muon_routing(args.train_mode, trainable_named_params, optimizer)
+    scheduler = build_lr_scheduler(args, optimizer, num_training_steps)
 
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
@@ -1170,6 +1353,8 @@ def main(argv=None):
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
                     optimizer.zero_grad()
 
         training_time = time.time() - training_start

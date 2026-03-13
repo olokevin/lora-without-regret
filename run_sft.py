@@ -9,16 +9,20 @@ Examples:
 """
 
 import argparse
+import math
 import random
 import sys
+from functools import partial
 
 import numpy as np
 import torch
 import wandb
 from btt_layer import (
+    BLOCKTT_DECOMP_GROUP_TO_MODULES,
     configure_blocktt_trainability,
     convert_linear_to_btt,
     get_blocktt_target_module_names,
+    resolve_blocktt_decomp_modes,
 )
 from datasets import load_dataset
 from optim.muon import Muon
@@ -28,8 +32,10 @@ from svd_layer import (
     convert_linear_to_svd,
     get_svd_target_module_names,
 )
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODE_DEFAULTS = {
@@ -94,6 +100,31 @@ def parse_args(argv=None):
         choices=["adamw", "muon"],
         help="Optimizer to use: adamw or muon (default: adamw)",
     )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        default="none",
+        choices=["none", "linear", "cosine"],
+        help="Learning rate scheduler to use (default: none)",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.0,
+        help="Warmup ratio in [0, 1] over total update steps (default: 0.0)",
+    )
+    parser.add_argument(
+        "--cycle-length",
+        type=int,
+        default=None,
+        help="Cycle length for cosine scheduler (default: full training length)",
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.1,
+        help="Minimum LR ratio for cosine scheduler (default: 0.1)",
+    )
 
     # LoRA-only args
     parser.add_argument(
@@ -105,8 +136,11 @@ def parse_args(argv=None):
         "--decomp-mode",
         type=str,
         default="input_one_block",
-        choices=["input_one_block", "output_one_block"],
-        help="BlockTT decomposition mode determining which core is trainable",
+        help=(
+            "BlockTT decomposition mode: scalar input_one_block|output_one_block "
+            "or dict literal with keys qkv,o,mlp_upgate,mlp_down "
+            "(values: input|output|input_one_block|output_one_block)"
+        ),
     )
     parser.add_argument(
         "--blocktt-rank",
@@ -243,6 +277,16 @@ def validate_mode_specific_flags(args, argv):
             raise ValueError(
                 f"{', '.join(passed)} is only valid when --train-mode blocktt"
             )
+    else:
+        blocktt_targets = get_blocktt_target_module_names(args.trainable_type)
+        decomp_mode, module_decomp_modes = resolve_blocktt_decomp_modes(
+            args.decomp_mode,
+            include_names=blocktt_targets,
+            default_mode="input_one_block",
+        )
+        args.decomp_mode = decomp_mode
+        args.blocktt_module_decomp_modes = module_decomp_modes
+        args.decomp_mode_display = format_blocktt_decomp_mode(decomp_mode)
 
     if args.train_mode == "full" and _flag_was_passed(argv, "--trainable-type"):
         raise ValueError("--trainable-type is only valid when --train-mode lora, blocktt, or svd")
@@ -298,6 +342,15 @@ def resolve_blocktt_rank(rank_arg):
     if rank <= 0:
         raise ValueError("--blocktt-rank must be > 0")
     return rank
+
+
+def format_blocktt_decomp_mode(decomp_mode):
+    if isinstance(decomp_mode, str):
+        return decomp_mode
+    if isinstance(decomp_mode, dict):
+        order = tuple(BLOCKTT_DECOMP_GROUP_TO_MODULES.keys())
+        return ",".join(f"{group}={decomp_mode[group]}" for group in order)
+    return str(decomp_mode)
 
 
 def build_tokenize_function(tokenizer, max_length=2048):
@@ -438,11 +491,18 @@ def prepare_model(args):
         target_modules = get_blocktt_target_module_names(args.trainable_type)
         train_bias = not args.no_train_bias
         train_position = args.train_position
+        decomp_mode = args.decomp_mode
+        decomp_mode_display = getattr(
+            args, "decomp_mode_display", format_blocktt_decomp_mode(decomp_mode)
+        )
+        module_decomp_modes = getattr(args, "blocktt_module_decomp_modes", None)
+        if not isinstance(decomp_mode, dict):
+            module_decomp_modes = None
 
         converted_modules = convert_linear_to_btt(
             model,
             btt_rank=blocktt_rank,
-            decomp_mode=args.decomp_mode,
+            decomp_mode=module_decomp_modes if module_decomp_modes is not None else decomp_mode,
             init_mode="default",
             include_names=target_modules,
             skip_names=("lm_head",),
@@ -475,7 +535,9 @@ def prepare_model(args):
         mode_info["wandb_extra"] = {
             "blocktt_rank": blocktt_rank,
             "trainable_type": args.trainable_type,
-            "decomp_mode": args.decomp_mode,
+            "decomp_mode": decomp_mode,
+            "decomp_mode_by_module": module_decomp_modes,
+            "decomp_mode_display": decomp_mode_display,
             "train_position": train_position,
             "s_merged_to": args.s_merged_to,
             "train_bias": train_bias,
@@ -484,7 +546,7 @@ def prepare_model(args):
         mode_info["print_lines"] = [
             f"  BlockTT rank: {blocktt_rank}",
             f"  Trainable type: {args.trainable_type}",
-            f"  Decomp mode: {args.decomp_mode}",
+            f"  Decomp mode: {decomp_mode_display}",
             f"  Train position: {train_position}",
             f"  S merged to: {args.s_merged_to}",
             f"  Train BTT bias: {train_bias}",
@@ -557,6 +619,96 @@ def build_optimizer(args, trainable_params, trainable_named_params):
     raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
+def _get_cyclical_cosine_schedule_with_min_lr_lambda(
+    current_step,
+    *,
+    num_warmup_steps,
+    cycle_length,
+    min_lr_ratio,
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float((current_step - num_warmup_steps) % cycle_length) / float(
+        max(1, cycle_length - num_warmup_steps)
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def get_cyclical_cosine_schedule_with_min_lr(
+    optimizer,
+    num_warmup_steps,
+    num_training_steps,
+    cycle_length,
+    min_lr_ratio=0.1,
+    last_epoch=-1,
+):
+    assert (
+        cycle_length is not None or num_training_steps is not None
+    ), "You must specify either cycle_length or num_training_steps"
+
+    if cycle_length is None:
+        cycle_length = num_training_steps
+
+    if num_training_steps % cycle_length != 0:
+        raise ValueError(
+            f"num_training_steps ({num_training_steps}) must be divisible by cycle_length ({cycle_length})"
+        )
+
+    lr_lambda = partial(
+        _get_cyclical_cosine_schedule_with_min_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        cycle_length=cycle_length,
+        min_lr_ratio=min_lr_ratio,
+    )
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def build_lr_scheduler(args, optimizer, num_training_steps):
+    warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+
+    if args.lr_scheduler == "none":
+        return None
+
+    if num_training_steps <= 0:
+        raise ValueError(
+            f"num_training_steps must be > 0 when using lr scheduler, got {num_training_steps}"
+        )
+
+    if args.lr_scheduler == "linear":
+        return transformers.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+            last_epoch=-1,
+        )
+    if args.lr_scheduler == "cosine":
+        return get_cyclical_cosine_schedule_with_min_lr(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+            cycle_length=args.cycle_length,
+            min_lr_ratio=args.min_lr_ratio,
+            last_epoch=-1,
+        )
+    raise ValueError(f"Unsupported lr scheduler: {args.lr_scheduler}")
+
+
+def compute_num_training_steps(num_batches, num_epochs, gradient_accumulation_steps):
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be > 0")
+    return num_epochs * (num_batches // gradient_accumulation_steps)
+
+
+def resolve_warmup_steps(warmup_ratio, num_training_steps):
+    if not 0.0 <= warmup_ratio <= 1.0:
+        raise ValueError(f"--warmup-ratio must be in [0, 1], got {warmup_ratio}")
+    if num_training_steps < 0:
+        raise ValueError(f"num_training_steps must be >= 0, got {num_training_steps}")
+    return int(math.ceil(num_training_steps * warmup_ratio))
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
@@ -584,6 +736,10 @@ def main(argv=None):
                 "num_epochs": args.num_epochs,
                 "max_length": 2048,
                 "optimizer": args.optimizer,
+                "lr_scheduler": args.lr_scheduler,
+                "warmup_ratio": args.warmup_ratio,
+                "cycle_length": args.cycle_length,
+                "min_lr_ratio": args.min_lr_ratio,
                 "seed": args.seed,
                 "enable_save_ckpt": args.enable_save_ckpt,
                 **mode_info["wandb_extra"],
@@ -596,6 +752,11 @@ def main(argv=None):
     print(f"  Model ID: {args.model_id}")
     print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  LR scheduler: {args.lr_scheduler}")
+    print(f"  Warmup ratio: {args.warmup_ratio}")
+    if args.lr_scheduler == "cosine":
+        print(f"  Cycle length: {args.cycle_length}")
+        print(f"  Min LR ratio: {args.min_lr_ratio}")
     for line in mode_info["print_lines"]:
         print(line)
     print(f"  Batch size: {args.batch_size}")
@@ -645,7 +806,16 @@ def main(argv=None):
 
     gradient_accumulation_steps = args.gradient_accumulation_steps
     device = model.device
+    num_training_steps = compute_num_training_steps(
+        num_batches=len(train_dataloader),
+        num_epochs=args.num_epochs,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+    print(f"  Optimizer update steps: {num_training_steps}")
+    print(f"  Warmup steps (derived): {warmup_steps}")
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
+    scheduler = build_lr_scheduler(args, optimizer, num_training_steps)
 
     def eval_model(step=None):
         model.eval()
@@ -687,6 +857,8 @@ def main(argv=None):
             if (step + 1) % gradient_accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 

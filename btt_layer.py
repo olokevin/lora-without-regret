@@ -3,9 +3,134 @@ import torch.nn as nn
 from transformers.activations import ACT2FN
 import numpy as np
 import warnings
+import ast
+import json
+import re
 
 
 VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
+VALID_BLOCKTT_DECOMP_MODES = {"square", "input_one_block", "output_one_block"}
+BLOCKTT_DECOMP_MODE_ALIASES = {
+    "input": "input_one_block",
+    "output": "output_one_block",
+    "input_block": "input_one_block",
+    "output_block": "output_one_block",
+}
+BLOCKTT_DECOMP_GROUP_TO_MODULES = {
+    "qkv": ("q_proj", "k_proj", "v_proj"),
+    "o": ("o_proj",),
+    "mlp_upgate": ("gate_proj", "up_proj"),
+    "mlp_down": ("down_proj",),
+}
+BLOCKTT_DECOMP_GROUP_ALIASES = {
+    "mlp_up_gate": "mlp_upgate",
+    "upgate": "mlp_upgate",
+    "up_gate": "mlp_upgate",
+}
+_BARE_DICT_KEY_PATTERN = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:')
+_BARE_MODE_VALUE_PATTERN = re.compile(
+    r'(:\s*)(input_one_block|output_one_block|input|output|input_block|output_block|square)\s*([,}])'
+)
+
+
+def normalize_blocktt_decomp_mode(mode, allow_square=True):
+    if not isinstance(mode, str):
+        raise ValueError("BlockTT decomp mode must be a string")
+    canonical_mode = BLOCKTT_DECOMP_MODE_ALIASES.get(mode.strip(), mode.strip())
+    valid_modes = VALID_BLOCKTT_DECOMP_MODES if allow_square else {
+        "input_one_block",
+        "output_one_block",
+    }
+    if canonical_mode not in valid_modes:
+        allowed = ", ".join(sorted(valid_modes))
+        raise ValueError(f"BlockTT decomp mode must be one of: {allowed}")
+    return canonical_mode
+
+
+def _parse_decomp_mode_mapping_literal(raw_value):
+    if isinstance(raw_value, dict):
+        return raw_value
+    if not isinstance(raw_value, str):
+        return None
+    stripped = raw_value.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+
+    parse_attempts = []
+    parse_attempts.append(stripped)
+    sanitized = _BARE_DICT_KEY_PATTERN.sub(r'\1"\2":', stripped)
+    sanitized = _BARE_MODE_VALUE_PATTERN.sub(r'\1"\2"\3', sanitized)
+    if sanitized != stripped:
+        parse_attempts.append(sanitized)
+
+    last_exc = None
+    for candidate in parse_attempts:
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(candidate)
+            except (ValueError, SyntaxError, TypeError) as exc:
+                last_exc = exc
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            raise ValueError("--decomp-mode dict literal must parse to a dictionary")
+
+    raise ValueError(
+        "--decomp-mode dictionary could not be parsed. "
+        "Use JSON/Python dict syntax, e.g. "
+        '\'{"qkv":"input","o":"output","mlp_upgate":"output","mlp_down":"output"}\''
+    ) from last_exc
+
+
+def resolve_blocktt_decomp_modes(decomp_mode, include_names=None, default_mode="input_one_block"):
+    include_name_set = set(include_names) if include_names is not None else None
+    default_canonical = normalize_blocktt_decomp_mode(default_mode, allow_square=False)
+
+    parsed_mapping = _parse_decomp_mode_mapping_literal(decomp_mode)
+    if parsed_mapping is None:
+        scalar_mode = normalize_blocktt_decomp_mode(decomp_mode, allow_square=False)
+        if include_name_set is None:
+            module_modes = {}
+        else:
+            module_modes = {module_name: scalar_mode for module_name in include_name_set}
+        return scalar_mode, module_modes
+
+    group_modes = {}
+    for raw_key, raw_value in parsed_mapping.items():
+        if not isinstance(raw_key, str):
+            raise ValueError("--decomp-mode dict keys must be strings")
+        normalized_key = BLOCKTT_DECOMP_GROUP_ALIASES.get(raw_key.strip(), raw_key.strip())
+        if normalized_key not in BLOCKTT_DECOMP_GROUP_TO_MODULES:
+            valid_keys = ", ".join(sorted(BLOCKTT_DECOMP_GROUP_TO_MODULES))
+            raise ValueError(
+                f"Invalid --decomp-mode key '{raw_key}'. Expected one of: {valid_keys}"
+            )
+        group_modes[normalized_key] = normalize_blocktt_decomp_mode(
+            str(raw_value), allow_square=False
+        )
+
+    module_modes = {}
+    for group_name, module_names in BLOCKTT_DECOMP_GROUP_TO_MODULES.items():
+        group_mode = group_modes.get(group_name, default_canonical)
+        for module_name in module_names:
+            module_modes[module_name] = group_mode
+
+    if include_name_set is not None:
+        missing_names = include_name_set - set(module_modes)
+        if missing_names:
+            raise ValueError(
+                f"Cannot resolve decomp modes for modules: {sorted(missing_names)}"
+            )
+        module_modes = {
+            module_name: module_modes[module_name]
+            for module_name in include_name_set
+        }
+
+    canonical_groups = {
+        group_name: group_modes.get(group_name, default_canonical)
+        for group_name in BLOCKTT_DECOMP_GROUP_TO_MODULES
+    }
+    return canonical_groups, module_modes
 
 
 def _closest_factor_pair(d):
@@ -93,6 +218,18 @@ def convert_linear_to_btt(
         )
 
     include_name_set = set(include_names) if include_names is not None else None
+    if isinstance(decomp_mode, dict):
+        normalized_decomp_mode = {
+            str(name): normalize_blocktt_decomp_mode(mode, allow_square=False)
+            for name, mode in decomp_mode.items()
+        }
+        default_decomp_mode = None
+        decomp_mode_printable = normalized_decomp_mode
+    else:
+        normalized_decomp_mode = None
+        default_decomp_mode = normalize_blocktt_decomp_mode(decomp_mode)
+        decomp_mode_printable = default_decomp_mode
+
     modules_to_replace = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
@@ -105,7 +242,7 @@ def convert_linear_to_btt(
         modules_to_replace.append((name, module))
     print(
         f"Converting {len(modules_to_replace)} Linear layers to BTT "
-        f"(rank={btt_rank}, decomp_mode={decomp_mode}, init_mode={init_mode}, "
+        f"(rank={btt_rank}, decomp_mode={decomp_mode_printable}, init_mode={init_mode}, "
         f"forward_impl={forward_impl})"
     )
 
@@ -115,6 +252,13 @@ def convert_linear_to_btt(
         for key in path[:-1]:
             parent = getattr(parent, key)
         child_name = path[-1]
+        layer_decomp_mode = default_decomp_mode
+        if normalized_decomp_mode is not None:
+            if child_name not in normalized_decomp_mode:
+                raise ValueError(
+                    f"Missing per-module decomp mode for '{child_name}' in --decomp-mode dict"
+                )
+            layer_decomp_mode = normalized_decomp_mode[child_name]
 
         btt_layer = BTTLayer(
             in_features=linear.in_features,
@@ -122,7 +266,7 @@ def convert_linear_to_btt(
             rank=btt_rank,
             bias=(linear.bias is not None),
             lr_act=lr_act,
-            decomp_mode=decomp_mode,
+            decomp_mode=layer_decomp_mode,
             init_mode=init_mode,
         ).to(device=linear.weight.device, dtype=linear.weight.dtype)
 
@@ -239,11 +383,7 @@ class BTTLayer(nn.Module):
         if num_cores != 2:
             raise NotImplementedError("BTTLayer currently supports only c=2 cores.")
 
-        mode_aliases = {
-            "input_block": "input_one_block",
-            "output_block": "output_one_block",
-        }
-        decomp_mode = mode_aliases.get(decomp_mode, decomp_mode)
+        decomp_mode = normalize_blocktt_decomp_mode(decomp_mode)
 
         self.in_features = in_features
         self.out_features = out_features

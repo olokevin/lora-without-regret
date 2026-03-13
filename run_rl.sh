@@ -8,6 +8,8 @@
 # BlockTT special:  --train-position both => default --s-merged-to split
 # BlockTT constraint: with --train-position both, --s-merged-to frozen/trainable is invalid.
 # BlockTT side map: output -> btt_l, input -> btt_r
+# Fine-grained BlockTT decomp example:
+# DECOMP_MODE='{qkv:input,o:output,mlp_upgate:output,mlp_down:output}'
 
 # For LORA: 
 # - this script requires a vllm instance to be run on the same node with --enable-lora flag
@@ -116,36 +118,36 @@ run_blocktt()
     --wandb-run-name "$run_name"
 }
 
-# run_blocktt_muon()
-# {
-#   local train_mode="blocktt"
-#   local lr="${LR:-8e-5}"
-#   local optimizer="muon"
-#   local decomp_mode="${DECOMP_MODE:-input_one_block}"
-#   local train_position="${TRAIN_POSITION:-small}"
-#   local s_merged_to="${S_MERGED_TO:-frozen}"
-#   local device="${DEVICE:-2}"
-#   local run_name="${train_mode}-${optimizer}-lr_${lr}-${decomp_mode}-s_to_${s_merged_to}-train_${train_position}"
+run_blocktt_muon()
+{
+  local train_mode="blocktt"
+  local lr="${LR:-8e-5}"
+  local optimizer="muon"
+  local decomp_mode="${DECOMP_MODE:-input_one_block}"
+  local train_position="${TRAIN_POSITION:-small}"
+  local s_merged_to="${S_MERGED_TO:-frozen}"
+  local device="${DEVICE:-2}"
+  local run_name="${train_mode}-${optimizer}-lr_${lr}-${decomp_mode}-s_to_${s_merged_to}-train_${train_position}-warmup_0.1-minlr_0.01"
 
-#   if [[ "$train_position" != "small" && "$train_position" != "large" && "$train_position" != "both" ]]; then
-#     echo "Invalid BlockTT train position: $train_position (expected: small|large|both)"
-#     return 1
-#   fi
+  if [[ "$train_position" != "small" && "$train_position" != "large" && "$train_position" != "both" ]]; then
+    echo "Invalid BlockTT train position: $train_position (expected: small|large|both)"
+    return 1
+  fi
 
-#   CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
-#     --train-mode "$train_mode" \
-#     --lr "$lr" \
-#     --optimizer "$optimizer" \
-#     --trainable-type all \
-#     --decomp-mode "$decomp_mode" \
-#     --s-merged-to "$s_merged_to" \
-#     --train-position "$train_position" \
-#     --lr-adam 8e-5 \
-#     --lr-embedding 8e-5 \
-#     --model-id Qwen/Qwen3-1.7B \
-#     --wandb-project qwen3-1_7B-RL \
-#     --wandb-run-name "$run_name"
-# }
+  CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
+    --train-mode "$train_mode" \
+    --lr "$lr" \
+    --optimizer "$optimizer" \
+    --trainable-type all \
+    --decomp-mode "$decomp_mode" \
+    --s-merged-to "$s_merged_to" \
+    --train-position "$train_position" \
+    --warmup-ratio 0.1 \
+    --min-lr-ratio 0.01 \
+    --model-id Qwen/Qwen3-1.7B \
+    --wandb-project qwen3-1_7B-RL \
+    --wandb-run-name "$run_name"
+}
 
 ### lora/blocktt does not update embedding / lm_head
 
@@ -165,12 +167,19 @@ run_sequential()
   # LR=1e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=split run_blocktt
   # LR=1e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
 
+  ### fine-grained block ablation
+  # LR=8e-5 DECOMP_MODE='{qkv:input,o:output,mlp_upgate:output,mlp_down:output}'  TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+  # LR=1e-5 DECOMP_MODE='{qkv:input,o:output,mlp_upgate:output,mlp_down:output}'  TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
 
   ### muon ablation
-  LR=1e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
-  LR=1e-3 DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
-  LR=1e-3 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
-  LR=1e-2 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+  # LR=1e-4 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
+  # LR=1e-3 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt
+  # LR=1e-3 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+  # LR=1e-2 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
+
+  ### muon lr decay
+  LR=1e-3 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt_muon
+  LR=5e-4 OPTIMIZER=muon DECOMP_MODE=input_one_block TRAIN_POSITION=both S_MERGED_TO=keep run_blocktt_muon
 
 }
 
@@ -199,6 +208,9 @@ fi
 # DEVICE=6 LR=8e-5 TRAIN_MODE=lora bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=6 LR=8e-5 TRAIN_MODE=svd bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt TRAIN_POSITION=small S_MERGED_TO=frozen \
+# DECOMP_MODE='{qkv:input,o:output,mlp_upgate:output,mlp_down:output}' \
+# bash run_rl.sh >/dev/null 2>&1 &
 
 # DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt_muon bash run_rl.sh >/dev/null 2>&1 &
 
