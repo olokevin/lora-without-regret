@@ -22,7 +22,7 @@ For each target module (q/k/v/o/gate/up/down) in each layer, reconstruct `W_befo
 
 1. **Update heatmap** — `|ΔW|` aggregated to row-wise and column-wise L2 norms. Shows which rows/cols receive most update (cf. paper's consensus ratio stripe patterns).
 
-2. **Singular vector rotation** — For top-k singular vectors of `W_before`, compute angle between each `u_i`/`v_i` before and after training. X-axis = singular value index, Y-axis = angle in degrees. Reveals which principal directions rotated most.
+2. **Singular vector rotation** — For top-k singular vectors of `W_before`, compute angle between each `u_i`/`v_i` before and after training: `angle_i = arccos(clamp(|u_i^T @ u_i'|, 0, 1))` (absolute value of inner product to handle SVD sign ambiguity). X-axis = singular value index, Y-axis = angle in degrees. Reveals which principal directions rotated most.
 
 3. **Spectrum comparison** — Overlay `σ(W_before)` and `σ(W_after)` curves. Compute normalized spectral shift: `NSS(W) = ||σ(W_after) - σ(W_before)||_2 / ||σ(W_before)||_2`.
 
@@ -58,8 +58,10 @@ python analysis/analyze_weights.py \
   --top-k <int>                   # singular values for subspace analysis (default: 64)
   --principal-alpha <float>       # fraction for principal weight mask (default: 0.1)
   --layers <comma-sep>            # detailed analysis layers (default: 0,13,27)
-  --update-threshold <float>      # threshold for update mask as fraction of max |ΔW| (default: 0.01)
+  --update-threshold <float>      # threshold for update mask as fraction of per-module max |ΔW| (default: 0.01)
 ```
+
+Note: `--layers` values are bounds-checked against the actual model layer count. All angular computations clamp `cos` values to `[-1, 1]` before `arccos` to avoid NaN from floating point.
 
 ### Processing Flow
 
@@ -68,9 +70,9 @@ python analysis/analyze_weights.py \
 3. For each target module in each transformer layer:
    a. Extract `W_before` from base model (the original `nn.Linear` weight).
    b. Reconstruct `W_after`:
-      - **BlockTT**: materialize from `btt_l` and `btt_r` cores (and `btt_s` if present). Use the same materialization logic as `BTTLayer.materialize_dense_weight()`.
-      - **SVD**: materialize from `svd_a` and `svd_b` (and `svd_s` if present). Use same logic as `SVDLayer.materialize_dense_weight()`.
-      - **LoRA**: `W_after = W_before + lora_B @ lora_A` (with appropriate scaling).
+      - **BlockTT**: materialize from `btt_l` and `btt_r` cores (and `btt_s` if present, otherwise S was absorbed into cores). Infer block dimensions from tensor shapes: given `btt_l: (m, rank*n, a)` and `btt_r: (n, b, m*rank)`, extract `m = btt_l.shape[0]`, `a = btt_l.shape[2]`, `n = btt_r.shape[0]`, `b = btt_r.shape[1]`, `rank = btt_r.shape[2] // m` (equivalently `btt_l.shape[1] // n`). Materialization: reshape `btt_r` to `(n, b, m, rank)`, reshape `btt_l` to `(m, rank, n, a)`, contract over rank to get per-block weight `W_block[m,n] = btt_l[m,:,n,:] @ btt_r[n,:,m,:]` i.e. `(a, rank) @ (rank, b) -> (a, b)`, then assemble blocks into full `(m*a, n*b)` weight. If `btt_s` exists, multiply: `btt_l[m,:,n,:] * btt_s[m,n,:].unsqueeze(-1)` before contraction.
+      - **SVD**: materialize from `svd_a` and `svd_b` (and `svd_s` if present). `W_after = svd_a @ svd_b` or `W_after = (svd_a * svd_s.unsqueeze(0)) @ svd_b` if `svd_s` exists.
+      - **LoRA**: `W_after = W_before + (lora_alpha / r) * lora_B @ lora_A`. Read `lora_alpha` and `r` from `adapter_config.json` in the checkpoint directory. Key mapping: base model key `model.layers.{l}.{module}.weight` maps to adapter keys `base_model.model.model.layers.{l}.{module}.lora_A.weight` and `...lora_B.weight`.
    c. Compute `ΔW = W_after - W_before`.
    d. Compute all metrics.
    e. For detailed layers: store full vector/matrix data (spectra, angles, heatmap aggregates).
@@ -100,10 +102,10 @@ python analysis/analyze_weights.py \
   "summary": {
     "layers": [0, 1, ..., 27],
     "modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    "nss": [[float, ...], ...],
-    "max_principal_angle": [[float, ...], ...],
-    "overlap_ratio": [[float, ...], ...],
-    "relative_update_norm": [[float, ...], ...]
+    "nss": [[float, ...]],              // shape: [num_layers][num_modules]
+    "max_principal_angle": [[float, ...]],  // shape: [num_layers][num_modules]
+    "overlap_ratio": [[float, ...]],        // shape: [num_layers][num_modules]
+    "relative_update_norm": [[float, ...]]  // shape: [num_layers][num_modules]
   },
   "detailed": {
     "layer_0.q_proj": {
