@@ -3,6 +3,7 @@ import json
 import tempfile
 import os
 import torch
+from safetensors.torch import save_file
 from analysis.analyze_weights import materialize_blocktt_weight
 from analysis.analyze_weights import parse_args
 from analysis.analyze_weights import (
@@ -275,6 +276,74 @@ class TestBuildReport(unittest.TestCase):
                 content = f.read()
             self.assertIn("plotly", content.lower())
             self.assertIn("test", content)  # meta.base_model
+
+
+class TestEndToEnd(unittest.TestCase):
+    def test_lora_pipeline(self):
+        """Full pipeline: create synthetic weights -> analyze -> build report."""
+        from analysis.analyze_weights import parse_args, analyze
+        from analysis.build_report import build_report
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "base")
+            ckpt_dir = os.path.join(tmpdir, "ckpt")
+            os.makedirs(base_dir)
+            os.makedirs(ckpt_dir)
+
+            # Create synthetic base model weights (2 layers, all 7 target modules)
+            torch.manual_seed(42)
+            base_tensors = {}
+            for l in range(2):
+                base_tensors[f"model.layers.{l}.self_attn.q_proj.weight"] = torch.randn(16, 8)
+                base_tensors[f"model.layers.{l}.self_attn.k_proj.weight"] = torch.randn(8, 8)
+                base_tensors[f"model.layers.{l}.self_attn.v_proj.weight"] = torch.randn(8, 8)
+                base_tensors[f"model.layers.{l}.self_attn.o_proj.weight"] = torch.randn(8, 16)
+                base_tensors[f"model.layers.{l}.mlp.gate_proj.weight"] = torch.randn(32, 8)
+                base_tensors[f"model.layers.{l}.mlp.up_proj.weight"] = torch.randn(32, 8)
+                base_tensors[f"model.layers.{l}.mlp.down_proj.weight"] = torch.randn(8, 32)
+            save_file(base_tensors, os.path.join(base_dir, "model.safetensors"))
+
+            # Create synthetic LoRA adapter
+            ckpt_tensors = {}
+            for l in range(2):
+                for mod, out_dim, in_dim in [
+                    ("self_attn.q_proj", 16, 8), ("self_attn.k_proj", 8, 8),
+                    ("self_attn.v_proj", 8, 8), ("self_attn.o_proj", 8, 16),
+                    ("mlp.gate_proj", 32, 8), ("mlp.up_proj", 32, 8),
+                    ("mlp.down_proj", 8, 32),
+                ]:
+                    r = 2
+                    ckpt_tensors[f"base_model.model.model.layers.{l}.{mod}.lora_A.weight"] = torch.randn(r, in_dim)
+                    ckpt_tensors[f"base_model.model.model.layers.{l}.{mod}.lora_B.weight"] = torch.randn(out_dim, r)
+            save_file(ckpt_tensors, os.path.join(ckpt_dir, "adapter_model.safetensors"))
+
+            # Write adapter config
+            with open(os.path.join(ckpt_dir, "adapter_config.json"), "w") as f:
+                json.dump({"lora_alpha": 4, "r": 2}, f)
+
+            # Run analysis
+            args = parse_args([
+                "--base-model", base_dir,
+                "--checkpoint", ckpt_dir,
+                "--train-mode", "lora",
+                "--top-k", "4",
+                "--layers", "0,1",
+                "--output", os.path.join(tmpdir, "results.json"),
+            ])
+            results = analyze(args)
+
+            # Verify results structure
+            self.assertEqual(len(results["summary"]["nss"]), 2)  # 2 layers
+            self.assertEqual(len(results["summary"]["nss"][0]), 7)  # 7 modules
+            self.assertIn("layer_0.q_proj", results["detailed"])
+
+            # Write JSON and build report
+            json_path = os.path.join(tmpdir, "results.json")
+            with open(json_path, "w") as f:
+                json.dump(results, f)
+            html_path = os.path.join(tmpdir, "report.html")
+            build_report([json_path], html_path)
+            self.assertTrue(os.path.exists(html_path))
 
 
 if __name__ == "__main__":
