@@ -2,6 +2,9 @@ import unittest
 import torch
 from analysis.analyze_weights import materialize_blocktt_weight
 from analysis.analyze_weights import (
+    TARGET_MODULES,
+    get_base_weight_key,
+    get_checkpoint_keys,
     compute_update_row_col_norms,
     compute_singular_vector_angles,
     compute_spectrum_and_nss,
@@ -105,6 +108,35 @@ class TestReconstructLoRA(unittest.TestCase):
         W = reconstruct_lora_weight(W_base, lora_A, lora_B, lora_alpha=4, r=4)
         expected = W_base + lora_B @ lora_A
         torch.testing.assert_close(W, expected)
+
+
+class TestKeyMapping(unittest.TestCase):
+    def test_base_weight_key(self):
+        key = get_base_weight_key(layer_idx=3, module_name="q_proj")
+        self.assertEqual(key, "model.layers.3.self_attn.q_proj.weight")
+
+    def test_base_weight_key_mlp(self):
+        key = get_base_weight_key(layer_idx=0, module_name="gate_proj")
+        self.assertEqual(key, "model.layers.0.mlp.gate_proj.weight")
+
+    def test_checkpoint_keys_blocktt(self):
+        keys = get_checkpoint_keys(layer_idx=1, module_name="q_proj", train_mode="blocktt")
+        self.assertIn("model.layers.1.self_attn.q_proj.btt_l", keys.values())
+        self.assertIn("model.layers.1.self_attn.q_proj.btt_r", keys.values())
+
+    def test_checkpoint_keys_lora(self):
+        keys = get_checkpoint_keys(layer_idx=0, module_name="q_proj", train_mode="lora")
+        self.assertIn(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight", keys.values()
+        )
+        self.assertIn(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight", keys.values()
+        )
+
+    def test_target_modules(self):
+        self.assertEqual(len(TARGET_MODULES), 7)
+        self.assertIn("q_proj", TARGET_MODULES)
+        self.assertIn("gate_proj", TARGET_MODULES)
 
 
 class TestMetrics(unittest.TestCase):

@@ -76,6 +76,49 @@ def reconstruct_lora_weight(
     return W_base + scaling * (lora_B @ lora_A)
 
 
+TARGET_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+ATTN_MODULES = ("q_proj", "k_proj", "v_proj", "o_proj")
+MLP_MODULES = ("gate_proj", "up_proj", "down_proj")
+
+
+def _module_prefix(layer_idx: int, module_name: str) -> str:
+    if module_name in ATTN_MODULES:
+        return f"model.layers.{layer_idx}.self_attn.{module_name}"
+    return f"model.layers.{layer_idx}.mlp.{module_name}"
+
+
+def get_base_weight_key(layer_idx: int, module_name: str) -> str:
+    return f"{_module_prefix(layer_idx, module_name)}.weight"
+
+
+def get_checkpoint_keys(
+    layer_idx: int, module_name: str, train_mode: str
+) -> dict[str, str]:
+    """Return dict mapping role -> safetensors key for a given module."""
+    prefix = _module_prefix(layer_idx, module_name)
+    if train_mode == "blocktt":
+        return {
+            "btt_l": f"{prefix}.btt_l",
+            "btt_r": f"{prefix}.btt_r",
+            "btt_s": f"{prefix}.btt_s",
+        }
+    elif train_mode == "svd":
+        return {
+            "svd_a": f"{prefix}.svd_a",
+            "svd_b": f"{prefix}.svd_b",
+            "svd_s": f"{prefix}.svd_s",
+        }
+    elif train_mode == "lora":
+        lora_prefix = f"base_model.model.{prefix}"
+        return {
+            "lora_A": f"{lora_prefix}.lora_A.weight",
+            "lora_B": f"{lora_prefix}.lora_B.weight",
+        }
+    else:
+        raise ValueError(f"Unknown train_mode: {train_mode}")
+
+
 def compute_update_row_col_norms(
     delta_W: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
