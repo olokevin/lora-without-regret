@@ -2,6 +2,11 @@
 
 import torch
 import numpy as np
+import argparse
+import json
+from pathlib import Path
+from datetime import datetime
+from safetensors import safe_open
 
 
 def materialize_blocktt_weight(
@@ -224,3 +229,216 @@ def compute_update_spectrum(delta_W: torch.Tensor) -> list[float]:
     """Singular values of the update matrix itself."""
     s = torch.linalg.svdvals(delta_W.float())
     return s.tolist()
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Analyze weight updates in trained checkpoints")
+    p.add_argument("--base-model", required=True, help="Path or HF ID of base model")
+    p.add_argument("--checkpoint", required=True, help="Path to checkpoint directory")
+    p.add_argument("--train-mode", required=True, choices=["blocktt", "svd", "lora"])
+    p.add_argument("--output", default="analysis_results/metrics.json")
+    p.add_argument("--top-k", type=int, default=64)
+    p.add_argument("--principal-alpha", type=float, default=0.1)
+    p.add_argument("--layers", type=str, default=None,
+                    help="Comma-separated layer indices for detailed analysis (default: 0,mid,last)")
+    p.add_argument("--update-threshold", type=float, default=0.01)
+    args = p.parse_args(argv)
+    if args.layers is not None:
+        args.layers = [int(x) for x in args.layers.split(",")]
+    return args
+
+
+def load_safetensors_index(directory: str) -> dict[str, str]:
+    """Map tensor keys to their safetensors file paths."""
+    directory = Path(directory)
+    index = {}
+    for f in sorted(directory.glob("*.safetensors")):
+        with safe_open(str(f), framework="pt") as sf:
+            for key in sf.keys():
+                index[key] = str(f)
+    return index
+
+
+def load_tensor(index: dict[str, str], key: str) -> torch.Tensor | None:
+    """Load a single tensor by key, or return None if key not found."""
+    if key not in index:
+        return None
+    with safe_open(index[key], framework="pt") as sf:
+        return sf.get_tensor(key)
+
+
+def detect_num_layers(index: dict[str, str]) -> int:
+    """Detect number of transformer layers from key names."""
+    layers = set()
+    for key in index:
+        parts = key.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                layers.add(int(parts[i + 1]))
+    return max(layers) + 1 if layers else 0
+
+
+def analyze(args) -> dict:
+    """Main analysis: load weights, compute metrics, return results dict."""
+    base_index = load_safetensors_index(args.base_model)
+
+    # If base_model is an HF model ID, resolve to cache path
+    if not base_index:
+        from huggingface_hub import snapshot_download
+        local_path = snapshot_download(args.base_model)
+        base_index = load_safetensors_index(local_path)
+
+    ckpt_index = load_safetensors_index(args.checkpoint)
+
+    num_layers = detect_num_layers(base_index)
+    if args.layers is None:
+        args.layers = [0, num_layers // 2, num_layers - 1]
+    for l in args.layers:
+        if l >= num_layers:
+            raise ValueError(f"Layer {l} out of range (model has {num_layers} layers)")
+
+    # Read LoRA config if needed
+    lora_alpha, lora_r = 1.0, 1
+    if args.train_mode == "lora":
+        config_path = Path(args.checkpoint) / "adapter_config.json"
+        with open(config_path) as f:
+            cfg = json.load(f)
+        lora_alpha = cfg["lora_alpha"]
+        lora_r = cfg["r"]
+
+    detailed_layers = set(args.layers)
+
+    results = {
+        "meta": {
+            "base_model": args.base_model,
+            "checkpoint": args.checkpoint,
+            "train_mode": args.train_mode,
+            "top_k": args.top_k,
+            "principal_alpha": args.principal_alpha,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "summary": {
+            "layers": list(range(num_layers)),
+            "modules": list(TARGET_MODULES),
+            "nss": [],
+            "max_principal_angle": [],
+            "overlap_ratio": [],
+            "relative_update_norm": [],
+        },
+        "detailed": {},
+    }
+
+    for layer_idx in range(num_layers):
+        print(f"Processing layer {layer_idx}/{num_layers - 1}...")
+        layer_nss = []
+        layer_angles = []
+        layer_overlap = []
+        layer_norms = []
+
+        for mod in TARGET_MODULES:
+            # Load W_before
+            base_key = get_base_weight_key(layer_idx, mod)
+            W_before = load_tensor(base_index, base_key)
+            if W_before is None:
+                layer_nss.append(0.0)
+                layer_angles.append(0.0)
+                layer_overlap.append(0.0)
+                layer_norms.append(0.0)
+                continue
+
+            W_before = W_before.float()
+
+            # Reconstruct W_after
+            ckpt_keys = get_checkpoint_keys(layer_idx, mod, args.train_mode)
+            if args.train_mode == "blocktt":
+                btt_l = load_tensor(ckpt_index, ckpt_keys["btt_l"])
+                btt_r = load_tensor(ckpt_index, ckpt_keys["btt_r"])
+                btt_s = load_tensor(ckpt_index, ckpt_keys["btt_s"])
+                if btt_l is None or btt_r is None:
+                    layer_nss.append(0.0)
+                    layer_angles.append(0.0)
+                    layer_overlap.append(0.0)
+                    layer_norms.append(0.0)
+                    continue
+                W_after = materialize_blocktt_weight(btt_l.float(), btt_r.float(), btt_s=btt_s.float() if btt_s is not None else None)
+            elif args.train_mode == "svd":
+                svd_a = load_tensor(ckpt_index, ckpt_keys["svd_a"])
+                svd_b = load_tensor(ckpt_index, ckpt_keys["svd_b"])
+                svd_s = load_tensor(ckpt_index, ckpt_keys["svd_s"])
+                if svd_a is None or svd_b is None:
+                    layer_nss.append(0.0)
+                    layer_angles.append(0.0)
+                    layer_overlap.append(0.0)
+                    layer_norms.append(0.0)
+                    continue
+                W_after = materialize_svd_weight(svd_a.float(), svd_b.float(), svd_s=svd_s.float() if svd_s is not None else None)
+            elif args.train_mode == "lora":
+                lora_A = load_tensor(ckpt_index, ckpt_keys["lora_A"])
+                lora_B = load_tensor(ckpt_index, ckpt_keys["lora_B"])
+                if lora_A is None or lora_B is None:
+                    layer_nss.append(0.0)
+                    layer_angles.append(0.0)
+                    layer_overlap.append(0.0)
+                    layer_norms.append(0.0)
+                    continue
+                W_after = reconstruct_lora_weight(W_before, lora_A.float(), lora_B.float(), lora_alpha, lora_r)
+
+            delta_W = W_after - W_before
+
+            # Compute spectra once (reuse for summary + detail)
+            s_before, s_after, nss = compute_spectrum_and_nss(W_before, W_after)
+            pa = compute_principal_angles(W_before, W_after, args.top_k)
+            overlap, baseline = compute_principal_weight_overlap(
+                W_before, delta_W, args.top_k, args.principal_alpha, args.update_threshold
+            )
+            rel_norm = float(torch.norm(delta_W) / torch.norm(W_before)) if torch.norm(W_before) > 0 else 0.0
+
+            layer_nss.append(nss)
+            layer_angles.append(max(pa) if pa else 0.0)
+            layer_overlap.append(overlap)
+            layer_norms.append(rel_norm)
+
+            # Detailed metrics for selected layers
+            if layer_idx in detailed_layers:
+                angles_u, angles_v = compute_singular_vector_angles(W_before, W_after, args.top_k)
+                row_norms, col_norms = compute_update_row_col_norms(delta_W)
+                update_s = compute_update_spectrum(delta_W)
+
+                detail_key = f"layer_{layer_idx}.{mod}"
+                results["detailed"][detail_key] = {
+                    "spectrum_before": s_before,
+                    "spectrum_after": s_after,
+                    "singular_vector_angles_u": angles_u,
+                    "singular_vector_angles_v": angles_v,
+                    "principal_angles": pa,
+                    "row_norms": row_norms.tolist(),
+                    "col_norms": col_norms.tolist(),
+                    "update_spectrum": update_s,
+                    "overlap_ratio": overlap,
+                    "overlap_random_baseline": baseline,
+                }
+
+            # Free memory
+            del W_before, W_after, delta_W
+
+        results["summary"]["nss"].append(layer_nss)
+        results["summary"]["max_principal_angle"].append(layer_angles)
+        results["summary"]["overlap_ratio"].append(layer_overlap)
+        results["summary"]["relative_update_norm"].append(layer_norms)
+
+    return results
+
+
+def main():
+    args = parse_args()
+    results = analyze(args)
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Results written to {output_path}")
+
+
+if __name__ == "__main__":
+    main()

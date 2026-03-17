@@ -1,6 +1,7 @@
 import unittest
 import torch
 from analysis.analyze_weights import materialize_blocktt_weight
+from analysis.analyze_weights import parse_args
 from analysis.analyze_weights import (
     TARGET_MODULES,
     get_base_weight_key,
@@ -213,6 +214,33 @@ class TestMetrics(unittest.TestCase):
         # Should be non-negative and sorted descending
         for i in range(len(s) - 1):
             self.assertGreaterEqual(s[i], s[i + 1] - 1e-6)
+
+
+class TestCLI(unittest.TestCase):
+    def test_required_args(self):
+        args = parse_args([
+            "--base-model", "Qwen/Qwen3-1.7B",
+            "--checkpoint", "runs/26/step=25",
+            "--train-mode", "lora",
+        ])
+        self.assertEqual(args.base_model, "Qwen/Qwen3-1.7B")
+        self.assertEqual(args.train_mode, "lora")
+        self.assertEqual(args.top_k, 64)  # default
+
+    def test_layers_parsing(self):
+        args = parse_args([
+            "--base-model", "x", "--checkpoint", "y", "--train-mode", "blocktt",
+            "--layers", "0,5,10",
+        ])
+        self.assertEqual(args.layers, [0, 5, 10])
+
+    def test_defaults(self):
+        args = parse_args([
+            "--base-model", "x", "--checkpoint", "y", "--train-mode", "svd",
+        ])
+        self.assertEqual(args.principal_alpha, 0.1)
+        self.assertEqual(args.update_threshold, 0.01)
+        self.assertEqual(args.output, "analysis_results/metrics.json")
 
 
 if __name__ == "__main__":
