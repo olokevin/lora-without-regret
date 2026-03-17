@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+import os
 import torch
 from analysis.analyze_weights import materialize_blocktt_weight
 from analysis.analyze_weights import parse_args
@@ -241,6 +244,37 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(args.principal_alpha, 0.1)
         self.assertEqual(args.update_threshold, 0.01)
         self.assertEqual(args.output, "analysis_results/metrics.json")
+
+
+class TestBuildReport(unittest.TestCase):
+    def test_generates_html(self):
+        from analysis.build_report import build_report
+
+        # Create minimal valid JSON
+        data = {
+            "meta": {"base_model": "test", "checkpoint": "test", "train_mode": "lora",
+                     "top_k": 4, "principal_alpha": 0.1, "timestamp": "2026-01-01"},
+            "summary": {
+                "layers": [0, 1],
+                "modules": ["q_proj", "k_proj"],
+                "nss": [[0.01, 0.02], [0.03, 0.04]],
+                "max_principal_angle": [[1.0, 2.0], [3.0, 4.0]],
+                "overlap_ratio": [[0.05, 0.06], [0.07, 0.08]],
+                "relative_update_norm": [[0.001, 0.002], [0.003, 0.004]],
+            },
+            "detailed": {},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "test.json")
+            html_path = os.path.join(tmpdir, "report.html")
+            with open(json_path, "w") as f:
+                json.dump(data, f)
+            build_report([json_path], html_path)
+            self.assertTrue(os.path.exists(html_path))
+            with open(html_path) as f:
+                content = f.read()
+            self.assertIn("plotly", content.lower())
+            self.assertIn("test", content)  # meta.base_model
 
 
 if __name__ == "__main__":
