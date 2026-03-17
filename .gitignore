@@ -14,3 +14,5 @@ sft/
 wandb/
 tests/
 logs/
+docs/
+analysis_results/
