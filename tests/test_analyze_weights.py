@@ -1,6 +1,14 @@
 import unittest
 import torch
 from analysis.analyze_weights import materialize_blocktt_weight
+from analysis.analyze_weights import (
+    compute_update_row_col_norms,
+    compute_singular_vector_angles,
+    compute_spectrum_and_nss,
+    compute_principal_angles,
+    compute_principal_weight_overlap,
+    compute_update_spectrum,
+)
 
 
 class TestMaterializeBlockTT(unittest.TestCase):
@@ -97,6 +105,82 @@ class TestReconstructLoRA(unittest.TestCase):
         W = reconstruct_lora_weight(W_base, lora_A, lora_B, lora_alpha=4, r=4)
         expected = W_base + lora_B @ lora_A
         torch.testing.assert_close(W, expected)
+
+
+class TestMetrics(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(42)
+        self.W_before = torch.randn(32, 16)
+        # Small perturbation
+        self.W_after = self.W_before + 0.01 * torch.randn(32, 16)
+        self.delta_W = self.W_after - self.W_before
+
+    def test_update_row_col_norms_shapes(self):
+        row_norms, col_norms = compute_update_row_col_norms(self.delta_W)
+        self.assertEqual(row_norms.shape[0], 32)
+        self.assertEqual(col_norms.shape[0], 16)
+
+    def test_update_row_col_norms_nonneg(self):
+        row_norms, col_norms = compute_update_row_col_norms(self.delta_W)
+        self.assertTrue((row_norms >= 0).all())
+        self.assertTrue((col_norms >= 0).all())
+
+    def test_singular_vector_angles_small_perturbation(self):
+        """Small perturbation should give small angles."""
+        angles_u, angles_v = compute_singular_vector_angles(
+            self.W_before, self.W_after, top_k=8
+        )
+        self.assertEqual(len(angles_u), 8)
+        self.assertEqual(len(angles_v), 8)
+        # Angles should be small (< 10 degrees) for tiny perturbation
+        self.assertTrue(all(a < 10.0 for a in angles_u))
+
+    def test_singular_vector_angles_identity(self):
+        """No change should give near-zero angles (within floating-point tolerance)."""
+        angles_u, angles_v = compute_singular_vector_angles(
+            self.W_before, self.W_before, top_k=4
+        )
+        for a in angles_u:
+            self.assertLess(a, 1.0)  # less than 1 degree
+
+    def test_spectrum_and_nss(self):
+        s_before, s_after, nss = compute_spectrum_and_nss(
+            self.W_before, self.W_after
+        )
+        self.assertEqual(len(s_before), min(32, 16))
+        self.assertEqual(len(s_after), min(32, 16))
+        self.assertGreater(nss, 0)
+        # Small perturbation -> small NSS
+        self.assertLess(nss, 0.1)
+
+    def test_spectrum_nss_zero_for_identical(self):
+        _, _, nss = compute_spectrum_and_nss(self.W_before, self.W_before)
+        self.assertAlmostEqual(nss, 0.0, places=6)
+
+    def test_principal_angles_shape(self):
+        angles = compute_principal_angles(self.W_before, self.W_after, top_k=8)
+        self.assertEqual(len(angles), 8)
+
+    def test_principal_angles_small_perturbation(self):
+        angles = compute_principal_angles(self.W_before, self.W_after, top_k=8)
+        # Small perturbation -> small angles
+        self.assertTrue(all(a < 10.0 for a in angles))
+
+    def test_overlap_ratio(self):
+        overlap, baseline = compute_principal_weight_overlap(
+            self.W_before, self.delta_W, top_k=8, alpha=0.1, threshold_frac=0.01
+        )
+        # overlap and baseline should be between 0 and 1
+        self.assertGreaterEqual(overlap, 0.0)
+        self.assertLessEqual(overlap, 1.0)
+        self.assertAlmostEqual(baseline, 0.1, places=5)
+
+    def test_update_spectrum_shape(self):
+        s = compute_update_spectrum(self.delta_W)
+        self.assertEqual(len(s), min(32, 16))
+        # Should be non-negative and sorted descending
+        for i in range(len(s) - 1):
+            self.assertGreaterEqual(s[i], s[i + 1] - 1e-6)
 
 
 if __name__ == "__main__":

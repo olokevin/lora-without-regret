@@ -74,3 +74,110 @@ def reconstruct_lora_weight(
     """
     scaling = lora_alpha / r
     return W_base + scaling * (lora_B @ lora_A)
+
+
+def compute_update_row_col_norms(
+    delta_W: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Row-wise and column-wise L2 norms of the update matrix.
+
+    Returns:
+        (row_norms, col_norms) as numpy arrays.
+    """
+    row_norms = torch.norm(delta_W, dim=1).numpy()
+    col_norms = torch.norm(delta_W, dim=0).numpy()
+    return row_norms, col_norms
+
+
+def compute_singular_vector_angles(
+    W_before: torch.Tensor, W_after: torch.Tensor, top_k: int
+) -> tuple[list[float], list[float]]:
+    """Angle (degrees) between each top-k singular vector before/after.
+
+    Uses absolute inner product to handle SVD sign ambiguity.
+    """
+    U0, _, Vt0 = torch.linalg.svd(W_before.float(), full_matrices=False)
+    U1, _, Vt1 = torch.linalg.svd(W_after.float(), full_matrices=False)
+    k = min(top_k, U0.shape[1], U1.shape[1])
+
+    angles_u = []
+    angles_v = []
+    for i in range(k):
+        cos_u = torch.clamp(torch.abs(U0[:, i] @ U1[:, i]), 0.0, 1.0)
+        angles_u.append(float(torch.acos(cos_u).rad2deg()))
+        cos_v = torch.clamp(torch.abs(Vt0[i] @ Vt1[i]), 0.0, 1.0)
+        angles_v.append(float(torch.acos(cos_v).rad2deg()))
+    return angles_u, angles_v
+
+
+def compute_spectrum_and_nss(
+    W_before: torch.Tensor, W_after: torch.Tensor
+) -> tuple[list[float], list[float], float]:
+    """Singular value spectra and normalized spectral shift.
+
+    NSS = ||sigma(W_after) - sigma(W_before)||_2 / ||sigma(W_before)||_2
+    """
+    s_before = torch.linalg.svdvals(W_before.float())
+    s_after = torch.linalg.svdvals(W_after.float())
+    norm_before = torch.norm(s_before)
+    nss = float(torch.norm(s_after - s_before) / norm_before) if norm_before > 0 else 0.0
+    return s_before.tolist(), s_after.tolist(), nss
+
+
+def compute_principal_angles(
+    W_before: torch.Tensor, W_after: torch.Tensor, top_k: int
+) -> list[float]:
+    """Top-k subspace principal angles (degrees).
+
+    cos theta_i = sigma_i(U_before_k^T @ U_after_k)
+    """
+    U0, _, _ = torch.linalg.svd(W_before.float(), full_matrices=False)
+    U1, _, _ = torch.linalg.svd(W_after.float(), full_matrices=False)
+    k = min(top_k, U0.shape[1], U1.shape[1])
+    cos_angles = torch.linalg.svdvals(U0[:, :k].T @ U1[:, :k])
+    cos_angles = torch.clamp(cos_angles, 0.0, 1.0)
+    angles_deg = torch.acos(cos_angles).rad2deg()
+    return angles_deg.tolist()
+
+
+def compute_principal_weight_overlap(
+    W_before: torch.Tensor,
+    delta_W: torch.Tensor,
+    top_k: int,
+    alpha: float,
+    threshold_frac: float,
+) -> tuple[float, float]:
+    """Overlap between update mask and principal weight mask.
+
+    Principal mask: top-alpha fraction of |rank-k SVD reconstruction| by magnitude.
+    Update mask: |delta_W_ij| > threshold_frac * max(|delta_W|).
+
+    Returns:
+        (overlap_ratio, random_baseline=alpha)
+    """
+    # Principal weight mask from rank-k approximation
+    U, S, Vt = torch.linalg.svd(W_before.float(), full_matrices=False)
+    k = min(top_k, len(S))
+    W_lowrank = (U[:, :k] * S[:k].unsqueeze(0)) @ Vt[:k]
+    n_principal = max(1, int(alpha * W_lowrank.numel()))
+    threshold_princ = torch.topk(W_lowrank.abs().flatten(), n_principal).values[-1]
+    M_princ = W_lowrank.abs() >= threshold_princ
+
+    # Update mask
+    max_delta = delta_W.abs().max()
+    if max_delta == 0:
+        return 0.0, alpha
+    M_update = delta_W.abs() > threshold_frac * max_delta
+
+    n_update = M_update.sum().item()
+    if n_update == 0:
+        return 0.0, alpha
+
+    overlap = float((M_princ & M_update).sum().item() / n_update)
+    return overlap, alpha
+
+
+def compute_update_spectrum(delta_W: torch.Tensor) -> list[float]:
+    """Singular values of the update matrix itself."""
+    s = torch.linalg.svdvals(delta_W.float())
+    return s.tolist()
