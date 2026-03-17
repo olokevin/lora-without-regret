@@ -391,7 +391,8 @@ def analyze(args) -> dict:
             overlap, baseline = compute_principal_weight_overlap(
                 W_before, delta_W, args.top_k, args.principal_alpha, args.update_threshold
             )
-            rel_norm = float(torch.norm(delta_W) / torch.norm(W_before)) if torch.norm(W_before) > 0 else 0.0
+            norm_before = torch.norm(W_before)
+            rel_norm = float(torch.norm(delta_W) / norm_before) if norm_before > 0 else 0.0
 
             layer_nss.append(nss)
             layer_angles.append(max(pa) if pa else 0.0)

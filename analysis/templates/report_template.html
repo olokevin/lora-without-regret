@@ -220,11 +220,13 @@
       ], { title: 'Principal Subspace Angles', yaxis: { title: 'Angle (deg)' },
            xaxis: { title: 'Index' }, height: 350, margin: compact });
 
-      // Row/col norms as subplots (horizontal bars)
+      // Row/col norms
       Plotly.newPlot('plot-row-col-norms', [
-        { y: d.row_norms, name: 'Row norms', type: 'bar', orientation: 'v' },
-      ], { title: 'Row-wise Update Norms', height: 350, margin: compact,
-           xaxis: { title: 'Row index' } });
+        { y: d.row_norms, name: 'Row norms', type: 'bar' },
+        { y: d.col_norms, name: 'Col norms', type: 'bar', xaxis: 'x2', yaxis: 'y2' },
+      ], { title: 'Update Norms (Row / Column)', height: 350, margin: compact,
+           grid: { rows: 1, columns: 2, pattern: 'independent' },
+           xaxis: { title: 'Row index' }, xaxis2: { title: 'Col index' } });
 
       // Update spectrum
       Plotly.newPlot('plot-update-spectrum', [
