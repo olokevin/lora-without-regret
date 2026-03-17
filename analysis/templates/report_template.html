@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Weight Update Analysis</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    /* Reset and base */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; }
+
+    /* Header */
+    #header { background: #1a1a2e; color: white; padding: 16px 24px; }
+    #header h1 { font-size: 1.4rem; margin-bottom: 4px; }
+    #header .meta { font-size: 0.85rem; opacity: 0.7; }
+
+    /* Run selector (multi-run mode) */
+    #run-selector { padding: 8px 24px; background: #e8e8e8; display: none; }
+
+    /* Tabs */
+    .tab-bar { display: flex; background: #2d2d44; }
+    .tab-btn { padding: 10px 24px; color: #aaa; cursor: pointer; border: none;
+               background: none; font-size: 0.95rem; }
+    .tab-btn.active { color: white; border-bottom: 2px solid #5c6bc0; }
+    .tab-content { display: none; padding: 24px; }
+    .tab-content.active { display: block; }
+
+    /* Summary grid: 2x2 heatmaps */
+    .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .summary-grid .plot-card { background: white; border-radius: 8px;
+                               padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+    /* Detail: two-column layout */
+    .detail-controls { margin-bottom: 16px; }
+    .detail-controls select { padding: 6px 12px; margin-right: 12px; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .detail-grid .plot-card { background: white; border-radius: 8px;
+                              padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+    /* Trends: single column */
+    .trends-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1 id="title">Weight Update Analysis</h1>
+    <div class="meta" id="meta-info"></div>
+  </div>
+  <div id="run-selector">
+    Run: <select id="run-select"></select>
+  </div>
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="summary">Summary</button>
+    <button class="tab-btn" data-tab="detail">Detail</button>
+    <button class="tab-btn" data-tab="trends">Trends</button>
+  </div>
+
+  <!-- Tab 1: Summary -->
+  <div id="tab-summary" class="tab-content active">
+    <div class="summary-grid">
+      <div class="plot-card"><div id="heatmap-nss"></div></div>
+      <div class="plot-card"><div id="heatmap-angle"></div></div>
+      <div class="plot-card"><div id="heatmap-overlap"></div></div>
+      <div class="plot-card"><div id="heatmap-norm"></div></div>
+    </div>
+  </div>
+
+  <!-- Tab 2: Detail -->
+  <div id="tab-detail" class="tab-content">
+    <div class="detail-controls">
+      Layer: <select id="detail-layer"></select>
+      Module: <select id="detail-module"></select>
+    </div>
+    <div class="detail-grid">
+      <div class="plot-card"><div id="plot-spectrum"></div></div>
+      <div class="plot-card"><div id="plot-sv-angles"></div></div>
+      <div class="plot-card"><div id="plot-principal-angles"></div></div>
+      <div class="plot-card"><div id="plot-row-col-norms"></div></div>
+      <div class="plot-card"><div id="plot-update-spectrum"></div></div>
+      <div class="plot-card"><div id="plot-overlap-bar"></div></div>
+    </div>
+  </div>
+
+  <!-- Tab 3: Trends -->
+  <div id="tab-trends" class="tab-content">
+    <div class="trends-grid">
+      <div class="plot-card"><div id="trend-nss"></div></div>
+      <div class="plot-card"><div id="trend-angle"></div></div>
+      <div class="plot-card"><div id="trend-overlap"></div></div>
+      <div class="plot-card"><div id="trend-norm"></div></div>
+    </div>
+  </div>
+
+  <script id="analysis-data" type="application/json">DATA_PLACEHOLDER</script>
+  <script>
+    // === Data Loading ===
+    const allData = JSON.parse(document.getElementById('analysis-data').textContent);
+    let currentRunIdx = 0;
+    const data = () => allData[currentRunIdx];
+
+    // === Header ===
+    function renderHeader() {
+      const m = data().meta;
+      document.getElementById('meta-info').textContent =
+        `Model: ${m.base_model} | Mode: ${m.train_mode} | Checkpoint: ${m.checkpoint} | ${m.timestamp}`;
+    }
+
+    // === Multi-run selector ===
+    if (allData.length > 1) {
+      document.getElementById('run-selector').style.display = 'block';
+      const sel = document.getElementById('run-select');
+      allData.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.text = `${d.meta.train_mode} - ${d.meta.checkpoint}`;
+        sel.add(opt);
+      });
+      sel.onchange = () => { currentRunIdx = parseInt(sel.value); renderAll(); };
+    }
+
+    // === Tab Switching ===
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+      };
+    });
+
+    // === Tab 1: Summary Heatmaps ===
+    function renderSummary() {
+      const s = data().summary;
+      const configs = [
+        { id: 'heatmap-nss', data: s.nss, title: 'Normalized Spectral Shift', colorscale: 'YlOrRd' },
+        { id: 'heatmap-angle', data: s.max_principal_angle, title: 'Max Principal Angle (deg)', colorscale: 'YlOrRd' },
+        { id: 'heatmap-overlap', data: s.overlap_ratio, title: 'Overlap with Principal Weights', colorscale: 'RdYlGn' },
+        { id: 'heatmap-norm', data: s.relative_update_norm, title: 'Relative Update Norm', colorscale: 'YlOrRd' },
+      ];
+      configs.forEach(cfg => {
+        const trace = {
+          z: cfg.data, x: s.modules, y: s.layers.map(String),
+          type: 'heatmap', colorscale: cfg.colorscale,
+          hovertemplate: 'Layer %{y}, %{x}<br>Value: %{z:.4f}<extra></extra>',
+        };
+        const layout = {
+          title: cfg.title, height: 400,
+          xaxis: { title: 'Module' }, yaxis: { title: 'Layer', autorange: 'reversed' },
+          margin: { l: 60, r: 20, t: 40, b: 60 },
+        };
+        Plotly.newPlot(cfg.id, [trace], layout);
+        // Click handler: navigate to detail tab
+        document.getElementById(cfg.id).on('plotly_click', function(d) {
+          const layerIdx = d.points[0].y;
+          const modIdx = d.points[0].x;
+          document.getElementById('detail-layer').value = layerIdx;
+          document.getElementById('detail-module').value = modIdx;
+          document.querySelector('[data-tab="detail"]').click();
+          renderDetail();
+        });
+      });
+    }
+
+    // === Tab 2: Detail Plots ===
+    function populateDetailDropdowns() {
+      const s = data().summary;
+      const layerSel = document.getElementById('detail-layer');
+      const modSel = document.getElementById('detail-module');
+      layerSel.innerHTML = '';
+      modSel.innerHTML = '';
+      // Only add layers that have detailed data
+      const detailedKeys = Object.keys(data().detailed);
+      const detailedLayers = [...new Set(detailedKeys.map(k => k.split('.')[0].replace('layer_','')))];
+      detailedLayers.forEach(l => {
+        const opt = document.createElement('option');
+        opt.value = l; opt.text = 'Layer ' + l;
+        layerSel.add(opt);
+      });
+      s.modules.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m; opt.text = m;
+        modSel.add(opt);
+      });
+      layerSel.onchange = renderDetail;
+      modSel.onchange = renderDetail;
+    }
+
+    function renderDetail() {
+      const layer = document.getElementById('detail-layer').value;
+      const mod = document.getElementById('detail-module').value;
+      const key = `layer_${layer}.${mod}`;
+      const d = data().detailed[key];
+      if (!d) {
+        ['plot-spectrum','plot-sv-angles','plot-principal-angles',
+         'plot-row-col-norms','plot-update-spectrum','plot-overlap-bar']
+          .forEach(id => Plotly.purge(id));
+        return;
+      }
+      const compact = { l: 50, r: 20, t: 40, b: 50 };
+
+      // Spectrum: before vs after (log Y)
+      Plotly.newPlot('plot-spectrum', [
+        { y: d.spectrum_before, name: 'Before', mode: 'lines' },
+        { y: d.spectrum_after, name: 'After', mode: 'lines' },
+      ], { title: 'Singular Value Spectrum', yaxis: { type: 'log', title: 'σ' },
+           xaxis: { title: 'Index' }, height: 350, margin: compact });
+
+      // Singular vector angles (U and V)
+      Plotly.newPlot('plot-sv-angles', [
+        { y: d.singular_vector_angles_u, name: 'Left (U)', mode: 'markers',
+          marker: { size: d.spectrum_before.slice(0, d.singular_vector_angles_u.length)
+                     .map(v => Math.max(3, Math.min(15, v / d.spectrum_before[0] * 15))) }},
+        { y: d.singular_vector_angles_v, name: 'Right (V)', mode: 'markers' },
+      ], { title: 'Singular Vector Rotation', yaxis: { title: 'Angle (deg)' },
+           xaxis: { title: 'SV Index' }, height: 350, margin: compact });
+
+      // Principal angles
+      Plotly.newPlot('plot-principal-angles', [
+        { y: d.principal_angles, type: 'bar' },
+      ], { title: 'Principal Subspace Angles', yaxis: { title: 'Angle (deg)' },
+           xaxis: { title: 'Index' }, height: 350, margin: compact });
+
+      // Row/col norms as subplots (horizontal bars)
+      Plotly.newPlot('plot-row-col-norms', [
+        { y: d.row_norms, name: 'Row norms', type: 'bar', orientation: 'v' },
+      ], { title: 'Row-wise Update Norms', height: 350, margin: compact,
+           xaxis: { title: 'Row index' } });
+
+      // Update spectrum
+      Plotly.newPlot('plot-update-spectrum', [
+        { y: d.update_spectrum, mode: 'lines+markers' },
+      ], { title: 'SVD of ΔW', yaxis: { type: 'log', title: 'σ(ΔW)' },
+           xaxis: { title: 'Index' }, height: 350, margin: compact });
+
+      // Overlap bar
+      Plotly.newPlot('plot-overlap-bar', [
+        { x: ['Overlap', 'Random baseline'], y: [d.overlap_ratio, d.overlap_random_baseline],
+          type: 'bar', marker: { color: ['#5c6bc0', '#bbb'] } },
+      ], { title: 'Update ∩ Principal Weights', yaxis: { title: 'Ratio' },
+           height: 350, margin: compact });
+    }
+
+    // === Tab 3: Cross-Layer Trends ===
+    function renderTrends() {
+      const s = data().summary;
+      const metrics = [
+        { id: 'trend-nss', data: s.nss, title: 'NSS Across Layers' },
+        { id: 'trend-angle', data: s.max_principal_angle, title: 'Max Principal Angle Across Layers' },
+        { id: 'trend-overlap', data: s.overlap_ratio, title: 'Overlap Ratio Across Layers' },
+        { id: 'trend-norm', data: s.relative_update_norm, title: 'Relative Update Norm Across Layers' },
+      ];
+      metrics.forEach(cfg => {
+        const traces = s.modules.map((mod, mi) => ({
+          x: s.layers, y: cfg.data.map(row => row[mi]),
+          name: mod, mode: 'lines+markers', marker: { size: 4 },
+        }));
+        Plotly.newPlot(cfg.id, traces, {
+          title: cfg.title, height: 400,
+          xaxis: { title: 'Layer' }, yaxis: { title: cfg.title.split(' ')[0] },
+          margin: { l: 60, r: 20, t: 40, b: 50 },
+          legend: { orientation: 'h', y: -0.2 },
+        });
+      });
+    }
+
+    // === Render All ===
+    function renderAll() { renderHeader(); renderSummary(); populateDetailDropdowns(); renderDetail(); renderTrends(); }
+    renderAll();
+  </script>
+</body>
+</html>
