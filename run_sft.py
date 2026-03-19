@@ -22,6 +22,7 @@ from btt_layer import (
     configure_blocktt_trainability,
     convert_linear_to_btt,
     get_blocktt_target_module_names,
+    normalize_trainable_blocktt_cores_,
     resolve_blocktt_decomp_modes,
 )
 from datasets import load_dataset
@@ -153,6 +154,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Freeze BTT biases; by default biases are trainable",
     )
+    parser.add_argument(
+        "--blocktt-normalize-after-update",
+        action="store_true",
+        help="Normalize trainable BTT cores after each optimizer update",
+    )
 
     # Shared trainable module selector for LoRA/BlockTT/SVD
     parser.add_argument(
@@ -260,6 +266,7 @@ def validate_mode_specific_flags(args, argv):
             "--decomp-mode",
             "--blocktt-rank",
             "--no-train-bias",
+            "--blocktt-normalize-after-update",
         ],
         "svd": [],
     }
@@ -541,6 +548,7 @@ def prepare_model(args):
             "train_position": train_position,
             "s_merged_to": args.s_merged_to,
             "train_bias": train_bias,
+            "blocktt_normalize_after_update": args.blocktt_normalize_after_update,
             "target_modules": target_modules,
         }
         mode_info["print_lines"] = [
@@ -550,6 +558,7 @@ def prepare_model(args):
             f"  Train position: {train_position}",
             f"  S merged to: {args.s_merged_to}",
             f"  Train BTT bias: {train_bias}",
+            f"  Normalize BTT after update: {args.blocktt_normalize_after_update}",
             f"  Target modules: {target_modules}",
         ]
 
@@ -841,6 +850,9 @@ def main(argv=None):
     total_loss = 0
     prev_step_loss_acc = 0
     prev_step_loss = 0
+    normalize_blocktt_after_update = (
+        args.train_mode == "blocktt" and args.blocktt_normalize_after_update
+    )
 
     for epoch in range(args.num_epochs):
         progress_bar = tqdm(
@@ -857,6 +869,8 @@ def main(argv=None):
             if (step + 1) % gradient_accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
+                if normalize_blocktt_after_update:
+                    normalize_trainable_blocktt_cores_(model)
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad()

@@ -352,6 +352,32 @@ def configure_blocktt_trainability(model, train_bias=True, train_position="small
     }
 
 
+@torch.no_grad()
+def normalize_trainable_blocktt_cores_(model, eps=1e-12):
+    normalized_left = 0
+    normalized_right = 0
+    for module in model.modules():
+        if not isinstance(module, BTTLayer):
+            continue
+
+        if module.btt_r.requires_grad:
+            # Packed shape (n, b, m*r): each fixed (n, m, r) vector over b should be unit norm.
+            norms = torch.linalg.vector_norm(module.btt_r, dim=1, keepdim=True).clamp_min(eps)
+            module.btt_r.div_(norms)
+            normalized_right += 1
+
+        if module.btt_l.requires_grad:
+            # Packed shape (m, n*r, a): each fixed (m, n, r) vector over a should be unit norm.
+            norms = torch.linalg.vector_norm(module.btt_l, dim=2, keepdim=True).clamp_min(eps)
+            module.btt_l.div_(norms)
+            normalized_left += 1
+
+    return {
+        "normalized_left_cores": normalized_left,
+        "normalized_right_cores": normalized_right,
+    }
+
+
 
 class BTTLayer(nn.Module):
     """

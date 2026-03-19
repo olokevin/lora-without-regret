@@ -27,6 +27,7 @@ from btt_layer import (
     configure_blocktt_trainability,
     convert_linear_to_btt,
     get_blocktt_target_module_names,
+    normalize_trainable_blocktt_cores_,
     resolve_blocktt_decomp_modes,
 )
 from datasets import load_dataset
@@ -208,7 +209,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--enable-save-ckpt",
         action="store_true",
-        help="Save final checkpoint after training (default: disabled)",
+        help="Save checkpoints at step 1, step 10, and final step (default: disabled)",
     )
 
     # LoRA-only args
@@ -243,6 +244,11 @@ def parse_args(argv=None):
         "--no-train-bias",
         action="store_true",
         help="Freeze BTT biases; by default biases are trainable",
+    )
+    parser.add_argument(
+        "--blocktt-normalize-after-update",
+        action="store_true",
+        help="Normalize trainable BTT cores after each optimizer update",
     )
 
     # Shared trainable module selector for LoRA/BlockTT/SVD
@@ -322,6 +328,7 @@ def validate_mode_specific_flags(args, argv):
             "--decomp-mode",
             "--blocktt-rank",
             "--no-train-bias",
+            "--blocktt-normalize-after-update",
         ],
         "svd": [],
     }
@@ -539,39 +546,35 @@ def get_response_log_probs(
     return torch.gather(logprobs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
 
 
-def create_run_dir(base_dir: str) -> str:
-    os.makedirs(base_dir, exist_ok=True)
-    i = 1
-    while os.path.exists(f"{base_dir}/{i}"):
-        i += 1
-    run_name = f"{base_dir}/{i}"
-    os.makedirs(run_name)
-    return run_name
+def compute_run_name(args, mode_info: dict) -> str:
+    """Compute a human-readable run name (used for both directory and W&B)."""
+    if args.wandb_run_name is not None:
+        return args.wandb_run_name
+    if args.train_mode == "full":
+        return f"{args.model_id}_{args.lr:.1e}_full"
+    if args.train_mode == "lora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+    if args.train_mode == "blocktt":
+        decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
+        return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
+    return f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}"
 
 
-def maybe_init_wandb(args, run_name, mode_info, num_training_steps):
+def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
+    """Create run directory at runs/{train_mode}/{run_name}-{timestamp}."""
+    timestamp = time.strftime("%m%d-%H%M%S")
+    run_dir = os.path.join(base_dir, train_mode, f"{run_name}-{timestamp}")
+    os.makedirs(run_dir)
+    return run_dir
+
+
+def maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps):
     if args.no_wandb:
         return
 
-    if args.wandb_run_name is not None:
-        wandb_run_name = args.wandb_run_name
-    elif args.train_mode == "full":
-        wandb_run_name = f"{args.model_id}_{args.lr:.1e}_full"
-    elif args.train_mode == "lora":
-        wandb_run_name = f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
-    elif args.train_mode == "blocktt":
-        decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
-        wandb_run_name = (
-            f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
-        )
-    else:
-        wandb_run_name = (
-            f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}"
-        )
-
     wandb.init(
         project=args.wandb_project,
-        name=wandb_run_name,
+        name=run_name,
         config={
             "train_mode": args.train_mode,
             "model_id": args.model_id,
@@ -596,10 +599,10 @@ def maybe_init_wandb(args, run_name, mode_info, num_training_steps):
             "seed": args.seed,
             "prompt_template": args.prompt_template,
             "enable_save_ckpt": args.enable_save_ckpt,
-            "run_dir": run_name,
+            "run_dir": run_dir,
             **mode_info,
         },
-        dir=run_name,
+        dir=run_dir,
     )
 
 
@@ -625,7 +628,7 @@ def normalize_lora_merged_weight_name(name: str) -> str | None:
     return name.replace(".base_layer.", ".")
 
 
-def build_lora_http_generators(args, model, run_name):
+def build_lora_http_generators(args, model, run_dir):
     loaded_loras = []
 
     def generate_http(prompts: list[str], vllm_model_id: str, temperature=0, responses_per_prompt=1):
@@ -655,7 +658,7 @@ def build_lora_http_generators(args, model, run_name):
         loaded_loras.append(lora_name)
 
     def save_lora(step):
-        lora_name = f"{run_name}/step={step}"
+        lora_name = f"{run_dir}/step={step}"
         if not os.path.exists(lora_name):
             model.save_pretrained(lora_name)
         return lora_name
@@ -1039,6 +1042,7 @@ def main(argv=None):
                 "s_merged_to": args.s_merged_to,
                 "target_modules": blocktt_targets,
                 "train_bias": train_bias,
+                "blocktt_normalize_after_update": args.blocktt_normalize_after_update,
             }
         )
     elif args.train_mode == "svd":
@@ -1086,6 +1090,10 @@ def main(argv=None):
         print(f"  Train position: {mode_info['train_position']}")
         print(f"  S merged to: {mode_info['s_merged_to']}")
         print(f"  Train BTT bias: {mode_info['train_bias']}")
+        print(
+            "  Normalize BTT after update: "
+            f"{mode_info['blocktt_normalize_after_update']}"
+        )
         print(f"  Target modules: {mode_info['target_modules']}")
     if args.train_mode == "svd":
         print(f"  Trainable type: {args.trainable_type}")
@@ -1101,10 +1109,11 @@ def main(argv=None):
     print(f"  Optimizer update steps: {num_training_steps}")
     print(f"  Warmup steps (derived): {warmup_steps}")
 
-    run_name = create_run_dir(args.base_dir)
-    print(f"Created: {run_name}")
+    run_name = compute_run_name(args, mode_info)
+    run_dir = create_run_dir(args.base_dir, args.train_mode, run_name)
+    print(f"Created: {run_dir}")
 
-    maybe_init_wandb(args, run_name, mode_info, num_training_steps)
+    maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps)
 
     train_dataset, val_dataset, tokenizer = load_datasets_and_tokenizer(
         args.model_id,
@@ -1208,7 +1217,7 @@ def main(argv=None):
             generate_for_train, generate_for_eval = build_lora_http_generators(
                 args,
                 model,
-                run_name,
+                run_dir,
             )
         else:
             generate_for_train, generate_for_eval = build_lora_local_generators(
@@ -1222,6 +1231,9 @@ def main(argv=None):
     if args.optimizer == "muon":
         assert_muon_routing(args.train_mode, trainable_named_params, optimizer)
     scheduler = build_lr_scheduler(args, optimizer, num_training_steps)
+    normalize_blocktt_after_update = (
+        args.train_mode == "blocktt" and args.blocktt_normalize_after_update
+    )
 
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
@@ -1353,6 +1365,8 @@ def main(argv=None):
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
+                    if normalize_blocktt_after_update:
+                        normalize_trainable_blocktt_cores_(model)
                     if scheduler is not None:
                         scheduler.step()
                     optimizer.zero_grad()
@@ -1407,14 +1421,21 @@ def main(argv=None):
         if (i + 1) % 5 == 0:
             eval_model(i + 1)
 
-    if args.enable_save_ckpt:
-        ckpt_dir = os.path.join(run_name, "final_ckpt")
-        print(f"Saving model checkpoint to {ckpt_dir}")
-        model.save_pretrained(ckpt_dir)
-        tokenizer.save_pretrained(ckpt_dir)
-        print(f"Checkpoint saved to {ckpt_dir}")
-    else:
-        print("Final checkpoint save disabled (--enable-save-ckpt not set).")
+        # Save checkpoints after first update, at step 10, and at final step
+        if args.enable_save_ckpt:
+            step_num = i + 1
+            is_first = step_num == 1
+            is_step_10 = step_num == 10
+            is_final = step_num == args.n_grpo_steps
+            if is_first or is_step_10 or is_final:
+                ckpt_dir = os.path.join(run_dir, f"step={step_num}")
+                print(f"Saving checkpoint to {ckpt_dir}")
+                model.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+                print(f"Checkpoint saved to {ckpt_dir}")
+
+    if not args.enable_save_ckpt:
+        print("Checkpoint saving disabled (--enable-save-ckpt not set).")
 
     if not args.no_wandb:
         wandb.finish()
