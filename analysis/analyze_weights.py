@@ -132,8 +132,8 @@ def compute_update_row_col_norms(
     Returns:
         (row_norms, col_norms) as numpy arrays.
     """
-    row_norms = torch.norm(delta_W, dim=1).numpy()
-    col_norms = torch.norm(delta_W, dim=0).numpy()
+    row_norms = torch.norm(delta_W, dim=1).cpu().numpy()
+    col_norms = torch.norm(delta_W, dim=0).cpu().numpy()
     return row_norms, col_norms
 
 
@@ -242,6 +242,8 @@ def parse_args(argv=None):
     p.add_argument("--layers", type=str, default=None,
                     help="Comma-separated layer indices for detailed analysis (default: 0,mid,last)")
     p.add_argument("--update-threshold", type=float, default=0.01)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                    help="Device for SVD computation (default: cuda if available)")
     args = p.parse_args(argv)
     if args.layers is not None:
         args.layers = [int(x) for x in args.layers.split(",")]
@@ -307,6 +309,8 @@ def analyze(args) -> dict:
         lora_r = cfg["r"]
 
     detailed_layers = set(args.layers)
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
 
     results = {
         "meta": {
@@ -346,7 +350,7 @@ def analyze(args) -> dict:
                 layer_norms.append(0.0)
                 continue
 
-            W_before = W_before.float()
+            W_before = W_before.float().to(device)
 
             # Reconstruct W_after
             ckpt_keys = get_checkpoint_keys(layer_idx, mod, args.train_mode)
@@ -360,7 +364,10 @@ def analyze(args) -> dict:
                     layer_overlap.append(0.0)
                     layer_norms.append(0.0)
                     continue
-                W_after = materialize_blocktt_weight(btt_l.float(), btt_r.float(), btt_s=btt_s.float() if btt_s is not None else None)
+                W_after = materialize_blocktt_weight(
+                    btt_l.float().to(device), btt_r.float().to(device),
+                    btt_s=btt_s.float().to(device) if btt_s is not None else None,
+                )
             elif args.train_mode == "svd":
                 svd_a = load_tensor(ckpt_index, ckpt_keys["svd_a"])
                 svd_b = load_tensor(ckpt_index, ckpt_keys["svd_b"])
@@ -371,7 +378,10 @@ def analyze(args) -> dict:
                     layer_overlap.append(0.0)
                     layer_norms.append(0.0)
                     continue
-                W_after = materialize_svd_weight(svd_a.float(), svd_b.float(), svd_s=svd_s.float() if svd_s is not None else None)
+                W_after = materialize_svd_weight(
+                    svd_a.float().to(device), svd_b.float().to(device),
+                    svd_s=svd_s.float().to(device) if svd_s is not None else None,
+                )
             elif args.train_mode == "lora":
                 lora_A = load_tensor(ckpt_index, ckpt_keys["lora_A"])
                 lora_B = load_tensor(ckpt_index, ckpt_keys["lora_B"])
@@ -381,7 +391,10 @@ def analyze(args) -> dict:
                     layer_overlap.append(0.0)
                     layer_norms.append(0.0)
                     continue
-                W_after = reconstruct_lora_weight(W_before, lora_A.float(), lora_B.float(), lora_alpha, lora_r)
+                W_after = reconstruct_lora_weight(
+                    W_before, lora_A.float().to(device), lora_B.float().to(device),
+                    lora_alpha, lora_r,
+                )
 
             delta_W = W_after - W_before
 
