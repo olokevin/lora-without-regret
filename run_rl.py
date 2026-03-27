@@ -5,6 +5,7 @@ Examples:
   uv run run_rl.py --train-mode full --lr 1e-5 --no-wandb
   uv run run_rl.py --train-mode full --optimizer muon --lr 1e-5 --no-wandb
   uv run run_rl.py --train-mode lora --lr 1e-4 --lora-rank 1 --trainable-type all --no-wandb
+  uv run run_rl.py --train-mode lora_full --lr 1e-4 --lora-rank 1 --trainable-type all --no-wandb
   uv run run_rl.py --train-mode blocktt --lr 1e-4 --trainable-type all --decomp-mode input_one_block --train-position small --no-wandb
   uv run run_rl.py --train-mode svd --lr 1e-4 --trainable-type all --train-position output --no-wandb
 """
@@ -21,6 +22,7 @@ from pathlib import Path
 import requests
 import torch
 import wandb
+from safetensors.torch import save_file as save_safetensors_file
 from btt_layer import (
     BTTLayer,
     BLOCKTT_DECOMP_GROUP_TO_MODULES,
@@ -57,6 +59,12 @@ MODE_DEFAULTS = {
         "micro_batch_size": 2,
         "gradient_accumulation_steps": 128,
     },
+    "lora_full": {
+        "lr": 9e-5,
+        "wandb_project": "math-grpo-lora-full",
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
+    },
     "blocktt": {
         "lr": 9e-5,
         "wandb_project": "math-grpo-blocktt",
@@ -78,8 +86,8 @@ def parse_args(argv=None):
         "--train-mode",
         type=str,
         required=True,
-        choices=["full", "lora", "blocktt", "svd"],
-        help="Training mode: full, lora, blocktt, or svd",
+        choices=["full", "lora", "lora_full", "blocktt", "svd"],
+        help="Training mode: full, lora, lora_full, blocktt, or svd",
     )
 
     # Shared configuration
@@ -211,8 +219,31 @@ def parse_args(argv=None):
         action="store_true",
         help="Save checkpoints at step 1, step 10, and final step (default: disabled)",
     )
+    parser.add_argument(
+        "--save-first-step-grads-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to save raw gradients at the first optimizer step "
+            "(safetensors)."
+        ),
+    )
+    parser.add_argument(
+        "--save-first-step-grads-prefixes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated parameter-name prefixes to include when saving first-step "
+            "grads. If omitted, all trainable grads are saved."
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-first-step",
+        action="store_true",
+        help="Stop training immediately after the first optimizer step.",
+    )
 
-    # LoRA-only args
+    # LoRA-family args (lora / lora_full)
     parser.add_argument(
         "--lora-rank", type=int, default=1, help="LoRA rank (default: 1)"
     )
@@ -220,7 +251,7 @@ def parse_args(argv=None):
         "--vllm-url",
         type=str,
         default="http://localhost:8000",
-        help="URL for vLLM API server (lora mode only)",
+        help="URL for vLLM API server (lora mode only; lora_full uses local in-process rollout)",
     )
 
     # BlockTT-only args
@@ -333,11 +364,11 @@ def validate_mode_specific_flags(args, argv):
         "svd": [],
     }
 
-    if args.train_mode != "lora":
+    if args.train_mode not in {"lora", "lora_full"}:
         passed = [f for f in mode_to_flag_sets["lora"] if _flag_was_passed(argv, f)]
         if passed:
             raise ValueError(
-                f"{', '.join(passed)} is only valid when --train-mode lora"
+                f"{', '.join(passed)} is only valid when --train-mode lora or lora_full"
             )
 
     if args.train_mode != "blocktt":
@@ -358,10 +389,13 @@ def validate_mode_specific_flags(args, argv):
         args.decomp_mode_display = format_blocktt_decomp_mode(decomp_mode)
 
     if args.train_mode == "full" and _flag_was_passed(argv, "--trainable-type"):
-        raise ValueError("--trainable-type is only valid when --train-mode lora, blocktt, or svd")
+        raise ValueError(
+            "--trainable-type is only valid when --train-mode "
+            "lora, lora_full, blocktt, or svd"
+        )
 
     train_position_passed = _flag_was_passed(argv, "--train-position")
-    if args.train_mode in {"full", "lora"} and train_position_passed:
+    if args.train_mode in {"full", "lora", "lora_full"} and train_position_passed:
         raise ValueError("--train-position is only valid when --train-mode blocktt or svd")
     if args.train_mode == "blocktt" and train_position_passed:
         if args.train_position not in {"small", "large", "both"}:
@@ -371,7 +405,7 @@ def validate_mode_specific_flags(args, argv):
             raise ValueError("--train-position for svd must be one of: output, input")
 
     s_merged_to_passed = _flag_was_passed(argv, "--s-merged-to")
-    if args.train_mode in {"full", "lora"} and s_merged_to_passed:
+    if args.train_mode in {"full", "lora", "lora_full"} and s_merged_to_passed:
         raise ValueError("--s-merged-to is only valid when --train-mode blocktt or svd")
     if (
         args.train_mode == "blocktt"
@@ -554,6 +588,8 @@ def compute_run_name(args, mode_info: dict) -> str:
         return f"{args.model_id}_{args.lr:.1e}_full"
     if args.train_mode == "lora":
         return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+    if args.train_mode == "lora_full":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_lora_full"
     if args.train_mode == "blocktt":
         decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
         return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
@@ -566,6 +602,19 @@ def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
     run_dir = os.path.join(base_dir, train_mode, f"{run_name}-{timestamp}")
     os.makedirs(run_dir)
     return run_dir
+
+
+def should_save_checkpoint(step_num: int, total_steps: int) -> bool:
+    return step_num == 1 or step_num == 10 or step_num == total_steps
+
+
+def save_checkpoint(model, tokenizer, run_dir: str, step_num: int):
+    ckpt_dir = os.path.join(run_dir, f"step={step_num}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"Saving checkpoint to {ckpt_dir}")
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    print(f"Checkpoint saved to {ckpt_dir}")
 
 
 def maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps):
@@ -612,6 +661,14 @@ def is_vllm_http_available(vllm_url: str, timeout_sec: float = 2.0) -> bool:
     except requests.RequestException:
         return False
     return response.ok
+
+
+def resolve_lora_rollout_backend(train_mode: str, vllm_url: str) -> str | None:
+    if train_mode == "lora_full":
+        return "local_inproc"
+    if train_mode == "lora":
+        return "http" if is_vllm_http_available(vllm_url) else "local_inproc"
+    return None
 
 
 def normalize_lora_merged_weight_name(name: str) -> str | None:
@@ -857,7 +914,7 @@ def assert_muon_routing(train_mode, trainable_named_params, optimizer):
             )
         return
 
-    if train_mode == "lora":
+    if train_mode in {"lora", "lora_full"}:
         lora_ids = _param_ids_by_suffix(("lora_A", "lora_B"))
         if len(lora_ids) == 0:
             raise ValueError(
@@ -999,20 +1056,24 @@ def main(argv=None):
     args = parse_args(argv)
     validate_mode_specific_flags(args, argv)
     apply_mode_defaults(args)
+    grad_prefixes = None
+    if args.save_first_step_grads_prefixes is not None:
+        grad_prefixes = [
+            p.strip()
+            for p in args.save_first_step_grads_prefixes.split(",")
+            if p.strip()
+        ]
 
     set_seed(args.seed)
-    lora_rollout_backend = None
-    if args.train_mode == "lora":
-        lora_rollout_backend = (
-            "http" if is_vllm_http_available(args.vllm_url) else "local_inproc"
-        )
+    lora_rollout_backend = resolve_lora_rollout_backend(args.train_mode, args.vllm_url)
 
     mode_info = {}
-    if args.train_mode == "lora":
+    if args.train_mode in {"lora", "lora_full"}:
         lora_target_modules = get_lora_target_modules(args.trainable_type)
         mode_info.update(
             {
                 "lora_rank": args.lora_rank,
+                "lora_full_backbone_trainable": args.train_mode == "lora_full",
                 "trainable_type": args.trainable_type,
                 "target_modules": lora_target_modules,
                 "vllm_url": args.vllm_url,
@@ -1077,9 +1138,13 @@ def main(argv=None):
     print(f"  Epochs per step: {args.epochs_per_step}")
     print(f"  Micro batch size: {args.micro_batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-    if args.train_mode == "lora":
+    if args.train_mode in {"lora", "lora_full"}:
         print(f"  LoRA rank: {args.lora_rank}")
         print(f"  Trainable type: {args.trainable_type}")
+        print(
+            "  Backbone trainable: "
+            f"{'yes' if args.train_mode == 'lora_full' else 'no'}"
+        )
         print(f"  Target modules: {mode_info['target_modules']}")
         print(f"  Rollout backend: {lora_rollout_backend}")
         print(f"  vLLM URL: {args.vllm_url}")
@@ -1129,7 +1194,7 @@ def main(argv=None):
     )
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
-    if args.train_mode == "lora":
+    if args.train_mode in {"lora", "lora_full"}:
         from peft import LoraConfig, get_peft_model
 
         peft_config = LoraConfig(
@@ -1138,6 +1203,9 @@ def main(argv=None):
             target_modules=mode_info["target_modules"],
         )
         model = get_peft_model(model, peft_config)
+        if args.train_mode == "lora_full":
+            for p in model.parameters():
+                p.requires_grad = True
         model.print_trainable_parameters()
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     elif args.train_mode == "blocktt":
@@ -1212,7 +1280,7 @@ def main(argv=None):
     trainable_params = [p for _, p in trainable_named_params]
     validate_trainable_params(trainable_params)
 
-    if args.train_mode == "lora":
+    if args.train_mode in {"lora", "lora_full"}:
         if lora_rollout_backend == "http":
             generate_for_train, generate_for_eval = build_lora_http_generators(
                 args,
@@ -1234,6 +1302,9 @@ def main(argv=None):
     normalize_blocktt_after_update = (
         args.train_mode == "blocktt" and args.blocktt_normalize_after_update
     )
+    first_step_grads_saved = False
+    optimizer_steps = 0
+    stop_requested = False
 
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
@@ -1362,6 +1433,37 @@ def main(argv=None):
                 loss.backward()
 
                 if (b + 1) % args.gradient_accumulation_steps == 0:
+                    if (
+                        args.save_first_step_grads_path is not None
+                        and not first_step_grads_saved
+                    ):
+                        grad_payload = {}
+                        for name, p in trainable_named_params:
+                            if p.grad is None:
+                                continue
+                            if grad_prefixes is not None and not any(
+                                name.startswith(prefix) for prefix in grad_prefixes
+                            ):
+                                continue
+                            grad_payload[name] = p.grad.detach().cpu()
+                        if len(grad_payload) == 0:
+                            raise ValueError(
+                                "No gradients matched --save-first-step-grads-prefixes "
+                                f"for path {args.save_first_step_grads_path}"
+                            )
+                        grad_dir = os.path.dirname(args.save_first_step_grads_path)
+                        if grad_dir:
+                            os.makedirs(grad_dir, exist_ok=True)
+                        save_safetensors_file(
+                            grad_payload,
+                            args.save_first_step_grads_path,
+                        )
+                        first_step_grads_saved = True
+                        print(
+                            "Saved first-step gradients to "
+                            f"{args.save_first_step_grads_path} "
+                            f"({len(grad_payload)} tensors)"
+                        )
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
@@ -1370,6 +1472,14 @@ def main(argv=None):
                     if scheduler is not None:
                         scheduler.step()
                     optimizer.zero_grad()
+                    optimizer_steps += 1
+                    if args.stop_after_first_step and optimizer_steps >= 1:
+                        stop_requested = True
+                        break
+            if stop_requested:
+                break
+        if stop_requested:
+            print("Stopping early after first optimizer step (--stop-after-first-step).")
 
         training_time = time.time() - training_start
         step_time = time.time() - step_start_time
@@ -1424,15 +1534,10 @@ def main(argv=None):
         # Save checkpoints after first update, at step 10, and at final step
         if args.enable_save_ckpt:
             step_num = i + 1
-            is_first = step_num == 1
-            is_step_10 = step_num == 10
-            is_final = step_num == args.n_grpo_steps
-            if is_first or is_step_10 or is_final:
-                ckpt_dir = os.path.join(run_dir, f"step={step_num}")
-                print(f"Saving checkpoint to {ckpt_dir}")
-                model.save_pretrained(ckpt_dir)
-                tokenizer.save_pretrained(ckpt_dir)
-                print(f"Checkpoint saved to {ckpt_dir}")
+            if should_save_checkpoint(step_num, args.n_grpo_steps):
+                save_checkpoint(model, tokenizer, run_dir, step_num)
+        if stop_requested:
+            break
 
     if not args.enable_save_ckpt:
         print("Checkpoint saving disabled (--enable-save-ckpt not set).")

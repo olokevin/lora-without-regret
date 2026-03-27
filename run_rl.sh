@@ -29,6 +29,11 @@ run_full()
   local optimizer="${OPTIMIZER:-adamw}"
   local run_name="${train_mode}-${optimizer}-lr_${lr}"
   local device="${DEVICE:-2}"
+  local -a cfg_suffix_args=()
+  if [[ -n "${CFG_SUFFIX:-}" ]]; then
+    # Intended for trusted local overrides, e.g. CFG_SUFFIX="--flag --arg value".
+    read -r -a cfg_suffix_args <<< "${CFG_SUFFIX}"
+  fi
 
   CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
     --train-mode "$train_mode" \
@@ -36,12 +41,43 @@ run_full()
     --optimizer "$optimizer" \
     --model-id Qwen/Qwen3-1.7B \
     --wandb-project qwen3-1_7B-RL \
-    --wandb-run-name "$run_name"
+    --wandb-run-name "$run_name" \
+    "${cfg_suffix_args[@]}"
 }
 
 run_lora()
 {
   local train_mode="lora"
+  local lr="${LR:-2e-4}"
+  local optimizer="${OPTIMIZER:-adamw}"
+  local lora_rank="${LORA_RANK:-64}"
+  local trainable_type="${TRAINABLE_TYPE:-all}"
+  local name_suffix="${NAME_SUFFIX:-}"
+  local run_name="${train_mode}-${optimizer}-lr_${lr}-rank_${lora_rank}${name_suffix}"
+  local device="${DEVICE:-2}"
+  local vllm_url="${VLLM_URL:-http://localhost:8000}"
+  local -a cfg_suffix_args=()
+  if [[ -n "${CFG_SUFFIX:-}" ]]; then
+    # Intended for trusted local overrides, e.g. CFG_SUFFIX="--flag --arg value".
+    read -r -a cfg_suffix_args <<< "${CFG_SUFFIX}"
+  fi
+
+  CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
+    --train-mode "$train_mode" \
+    --lr "$lr" \
+    --optimizer "$optimizer" \
+    --lora-rank "$lora_rank" \
+    --trainable-type "$trainable_type" \
+    --vllm-url "$vllm_url" \
+    --model-id Qwen/Qwen3-1.7B \
+    --wandb-project qwen3-1_7B-RL \
+    --wandb-run-name "$run_name" \
+    "${cfg_suffix_args[@]}"
+}
+
+run_lora_full()
+{
+  local train_mode="lora_full"
   local lr="${LR:-2e-4}"
   local optimizer="${OPTIMIZER:-adamw}"
   local lora_rank="${LORA_RANK:-64}"
@@ -238,6 +274,8 @@ if [[ "$TRAIN_MODE" == "full" ]]; then
     run_full
 elif [[ "$TRAIN_MODE" == "lora" ]]; then
     run_lora
+elif [[ "$TRAIN_MODE" == "lora_full" ]]; then
+    run_lora_full
 elif [[ "$TRAIN_MODE" == "svd" ]]; then
     run_svd
 elif [[ "$TRAIN_MODE" == "blocktt" ]]; then
@@ -248,7 +286,7 @@ elif [[ "$TRAIN_MODE" == "sequential" ]]; then
     run_sequential
 else
     echo "Unsupported train mode: $TRAIN_MODE"
-    echo "Use TRAIN_MODE=full|lora|svd|blocktt|sequential"
+    echo "Use TRAIN_MODE=full|lora|lora_full|svd|blocktt|sequential"
     exit 1
 fi
 
@@ -256,6 +294,7 @@ fi
 ### shell scripts
 # DEVICE=4 LR=1e-5 TRAIN_MODE=full bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=0 LR=8e-5 TRAIN_MODE=lora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=8e-5 TRAIN_MODE=lora_full LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=1 LR=8e-5 TRAIN_MODE=svd bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt bash run_rl.sh >/dev/null 2>&1 &
 
@@ -268,4 +307,3 @@ fi
 # DEVICE=1 LR=1e-5 TRAIN_MODE=svd TRAIN_POSITION=input S_MERGED_TO=keep CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=2 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=frozen CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=3 LR=1e-5 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
-

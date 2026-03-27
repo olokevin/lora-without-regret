@@ -2,6 +2,7 @@ import unittest
 import json
 import tempfile
 import os
+from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from analysis.analyze_weights import materialize_blocktt_weight
@@ -16,6 +17,13 @@ from analysis.analyze_weights import (
     compute_principal_angles,
     compute_principal_weight_overlap,
     compute_update_spectrum,
+)
+from analysis.plot_singular_relationship import (
+    build_singular_maps,
+    factor_keys_for_mode,
+    find_max_step,
+    flatten_heatmap_tensor,
+    resolve_trained_sides,
 )
 
 
@@ -276,6 +284,58 @@ class TestBuildReport(unittest.TestCase):
                 content = f.read()
             self.assertIn("plotly", content.lower())
             self.assertIn("test", content)  # meta.base_model
+
+
+class TestSingularRelationshipHelpers(unittest.TestCase):
+    def test_factor_keys_for_svd(self):
+        keys = factor_keys_for_mode("svd", "model.layers.0.self_attn.q_proj")
+        self.assertEqual(keys["left"], "model.layers.0.self_attn.q_proj.svd_a")
+        self.assertEqual(keys["right"], "model.layers.0.self_attn.q_proj.svd_b")
+        self.assertEqual(keys["singular"], "model.layers.0.self_attn.q_proj.svd_s")
+
+    def test_blocktt_flatten_shapes(self):
+        l = torch.zeros(2, 6, 4)
+        r = torch.zeros(3, 5, 4)
+        self.assertEqual(tuple(flatten_heatmap_tensor("blocktt", "left", l).shape), (12, 4))
+        self.assertEqual(tuple(flatten_heatmap_tensor("blocktt", "right", r).shape), (15, 4))
+
+    def test_svd_singular_maps_shapes(self):
+        s = torch.tensor([3.0, 2.0, 1.0])
+        u = torch.zeros(5, 3)
+        v = torch.zeros(3, 4)
+        left_map, right_map = build_singular_maps("svd", s, u, v)
+        self.assertEqual(tuple(left_map.shape), (5, 3))
+        self.assertEqual(tuple(right_map.shape), (3, 4))
+
+    def test_find_max_step(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            (run_dir / "step=1").mkdir()
+            (run_dir / "step=10").mkdir()
+            (run_dir / "step=50").mkdir()
+            self.assertEqual(find_max_step(run_dir), 50)
+
+    def test_resolve_trained_sides_svd_input(self):
+        l = torch.zeros(8, 4)
+        r = torch.zeros(4, 16)
+        sides = resolve_trained_sides(
+            "svd",
+            {"train_position": "input"},
+            l,
+            r,
+        )
+        self.assertEqual(sides, ["right"])
+
+    def test_resolve_trained_sides_blocktt_small(self):
+        l = torch.zeros(1, 8, 16)  # 128 elems
+        r = torch.zeros(2, 16, 16)  # 512 elems
+        sides = resolve_trained_sides(
+            "blocktt",
+            {"train_position": "small"},
+            l,
+            r,
+        )
+        self.assertEqual(sides, ["left"])
 
 
 class TestEndToEnd(unittest.TestCase):
