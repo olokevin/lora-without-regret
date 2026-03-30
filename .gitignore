@@ -17,6 +17,11 @@ logs/
 docs/
 analysis_results/
 
+adapter_fusion/
+deberta_tune/
+mistral_tune/
+adapter_efficiency/
+
 *.safetensors
 *.pth
 
