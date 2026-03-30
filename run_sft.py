@@ -126,6 +126,31 @@ def parse_args(argv=None):
         default=0.1,
         help="Minimum LR ratio for cosine scheduler (default: 0.1)",
     )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="Weight decay for optimizer (default: 0.01)",
+    )
+    parser.add_argument(
+        "--lr-adam",
+        type=float,
+        default=None,
+        help="Muon-only: AdamW fallback learning rate (default: inherit --lr)",
+    )
+    parser.add_argument(
+        "--lr-embedding",
+        type=float,
+        default=None,
+        help="Muon-only: embedding AdamW learning rate (default: inherit AdamW lr)",
+    )
+    parser.add_argument(
+        "--norm-method",
+        type=str,
+        default=None,
+        choices=["row", "col", "row-col", "col-row", "shape"],
+        help="Muon-only: optional update normalization method",
+    )
 
     # LoRA-only args
     parser.add_argument(
@@ -622,9 +647,20 @@ def validate_trainable_params(trainable_params):
 
 def build_optimizer(args, trainable_params, trainable_named_params):
     if args.optimizer == "adamw":
-        return torch.optim.AdamW(trainable_params, lr=args.lr)
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     if args.optimizer == "muon":
-        return Muon(trainable_named_params, lr=args.lr, weight_decay=0.01)
+        return Muon(
+            trainable_named_params,
+            lr=args.lr,
+            lr_adam=args.lr_adam,
+            lr_embedding=args.lr_embedding,
+            weight_decay=args.weight_decay,
+            norm_method=args.norm_method,
+        )
     raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
@@ -749,6 +785,10 @@ def main(argv=None):
                 "warmup_ratio": args.warmup_ratio,
                 "cycle_length": args.cycle_length,
                 "min_lr_ratio": args.min_lr_ratio,
+                "weight_decay": args.weight_decay,
+                "lr_adam": args.lr_adam,
+                "lr_embedding": args.lr_embedding,
+                "norm_method": args.norm_method,
                 "seed": args.seed,
                 "enable_save_ckpt": args.enable_save_ckpt,
                 **mode_info["wandb_extra"],
@@ -761,8 +801,17 @@ def main(argv=None):
     print(f"  Model ID: {args.model_id}")
     print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  Weight decay: {args.weight_decay}")
     print(f"  LR scheduler: {args.lr_scheduler}")
     print(f"  Warmup ratio: {args.warmup_ratio}")
+    if args.optimizer == "muon":
+        print(f"  Muon Adam LR: {args.lr_adam if args.lr_adam is not None else args.lr}")
+        if args.lr_embedding is None:
+            embedding_lr = args.lr_adam if args.lr_adam is not None else args.lr
+            print(f"  Muon Embedding LR: {embedding_lr}")
+        else:
+            print(f"  Muon Embedding LR: {args.lr_embedding}")
+        print(f"  Muon norm method: {args.norm_method}")
     if args.lr_scheduler == "cosine":
         print(f"  Cycle length: {args.cycle_length}")
         print(f"  Min LR ratio: {args.min_lr_ratio}")
