@@ -243,5 +243,40 @@ class TestKLLoss(unittest.TestCase):
         self.assertFalse(torch.isnan(loss_half))
 
 
+class TestCheckpointSaving(unittest.TestCase):
+    def test_save_kd_checkpoint_creates_safetensors(self):
+        import run_kd
+
+        model = torch.nn.Linear(4, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_kd.save_kd_checkpoint(model, tmp, step=1)
+            ckpt_dir = os.path.join(tmp, "step=1")
+            self.assertTrue(os.path.isdir(ckpt_dir))
+            self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "model.safetensors")))
+
+    def test_save_kd_checkpoint_roundtrips_weights(self):
+        import run_kd
+        from safetensors.torch import load_file
+
+        model = torch.nn.Linear(4, 2, bias=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_kd.save_kd_checkpoint(model, tmp, step=5)
+            loaded = load_file(os.path.join(tmp, "step=5", "model.safetensors"))
+            torch.testing.assert_close(loaded["weight"], model.weight.data.cpu())
+            torch.testing.assert_close(loaded["bias"], model.bias.data.cpu())
+
+    def test_parse_save_steps_with_final(self):
+        import run_kd
+
+        steps = run_kd.parse_save_steps("1,10,final", total_steps=50)
+        self.assertEqual(steps, {1, 10, 50})
+
+    def test_parse_save_steps_deduplicates(self):
+        import run_kd
+
+        steps = run_kd.parse_save_steps("1,10,10,final", total_steps=10)
+        self.assertEqual(steps, {1, 10})
+
+
 if __name__ == "__main__":
     unittest.main()

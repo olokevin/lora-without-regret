@@ -427,3 +427,15 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
     masked_kl = kl_per_token * response_mask
     num_tokens = response_mask.sum().clamp(min=1)
     return masked_kl.sum() / num_tokens
+
+
+def save_kd_checkpoint(model, output_dir, step):
+    """Save model checkpoint in step={N}/model.safetensors format."""
+    ckpt_dir = os.path.join(output_dir, f"step={step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    state_dict = {
+        name: param.detach().cpu()
+        for name, param in model.named_parameters()
+    }
+    save_safetensors_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
+    print(f"Saved checkpoint to {ckpt_dir}")
