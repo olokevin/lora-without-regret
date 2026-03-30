@@ -17,6 +17,7 @@ import sys
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 import wandb
 from btt_layer import (
     BLOCKTT_DECOMP_GROUP_TO_MODULES,
@@ -383,3 +384,46 @@ class KDKlDataset(Dataset):
             "teacher_topk_values": topk_values,
             "teacher_topk_indices": topk_indices,
         }
+
+
+def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, response_mask):
+    """
+    Compute token-wise KL(student || teacher) over teacher's top-K positions.
+
+    Args:
+        student_logits: [batch, seq_len, vocab_size]
+        teacher_topk_values: [batch, seq_len, K] - teacher logits (NOT log-probs)
+        teacher_topk_indices: [batch, seq_len, K] - token indices for top-K
+        response_mask: [batch, seq_len] - 1 for response tokens, 0 for padding
+
+    Returns:
+        Scalar KL loss averaged over response tokens.
+    """
+    batch, seq_len, K = teacher_topk_values.shape
+
+    # Gather student logits at teacher's top-K positions
+    # teacher_topk_indices: [batch, seq_len, K]
+    student_topk_logits = torch.gather(student_logits, dim=2, index=teacher_topk_indices.long())
+    # student_topk_logits: [batch, seq_len, K]
+
+    # Compute log-softmax over K positions for both
+    student_log_probs = F.log_softmax(student_topk_logits, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_topk_values.float(), dim=-1)
+
+    # KL(student || teacher) = sum_k student_prob * (log_student_prob - log_teacher_prob)
+    # Using F.kl_div: expects input=log_probs, target=log_probs with log_target=True
+    # kl_div computes: target * (log_target - input) when log_target=True
+    # This gives KL(target || input), so we swap: input=teacher, target=student
+    # Actually: KL(student || teacher) = sum student * (log_student - log_teacher)
+    # F.kl_div(input=log_teacher, target=log_student, log_target=True) gives KL(student || teacher)
+    kl_per_token = F.kl_div(
+        teacher_log_probs,
+        student_log_probs,
+        log_target=True,
+        reduction="none",
+    ).sum(dim=-1)  # [batch, seq_len]
+
+    # Mask and average
+    masked_kl = kl_per_token * response_mask
+    num_tokens = response_mask.sum().clamp(min=1)
+    return masked_kl.sum() / num_tokens

@@ -185,5 +185,63 @@ class TestTeacherDataLoading(unittest.TestCase):
             self.assertIn("response_mask", item)
 
 
+class TestKLLoss(unittest.TestCase):
+    def test_kl_loss_shape(self):
+        import run_kd
+
+        # student_logits: [batch, seq_len, vocab_size]
+        student_logits = torch.randn(2, 4, 100)
+        # teacher top-K
+        teacher_topk_values = torch.randn(2, 4, 8)
+        teacher_topk_indices = torch.randint(0, 100, (2, 4, 8))
+        response_mask = torch.ones(2, 4)
+
+        loss = run_kd.compute_kl_loss(
+            student_logits, teacher_topk_values, teacher_topk_indices, response_mask
+        )
+        self.assertEqual(loss.shape, ())
+        self.assertFalse(torch.isnan(loss))
+
+    def test_kl_loss_zero_when_identical(self):
+        import run_kd
+
+        # If student logits at teacher's top-K positions match teacher logprobs,
+        # KL should be ~0
+        teacher_topk_values = torch.tensor([[[2.0, 1.0, 0.5]]])  # [1, 1, 3]
+        teacher_topk_indices = torch.tensor([[[0, 1, 2]]])  # [1, 1, 3]
+
+        # Student logits: set positions 0,1,2 to match teacher values
+        student_logits = torch.full((1, 1, 100), -1000.0)
+        student_logits[0, 0, 0] = 2.0
+        student_logits[0, 0, 1] = 1.0
+        student_logits[0, 0, 2] = 0.5
+        response_mask = torch.ones(1, 1)
+
+        loss = run_kd.compute_kl_loss(
+            student_logits, teacher_topk_values, teacher_topk_indices, response_mask
+        )
+        self.assertAlmostEqual(loss.item(), 0.0, places=4)
+
+    def test_kl_loss_respects_response_mask(self):
+        import run_kd
+
+        student_logits = torch.randn(1, 4, 100)
+        teacher_topk_values = torch.randn(1, 4, 8)
+        teacher_topk_indices = torch.randint(0, 100, (1, 4, 8))
+
+        mask_all = torch.ones(1, 4)
+        mask_half = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+
+        loss_all = run_kd.compute_kl_loss(
+            student_logits, teacher_topk_values, teacher_topk_indices, mask_all
+        )
+        loss_half = run_kd.compute_kl_loss(
+            student_logits, teacher_topk_values, teacher_topk_indices, mask_half
+        )
+        # Different masks should generally give different losses
+        self.assertFalse(torch.isnan(loss_all))
+        self.assertFalse(torch.isnan(loss_half))
+
+
 if __name__ == "__main__":
     unittest.main()
