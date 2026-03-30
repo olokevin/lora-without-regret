@@ -278,5 +278,158 @@ class TestCheckpointSaving(unittest.TestCase):
         self.assertEqual(steps, {1, 10})
 
 
+from unittest.mock import patch, Mock
+
+
+class _DummyModel(torch.nn.Module):
+    def __init__(self, vocab_size=100):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(4, 4))
+        self._vocab_size = vocab_size
+        self.device = torch.device("cpu")
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        batch, seq_len = input_ids.shape
+        # Use self.weight so logits are connected to the parameter graph
+        dummy = self.weight.sum() * 0
+        logits = torch.zeros(batch, seq_len, self._vocab_size) + dummy
+
+        loss = None
+        if labels is not None:
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, self._vocab_size),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return type("Out", (), {"logits": logits, "loss": loss})()
+
+    def named_parameters(self, recurse=True):
+        yield "weight", self.weight
+
+    def parameters(self, recurse=True):
+        yield self.weight
+
+    def train(self, mode=True):
+        return self
+
+    def eval(self):
+        return self
+
+    def save_pretrained(self, path):
+        os.makedirs(path, exist_ok=True)
+
+
+class TestRunKdIntegration(unittest.TestCase):
+    def _create_teacher_data(self, tmp_dir, num_examples=8, top_k=8, max_tokens=16):
+        """Create minimal teacher data directory for testing."""
+        config = {
+            "teacher_model_id": "test/teacher",
+            "dataset": "test/data",
+            "dataset_split": "train[:8]",
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+            "shared_vocab_size": 100,
+            "num_examples": num_examples,
+            "prompt_template": "boxed.prompt",
+            "temperature": 0,
+        }
+        with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+            json.dump(config, f)
+
+        with open(os.path.join(tmp_dir, "completions.jsonl"), "w") as f:
+            for i in range(num_examples):
+                entry = {
+                    "index": i,
+                    "question": f"Q{i}",
+                    "ground_truth": str(i),
+                    "prompt": f"prompt {i}",
+                    "completion": f"answer {i}",
+                    "token_ids": list(range(max_tokens)),
+                }
+                f.write(json.dumps(entry) + "\n")
+
+        logits_dir = os.path.join(tmp_dir, "logits")
+        os.makedirs(logits_dir)
+        save_safetensors_file(
+            {
+                "topk_values": torch.randn(num_examples, max_tokens, top_k, dtype=torch.bfloat16),
+                "topk_indices": torch.randint(0, 100, (num_examples, max_tokens, top_k), dtype=torch.int32),
+                "seq_lengths": torch.full((num_examples,), max_tokens, dtype=torch.int32),
+            },
+            os.path.join(logits_dir, "chunk_0.safetensors"),
+        )
+
+    def test_sft_mode_runs(self):
+        import run_kd
+
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._create_teacher_data(data_dir)
+            model = _DummyModel(vocab_size=100)
+
+            argv = [
+                "--kd-loss-type", "sft",
+                "--train-mode", "full",
+                "--teacher-data-dir", data_dir,
+                "--student-model-id", "test/student",
+                "--output-dir", out_dir,
+                "--batch-size", "2",
+                "--gradient-accumulation-steps", "1",
+                "--num-epochs", "1",
+                "--no-wandb",
+                "--enable-save-ckpt",
+                "--save-steps", "1,final",
+            ]
+
+            with (
+                patch("run_kd.prepare_model", return_value=(
+                    model,
+                    list(model.parameters()),
+                    list(model.named_parameters()),
+                    {"wandb_extra": {}, "print_lines": []},
+                )),
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=type(
+                    "Tok", (), {"pad_token_id": 0, "eos_token_id": 0}
+                )()),
+            ):
+                run_kd.main(argv)
+
+            # Check that step=1 checkpoint was saved
+            self.assertTrue(os.path.isdir(os.path.join(out_dir, "step=1")))
+
+    def test_kl_mode_runs(self):
+        import run_kd
+
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._create_teacher_data(data_dir, top_k=8)
+            model = _DummyModel(vocab_size=100)
+
+            argv = [
+                "--kd-loss-type", "kl",
+                "--train-mode", "full",
+                "--teacher-data-dir", data_dir,
+                "--student-model-id", "test/student",
+                "--output-dir", out_dir,
+                "--top-k", "8",
+                "--batch-size", "2",
+                "--gradient-accumulation-steps", "1",
+                "--num-epochs", "1",
+                "--no-wandb",
+            ]
+
+            with (
+                patch("run_kd.prepare_model", return_value=(
+                    model,
+                    list(model.parameters()),
+                    list(model.named_parameters()),
+                    {"wandb_extra": {}, "print_lines": []},
+                )),
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=type(
+                    "Tok", (), {"pad_token_id": 0, "eos_token_id": 0}
+                )()),
+            ):
+                run_kd.main(argv)
+
+
 if __name__ == "__main__":
     unittest.main()
