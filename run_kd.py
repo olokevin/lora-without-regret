@@ -26,7 +26,9 @@ from btt_layer import (
     normalize_trainable_blocktt_cores_,
     resolve_blocktt_decomp_modes,
 )
+from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file as save_safetensors_file
+from transformers import AutoTokenizer
 from svd_layer import (
     configure_svd_trainability,
     convert_linear_to_svd,
@@ -268,3 +270,116 @@ def parse_save_steps(save_steps_str, total_steps):
         else:
             steps.add(int(part))
     return steps
+
+
+def load_teacher_config(teacher_data_dir):
+    config_path = os.path.join(teacher_data_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Teacher data config not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_completions(teacher_data_dir):
+    completions_path = os.path.join(teacher_data_dir, "completions.jsonl")
+    completions = []
+    with open(completions_path, "r", encoding="utf-8") as f:
+        for line in f:
+            completions.append(json.loads(line))
+    return completions
+
+
+class KDSftDataset(Dataset):
+    """Dataset for SFT-style KD: train on teacher completions."""
+
+    def __init__(self, completions, max_length=2048):
+        self.completions = completions
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.completions)
+
+    def __getitem__(self, idx):
+        entry = self.completions[idx]
+        prompt_text = entry["prompt"]
+        completion_text = entry["completion"]
+
+        # Use token_ids directly (already tokenized by teacher's tokenizer,
+        # which shares the same base vocab as student)
+        prompt_ids = entry.get("prompt_ids")
+        if prompt_ids is None:
+            # Fallback: the full sequence is prompt + completion token_ids
+            # We need to figure out where prompt ends.
+            # Since token_ids are completion-only from vLLM, we construct:
+            #   input_ids = prompt_token_ids + completion_token_ids
+            #   labels = [-100]*len(prompt) + completion_token_ids
+            # But we don't have prompt_token_ids stored separately.
+            # The token_ids field contains completion tokens only.
+            completion_ids = entry["token_ids"]
+        else:
+            completion_ids = entry["token_ids"]
+
+        # For SFT, input_ids = completion token_ids (teacher's output)
+        # Labels = same (next-token prediction on teacher's output)
+        # We train the student to reproduce the teacher's output autoregressively
+        input_ids = completion_ids[: self.max_length]
+        labels = input_ids.copy()
+        attention_mask = [1] * len(input_ids)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+
+
+class KDKlDataset(Dataset):
+    """Dataset for KL-divergence KD: match teacher logits."""
+
+    def __init__(self, completions, teacher_data_dir, top_k, max_length=2048):
+        self.completions = completions
+        self.top_k = top_k
+        self.max_length = max_length
+
+        # Load all logit chunks
+        logits_dir = os.path.join(teacher_data_dir, "logits")
+        chunk_files = sorted(
+            f for f in os.listdir(logits_dir) if f.startswith("chunk_") and f.endswith(".safetensors")
+        )
+        self.all_topk_values = []
+        self.all_topk_indices = []
+        self.all_seq_lengths = []
+
+        for chunk_file in chunk_files:
+            chunk = load_safetensors_file(os.path.join(logits_dir, chunk_file))
+            n = chunk["seq_lengths"].shape[0]
+            for i in range(n):
+                self.all_topk_values.append(chunk["topk_values"][i])
+                self.all_topk_indices.append(chunk["topk_indices"][i])
+                self.all_seq_lengths.append(chunk["seq_lengths"][i].item())
+
+    def __len__(self):
+        return len(self.completions)
+
+    def __getitem__(self, idx):
+        entry = self.completions[idx]
+        completion_ids = entry["token_ids"]
+        seq_len = self.all_seq_lengths[idx]
+
+        input_ids = completion_ids[: self.max_length]
+        actual_len = len(input_ids)
+        attention_mask = [1] * actual_len
+
+        # response_mask: all tokens are response tokens (completion only)
+        response_mask = [1] * actual_len
+
+        topk_values = self.all_topk_values[idx][:actual_len]
+        topk_indices = self.all_topk_indices[idx][:actual_len]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+            "teacher_topk_values": topk_values,
+            "teacher_topk_indices": topk_indices,
+        }
