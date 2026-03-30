@@ -337,10 +337,11 @@ class KDSftDataset(Dataset):
 class KDKlDataset(Dataset):
     """Dataset for KL-divergence KD: match teacher logits."""
 
-    def __init__(self, completions, teacher_data_dir, top_k, max_length=2048):
+    def __init__(self, completions, teacher_data_dir, top_k, max_length=2048, index_offset=0):
         self.completions = completions
         self.top_k = top_k
         self.max_length = max_length
+        self.index_offset = index_offset
 
         # Load all logit chunks
         logits_dir = os.path.join(teacher_data_dir, "logits")
@@ -365,7 +366,9 @@ class KDKlDataset(Dataset):
     def __getitem__(self, idx):
         entry = self.completions[idx]
         completion_ids = entry["token_ids"]
-        seq_len = self.all_seq_lengths[idx]
+        # Use index_offset to align with original logit indices after train/val split
+        logit_idx = idx + self.index_offset
+        seq_len = self.all_seq_lengths[logit_idx]
 
         input_ids = completion_ids[: self.max_length]
         actual_len = len(input_ids)
@@ -374,8 +377,8 @@ class KDKlDataset(Dataset):
         # response_mask: all tokens are response tokens (completion only)
         response_mask = [1] * actual_len
 
-        topk_values = self.all_topk_values[idx][:actual_len]
-        topk_indices = self.all_topk_indices[idx][:actual_len]
+        topk_values = self.all_topk_values[logit_idx][:actual_len]
+        topk_indices = self.all_topk_indices[logit_idx][:actual_len]
 
         return {
             "input_ids": input_ids,
@@ -392,7 +395,7 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
 
     Args:
         student_logits: [batch, seq_len, vocab_size]
-        teacher_topk_values: [batch, seq_len, K] - teacher logits (NOT log-probs)
+        teacher_topk_values: [batch, seq_len, K] - teacher log-probs from vLLM
         teacher_topk_indices: [batch, seq_len, K] - token indices for top-K
         response_mask: [batch, seq_len] - 1 for response tokens, 0 for padding
 
@@ -402,19 +405,16 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
     batch, seq_len, K = teacher_topk_values.shape
 
     # Gather student logits at teacher's top-K positions
-    # teacher_topk_indices: [batch, seq_len, K]
     student_topk_logits = torch.gather(student_logits, dim=2, index=teacher_topk_indices.long())
-    # student_topk_logits: [batch, seq_len, K]
 
-    # Compute log-softmax over K positions for both
+    # Student: log-softmax over K positions (from raw logits)
     student_log_probs = F.log_softmax(student_topk_logits, dim=-1)
+
+    # Teacher: values are already log-probs from vLLM over full vocab.
+    # Re-normalize over the top-K subset to get a valid distribution over K positions.
     teacher_log_probs = F.log_softmax(teacher_topk_values.float(), dim=-1)
 
     # KL(student || teacher) = sum_k student_prob * (log_student_prob - log_teacher_prob)
-    # Using F.kl_div: expects input=log_probs, target=log_probs with log_target=True
-    # kl_div computes: target * (log_target - input) when log_target=True
-    # This gives KL(target || input), so we swap: input=teacher, target=student
-    # Actually: KL(student || teacher) = sum student * (log_student - log_teacher)
     # F.kl_div(input=log_teacher, target=log_student, log_target=True) gives KL(student || teacher)
     kl_per_token = F.kl_div(
         teacher_log_probs,
@@ -540,7 +540,7 @@ def main(argv=None):
         collate_fn = build_kd_sft_collate_fn(tokenizer.pad_token_id)
     else:
         train_dataset = KDKlDataset(train_completions, args.teacher_data_dir, args.top_k)
-        val_dataset = KDKlDataset(val_completions, args.teacher_data_dir, args.top_k)
+        val_dataset = KDKlDataset(val_completions, args.teacher_data_dir, args.top_k, index_offset=len(train_completions))
         collate_fn = build_kd_kl_collate_fn(tokenizer.pad_token_id, args.top_k)
 
     train_dataloader = DataLoader(
