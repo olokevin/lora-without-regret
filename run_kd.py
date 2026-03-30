@@ -439,3 +439,327 @@ def save_kd_checkpoint(model, output_dir, step):
     }
     save_safetensors_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
     print(f"Saved checkpoint to {ckpt_dir}")
+
+
+def build_kd_sft_collate_fn(pad_token_id):
+    """Collate for SFT KD: pad input_ids, labels, attention_mask."""
+    def collate_fn(batch):
+        max_len = max(len(item["input_ids"]) for item in batch)
+        input_ids = []
+        labels = []
+        attention_mask = []
+
+        for item in batch:
+            padding_len = max_len - len(item["input_ids"])
+            input_ids.append(item["input_ids"] + [pad_token_id] * padding_len)
+            labels.append(item["labels"] + [-100] * padding_len)
+            attention_mask.append(item["attention_mask"] + [0] * padding_len)
+
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "labels": torch.tensor(labels),
+            "attention_mask": torch.tensor(attention_mask),
+        }
+    return collate_fn
+
+
+def build_kd_kl_collate_fn(pad_token_id, top_k):
+    """Collate for KL KD: pad input_ids, attention_mask, response_mask, teacher logits."""
+    def collate_fn(batch):
+        max_len = max(len(item["input_ids"]) for item in batch)
+        input_ids = []
+        attention_mask = []
+        response_mask = []
+        teacher_topk_values = []
+        teacher_topk_indices = []
+
+        for item in batch:
+            actual_len = len(item["input_ids"])
+            padding_len = max_len - actual_len
+            input_ids.append(item["input_ids"] + [pad_token_id] * padding_len)
+            attention_mask.append(item["attention_mask"] + [0] * padding_len)
+            response_mask.append(item["response_mask"] + [0] * padding_len)
+
+            # Pad teacher logits
+            tv = item["teacher_topk_values"]  # [actual_len, K]
+            ti = item["teacher_topk_indices"]  # [actual_len, K]
+            if padding_len > 0:
+                tv = torch.cat([tv, torch.zeros(padding_len, top_k, dtype=tv.dtype)])
+                ti = torch.cat([ti, torch.zeros(padding_len, top_k, dtype=ti.dtype)])
+            teacher_topk_values.append(tv)
+            teacher_topk_indices.append(ti)
+
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "response_mask": torch.stack(response_mask) if isinstance(response_mask[0], torch.Tensor) else torch.tensor(response_mask, dtype=torch.float32),
+            "teacher_topk_values": torch.stack(teacher_topk_values),
+            "teacher_topk_indices": torch.stack(teacher_topk_indices),
+        }
+    return collate_fn
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parse_args(argv)
+    validate_mode_specific_flags(args, argv)
+    apply_mode_defaults(args)
+
+    set_seed(args.seed)
+
+    # Load teacher data
+    teacher_config = load_teacher_config(args.teacher_data_dir)
+    if args.kd_loss_type == "kl" and args.top_k > teacher_config["top_k"]:
+        raise ValueError(
+            f"--top-k ({args.top_k}) exceeds teacher data top_k ({teacher_config['top_k']})"
+        )
+
+    completions = load_completions(args.teacher_data_dir)
+    num_total = len(completions)
+    # Use last 20% for validation, rest for training
+    val_size = max(1, num_total // 5)
+    train_completions = completions[:-val_size]
+    val_completions = completions[-val_size:]
+    print(f"Loaded {num_total} completions: {len(train_completions)} train, {len(val_completions)} val")
+
+    # Prepare model
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
+    validate_trainable_params(trainable_params)
+
+    # Prepare tokenizer for padding
+    from transformers import AutoTokenizer as _AT
+    tokenizer = _AT.from_pretrained(args.student_model_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Build datasets
+    if args.kd_loss_type == "sft":
+        train_dataset = KDSftDataset(train_completions)
+        val_dataset = KDSftDataset(val_completions)
+        collate_fn = build_kd_sft_collate_fn(tokenizer.pad_token_id)
+    else:
+        train_dataset = KDKlDataset(train_completions, args.teacher_data_dir, args.top_k)
+        val_dataset = KDKlDataset(val_completions, args.teacher_data_dir, args.top_k)
+        collate_fn = build_kd_kl_collate_fn(tokenizer.pad_token_id, args.top_k)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    device = model.device
+    num_training_steps = compute_num_training_steps(
+        num_batches=len(train_dataloader),
+        num_epochs=args.num_epochs,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
+    warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+
+    save_steps = parse_save_steps(args.save_steps, num_training_steps)
+
+    optimizer = build_optimizer(args, trainable_params, trainable_named_params)
+    scheduler = build_lr_scheduler(args, optimizer, num_training_steps)
+
+    # Wandb
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "train_mode": args.train_mode,
+                "kd_loss_type": args.kd_loss_type,
+                "student_model_id": args.student_model_id,
+                "teacher_data_dir": args.teacher_data_dir,
+                "top_k": args.top_k,
+                "learning_rate": args.lr,
+                "batch_size": args.batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "effective_batch_size": effective_batch_size,
+                "num_epochs": args.num_epochs,
+                "optimizer": args.optimizer,
+                "lr_scheduler": args.lr_scheduler,
+                "warmup_ratio": args.warmup_ratio,
+                "seed": args.seed,
+                **mode_info["wandb_extra"],
+            },
+            tags=["kd", args.train_mode, args.kd_loss_type],
+        )
+
+    shared_vocab_size = teacher_config.get("shared_vocab_size")
+
+    print("Training configuration:")
+    print(f"  KD loss type: {args.kd_loss_type}")
+    print(f"  Train mode: {args.train_mode}")
+    print(f"  Student model: {args.student_model_id}")
+    print(f"  Teacher data: {args.teacher_data_dir}")
+    print(f"  Top-K: {args.top_k}")
+    print(f"  Optimizer: {args.optimizer}")
+    print(f"  Learning rate: {args.lr}")
+    print(f"  LR scheduler: {args.lr_scheduler}")
+    for line in mode_info["print_lines"]:
+        print(line)
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Gradient accumulation: {gradient_accumulation_steps}")
+    print(f"  Effective batch size: {effective_batch_size}")
+    print(f"  Optimizer update steps: {num_training_steps}")
+    print(f"  Save steps: {sorted(save_steps)}")
+    print()
+
+    # Eval function
+    def eval_model(step=None):
+        model.eval()
+        total_loss = 0
+        with torch.no_grad():
+            for batch in val_dataloader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                if args.kd_loss_type == "sft":
+                    loss = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    ).loss
+                else:
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                    logits = outputs.logits
+                    if shared_vocab_size is not None:
+                        logits = logits[:, :, :shared_vocab_size]
+                    loss = compute_kl_loss(
+                        logits,
+                        batch["teacher_topk_values"],
+                        batch["teacher_topk_indices"],
+                        batch["response_mask"],
+                    )
+                total_loss += loss.item()
+        val_loss = total_loss / max(1, len(val_dataloader))
+        print(f"val_loss: {val_loss:.4f} at step {step}")
+
+        if use_wandb and step is not None:
+            wandb.log({"val/loss": val_loss}, step=step)
+
+        model.train()
+        return val_loss
+
+    # Training loop
+    print("Starting initial evaluation...")
+    eval_model()
+    model.train()
+    global_step = 0
+    total_loss = 0
+    prev_step_loss_acc = 0
+    prev_step_loss = 0
+    normalize_blocktt_after_update = (
+        args.train_mode == "blocktt" and args.blocktt_normalize_after_update
+    )
+
+    for epoch in range(args.num_epochs):
+        progress_bar = tqdm(
+            train_dataloader, desc=f"Epoch {epoch + 1}/{args.num_epochs}"
+        )
+
+        for step, batch in enumerate(progress_bar):
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            if args.kd_loss_type == "sft":
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                )
+                loss = outputs.loss
+            else:
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+                logits = outputs.logits
+                if shared_vocab_size is not None:
+                    logits = logits[:, :, :shared_vocab_size]
+                loss = compute_kl_loss(
+                    logits,
+                    batch["teacher_topk_values"],
+                    batch["teacher_topk_indices"],
+                    batch["response_mask"],
+                )
+
+            loss = loss / gradient_accumulation_steps
+            loss.backward()
+
+            if (step + 1) % gradient_accumulation_steps == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
+                if normalize_blocktt_after_update:
+                    normalize_trainable_blocktt_cores_(model)
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "train/loss": prev_step_loss_acc,
+                            "train/epoch": epoch + (step + 1) / len(train_dataloader),
+                            "train/grad_norm": grad_norm,
+                        },
+                        step=global_step,
+                    )
+
+                if global_step % 10 == 0:
+                    eval_model(step=global_step)
+
+                # Checkpoint saving
+                if args.enable_save_ckpt and global_step in save_steps:
+                    save_kd_checkpoint(model, args.output_dir, global_step)
+
+                prev_step_loss = prev_step_loss_acc
+                prev_step_loss_acc = 0
+
+            prev_step_loss_acc += loss.item()
+            total_loss += loss.item() * gradient_accumulation_steps
+            avg_loss = total_loss / (step + 1)
+
+            progress_bar.set_postfix(
+                {
+                    "avg_loss": f"{avg_loss:.4f}",
+                    "step": global_step,
+                    "prev_step_loss": prev_step_loss,
+                }
+            )
+
+    print("Training complete!")
+
+    print("Running final evaluation...")
+    final_val_loss = eval_model(step=global_step)
+
+    if use_wandb:
+        wandb.summary["final_val_loss"] = final_val_loss
+        wandb.summary["total_steps"] = global_step
+
+    # Save final checkpoint if "final" was in save_steps and not already saved
+    if args.enable_save_ckpt and num_training_steps in save_steps and global_step not in save_steps:
+        save_kd_checkpoint(model, args.output_dir, global_step)
+
+    if use_wandb:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
