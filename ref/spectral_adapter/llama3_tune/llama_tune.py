@@ -16,8 +16,46 @@ from pathlib import Path
 
 from blocktt_utils import apply_blocktt_to_model, write_blocktt_metadata
 
+import lm_eval
+from lm_eval.models.huggingface import HFLM
+
 """login for model download permission"""
 # login()
+
+
+def run_gsm8k_eval(model, tokenizer, num_fewshot):
+    """Run GSM8K evaluation and return the flexible-extract exact_match score."""
+    hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=8)
+    results = lm_eval.simple_evaluate(
+        model=hflm,
+        tasks=["gsm8k"],
+        num_fewshot=num_fewshot,
+        batch_size=8,
+    )
+    return results["results"]["gsm8k"]["exact_match,flexible-extract"]
+
+
+class InlineEvalCallback(TrainerCallback):
+    def __init__(self, tokenizer, eval_steps, num_fewshot):
+        self.tokenizer = tokenizer
+        self.eval_steps = eval_steps
+        self.num_fewshot = num_fewshot
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.eval_steps <= 0 or state.global_step % self.eval_steps != 0:
+            return
+        print(f"\n[InlineEval] Running GSM8K {self.num_fewshot}-shot evaluation at step {state.global_step}...")
+        model.eval()
+        try:
+            score = run_gsm8k_eval(model, self.tokenizer, self.num_fewshot)
+            print(f"[InlineEval] Step {state.global_step} — gsm8k exact_match (flexible-extract, {self.num_fewshot}-shot): {score:.4f}")
+            import wandb
+            if wandb.run is not None:
+                wandb.log({f"val/gsm8k_exact_match_{self.num_fewshot}shot": score}, step=state.global_step)
+        except Exception as e:
+            print(f"[InlineEval] Evaluation failed at step {state.global_step}: {e}")
+        finally:
+            model.train()
 
 
 class BlockTTMetadataCallback(TrainerCallback):
@@ -145,6 +183,20 @@ parser.add_argument(
     default="",
     help="Optional suffix appended to the auto-generated W&B run name.",
 )
+parser.add_argument(
+    "--inline-eval-steps",
+    type=int,
+    default=100,
+    dest="inline_eval_steps",
+    help="Run GSM8K eval every N steps and log to wandb under val/. 0 disables.",
+)
+parser.add_argument(
+    "--inline-eval-nshot",
+    type=int,
+    default=0,
+    dest="inline_eval_nshot",
+    help="Number of few-shot examples for inline GSM8K eval (default: 0-shot).",
+)
 args = parser.parse_args()
 
 torch.manual_seed(0)
@@ -250,6 +302,8 @@ print(f"W&B run name: {wandb_run_name}")
 
 
 callbacks = []
+if args.inline_eval_steps > 0:
+    callbacks.append(InlineEvalCallback(tokenizer, args.inline_eval_steps, args.inline_eval_nshot))
 if blocktt_metadata is not None:
     callbacks.append(BlockTTMetadataCallback(blocktt_metadata))
 
@@ -261,6 +315,20 @@ trainer = Trainer(
     callbacks=callbacks,
 )
 trainer.train()
+
+# Final 5-shot GSM8K evaluation (matches llama_test.py)
+print("\n[FinalEval] Running GSM8K 5-shot evaluation after training...")
+model.eval()
+try:
+    final_score = run_gsm8k_eval(model, tokenizer, num_fewshot=5)
+    print(f"[FinalEval] gsm8k exact_match (flexible-extract, 5-shot): {final_score:.4f}")
+    import wandb
+    if wandb.run is not None:
+        wandb.log({"val/gsm8k_exact_match_5shot_final": final_score})
+except Exception as e:
+    print(f"[FinalEval] Evaluation failed: {e}")
+finally:
+    model.train()
 
 if args.enable_eco_ckpt:
     save_dir = Path(args.ckpt_dir) / wandb_run_name
