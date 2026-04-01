@@ -420,6 +420,16 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
         Scalar KL loss averaged over response tokens.
     """
     batch, seq_len, K = teacher_topk_values.shape
+    vocab_size = student_logits.shape[2]
+
+    # Teacher may have larger vocab than student (e.g. DeepSeek 152064 vs Qwen 151936).
+    # Both share identical token mappings for real tokens; the difference is only in
+    # padding slots beyond ~151650. Clamp indices for safe gather, then zero out KL
+    # contributions from out-of-bound entries.
+    oob_mask = teacher_topk_indices >= vocab_size  # [batch, seq_len, K]
+    if oob_mask.any():
+        teacher_topk_indices = teacher_topk_indices.clone()
+        teacher_topk_indices[oob_mask] = 0  # safe index for gather
 
     # Gather student logits at teacher's top-K positions
     student_topk_logits = torch.gather(student_logits, dim=2, index=teacher_topk_indices.long())
@@ -433,12 +443,18 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
 
     # KL(student || teacher) = sum_k student_prob * (log_student_prob - log_teacher_prob)
     # F.kl_div(input=log_teacher, target=log_student, log_target=True) gives KL(student || teacher)
-    kl_per_token = F.kl_div(
+    kl_per_k = F.kl_div(
         teacher_log_probs,
         student_log_probs,
         log_target=True,
         reduction="none",
-    ).sum(dim=-1)  # [batch, seq_len]
+    )  # [batch, seq_len, K]
+
+    # Zero out contributions from out-of-vocab teacher entries
+    if oob_mask.any():
+        kl_per_k = kl_per_k.masked_fill(oob_mask, 0.0)
+
+    kl_per_token = kl_per_k.sum(dim=-1)  # [batch, seq_len]
 
     # Mask and average
     masked_kl = kl_per_token * response_mask

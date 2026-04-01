@@ -16,6 +16,14 @@ CUDA_VISIBLE_DEVICES=0 python analysis/plot_singular_relationship.py \
     --full-run runs/full/full-adamw-lr_2e-5-0325-215533 \
     --layer-prefix model.layers.12.self_attn.q_proj \
     --color-scale log
+
+### --sft-run applies to SFT RL KD runs with the same grad and ckpt saving
+
+CUDA_VISIBLE_DEVICES=2 python analysis/plot_singular_relationship.py \
+    --sft-run /data/yequan/fura/sft_runs/blocktt/blocktt-adamw-lr_2e-4-output_one_block-s_to_frozen-train_small-0331-164017 \
+    --base-model-id Qwen/Qwen3-4B \
+    --layer-prefix model.layers.12.self_attn.q_proj \
+    --color-scale log
 """
 
 from __future__ import annotations
@@ -46,14 +54,222 @@ from svd_layer import SVDLayer
 
 
 LAYER_PREFIX_RE = re.compile(r"^model\.layers\.(\d+)\.(self_attn|mlp)\.([A-Za-z0-9_]+)$")
+FACTOR_SUFFIXES = (".btt_l", ".btt_r", ".btt_s", ".svd_a", ".svd_b", ".svd_s")
+
+# ---------------------------------------------------------------------------
+# Directory-name config parsing (for runs without wandb)
+# ---------------------------------------------------------------------------
+
+_DIR_S_TO_RE = re.compile(r"-s_to_(\w+)-")
+_DIR_TRAIN_RE = re.compile(r"-train_(\w+)-")
+_DIR_LR_RE = re.compile(r"-lr_([\d.eE+-]+)-")
+
+
+def parse_run_dir_config(run_dir: Path) -> dict[str, Any]:
+    """Extract training config from the run directory name."""
+    name = run_dir.name
+
+    # train_mode is the first token
+    train_mode = name.split("-", 1)[0]
+
+    s_merged_to = None
+    m = _DIR_S_TO_RE.search(name)
+    if m:
+        s_merged_to = m.group(1)
+
+    train_position = None
+    m = _DIR_TRAIN_RE.search(name)
+    if m:
+        train_position = m.group(1)
+
+    lr = None
+    m = _DIR_LR_RE.search(name)
+    if m:
+        lr = float(m.group(1))
+
+    # decomp_mode: between lr_...- and -s_to_ (or end)
+    decomp_mode: str | dict[str, str] | None = None
+    lr_match = _DIR_LR_RE.search(name)
+    s_to_match = _DIR_S_TO_RE.search(name)
+    if lr_match and s_to_match:
+        segment = name[lr_match.end() : s_to_match.start()]
+        if segment:
+            decomp_mode = segment
+            if "{" in segment:
+                # Parse dict-like: {qkv:input,o:output,...}
+                inner = segment.strip("{}")
+                decomp_mode = {}
+                for part in inner.split(","):
+                    k, v = part.split(":", 1)
+                    decomp_mode[k.strip()] = v.strip()
+
+    # Build decomp_mode_by_module if we have a dict
+    decomp_mode_by_module = None
+    if isinstance(decomp_mode, dict):
+        from btt_layer import BLOCKTT_DECOMP_GROUP_TO_MODULES
+        decomp_mode_by_module = {}
+        for group_name, module_names in BLOCKTT_DECOMP_GROUP_TO_MODULES.items():
+            mode_val = decomp_mode.get(group_name, "input_one_block")
+            # Normalize short aliases
+            mode_map = {"input": "input_one_block", "output": "output_one_block"}
+            mode_val = mode_map.get(mode_val, mode_val)
+            for mod_name in module_names:
+                decomp_mode_by_module[mod_name] = mode_val
+
+    return {
+        "train_mode": train_mode,
+        "s_merged_to": s_merged_to,
+        "train_position": train_position,
+        "learning_rate": lr,
+        "decomp_mode": decomp_mode if not isinstance(decomp_mode, dict) else "mixed",
+        "decomp_mode_by_module": decomp_mode_by_module,
+        "blocktt_rank": "full",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flexible layer prefix resolution
+# ---------------------------------------------------------------------------
+
+def _extract_layer_prefixes_from_keys(keys: list[str]) -> list[str]:
+    """Strip factor suffixes from safetensors keys to get unique layer prefixes."""
+    prefixes = set()
+    for key in keys:
+        for suffix in FACTOR_SUFFIXES:
+            if key.endswith(suffix):
+                prefixes.add(key[: -len(suffix)])
+                break
+    return sorted(prefixes)
+
+
+def resolve_layer_prefixes(prefix: str, run_dir: Path) -> list[str]:
+    """Expand a flexible layer prefix into a list of fully-qualified prefixes.
+
+    Supported forms:
+      - model.layers.12.self_attn.q_proj  -> exact match
+      - model.layers.12                   -> all projection modules in layer 12
+      - q_proj                            -> that module across all layers
+    """
+    # Find a safetensors file to scan keys from
+    key_source = _find_key_source(run_dir)
+    if key_source is None:
+        raise FileNotFoundError(f"No safetensors files found in {run_dir} to resolve layer prefixes")
+
+    with safe_open(str(key_source), framework="pt") as sf:
+        all_keys = list(sf.keys())
+    all_prefixes = _extract_layer_prefixes_from_keys(all_keys)
+
+    if not all_prefixes:
+        raise ValueError(f"No factor keys found in {key_source}")
+
+    # Exact match
+    if prefix in all_prefixes:
+        return [prefix]
+
+    # Layer-level match: model.layers.12
+    if re.match(r"^model\.layers\.\d+$", prefix):
+        matched = [p for p in all_prefixes if p.startswith(prefix + ".")]
+        if not matched:
+            raise ValueError(f"No modules found under '{prefix}'. Available: {all_prefixes[:5]}")
+        return matched
+
+    # Module-name match: q_proj, down_proj, etc.
+    if "." not in prefix:
+        matched = [p for p in all_prefixes if p.endswith("." + prefix)]
+        if not matched:
+            raise ValueError(f"No layers found with module '{prefix}'. Available: {all_prefixes[:5]}")
+        return matched
+
+    raise ValueError(
+        f"Layer prefix '{prefix}' not found. "
+        f"Expected one of: exact prefix, model.layers.N, or module_name. "
+        f"Available prefixes (first 5): {all_prefixes[:5]}"
+    )
+
+
+def _find_key_source(run_dir: Path) -> Path | None:
+    """Find a safetensors file in the run dir to scan for available keys."""
+    # Prefer grads at step 0 (always has all trainable param keys)
+    for pattern in ["step=0/grads.safetensors", "optim_step=0/grads.safetensors"]:
+        p = run_dir / pattern
+        if p.exists():
+            return p
+    # Fall back to any grads file
+    for sub in sorted(run_dir.iterdir()):
+        if sub.is_dir():
+            g = sub / "grads.safetensors"
+            if g.exists():
+                return g
+    # Fall back to model checkpoint
+    for sub in sorted(run_dir.iterdir()):
+        if sub.is_dir():
+            m = sub / "model.safetensors"
+            if m.exists():
+                return m
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Sharded checkpoint loading
+# ---------------------------------------------------------------------------
+
+def load_tensor_from_checkpoint(step_dir: Path, key: str) -> torch.Tensor | None:
+    """Load a tensor from a (possibly sharded) model checkpoint directory."""
+    single = step_dir / "model.safetensors"
+    if single.exists():
+        return load_tensor_from_safetensor(single, key)
+
+    index_path = step_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        return None
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map", {})
+    shard_name = weight_map.get(key)
+    if shard_name is None:
+        return None
+
+    shard_path = step_dir / shard_name
+    return load_tensor_from_safetensor(shard_path, key)
+
+
+# ---------------------------------------------------------------------------
+# Grad file discovery
+# ---------------------------------------------------------------------------
+
+def find_grad_paths(run_dir: Path) -> dict[int, Path]:
+    """Find all pre-saved grad files. Returns {step: path_to_grads.safetensors}."""
+    result: dict[int, Path] = {}
+    for sub in run_dir.iterdir():
+        if not sub.is_dir():
+            continue
+        grads_file = sub / "grads.safetensors"
+        if not grads_file.exists():
+            continue
+        # Parse step from dir name: step=N or optim_step=N
+        name = sub.name
+        if "=" not in name:
+            continue
+        try:
+            step = int(name.split("=", 1)[1])
+        except ValueError:
+            continue
+        result[step] = grads_file
+    return result
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Plot singular-value vs gradient/update heatmaps")
-    p.add_argument("--layer-prefix", required=True, help="Exact layer prefix, e.g. model.layers.12.self_attn.q_proj")
+    p.add_argument(
+        "--layer-prefix", required=True,
+        help="Layer prefix: model.layers.12.self_attn.q_proj (exact), "
+             "model.layers.12 (all modules in layer), or q_proj (module across all layers)",
+    )
     p.add_argument("--svd-run", type=Path, default=None, help="Path to one SVD run directory")
     p.add_argument("--blocktt-run", type=Path, default=None, help="Path to one BlockTT run directory")
     p.add_argument("--full-run", type=Path, default=None, help="Path to one full-model run directory")
+    p.add_argument("--sft-run", type=Path, default=None, help="Path to an SFT run directory (with pre-saved grads/ckpts)")
     p.add_argument("--base-model-id", default=None, help="Override base model ID")
     p.add_argument("--output-dir", type=Path, default=Path("analysis_results/singular_relationship"))
     p.add_argument("--color-scale", choices=["linear", "log"], default="linear")
@@ -61,6 +277,14 @@ def parse_args(argv=None):
     p.add_argument("--no-replay-grad", action="store_true", help="Do not replay; require existing grad cache")
     p.add_argument("--device", default="cpu", help="Device for base model init extraction")
     p.add_argument("--final-step", type=int, default=None, help="Optional explicit final checkpoint step")
+    p.add_argument(
+        "--to-plot",
+        nargs="+",
+        choices=["grad_0", "grad_n", "update"],
+        default=None,
+        help="What to plot: grad_0 (grad at step 0), grad_n (grad at step n), update (final - pretrained). Default: all.",
+    )
+    p.add_argument("--grad-n-step", type=int, default=None, help="Which step for grad_n (default: max step with grads)")
     p.add_argument(
         "--full-step-start",
         type=int,
@@ -79,12 +303,18 @@ def parse_args(argv=None):
 
 
 def parse_layer_prefix(prefix: str) -> tuple[int, str]:
+    """Validate a fully-qualified layer prefix. Returns (layer_idx, module_name)."""
     m = LAYER_PREFIX_RE.match(prefix)
     if not m:
         raise ValueError(
             "Invalid --layer-prefix format. Expected e.g. model.layers.12.self_attn.q_proj"
         )
     return int(m.group(1)), m.group(3)
+
+
+def is_exact_layer_prefix(prefix: str) -> bool:
+    """Check if a prefix is fully-qualified (e.g. model.layers.12.self_attn.q_proj)."""
+    return LAYER_PREFIX_RE.match(prefix) is not None
 
 
 def parse_subplot_shape(shape: str | None) -> tuple[int, int] | None:
@@ -518,6 +748,8 @@ def build_initialized_factors(
             lr_act=False,
             decomp_mode=_resolve_blocktt_mode_for_module(run_cfg, module_name),
             init_mode="default",
+            output_factorization=run_cfg.get("_output_factorization"),
+            input_factorization=run_cfg.get("_input_factorization"),
         ).to(dtype=weight.dtype, device=weight.device)
         layer.init_from_linear_weight(
             weight,
@@ -1076,10 +1308,376 @@ def run_mode_analysis(
     }
 
 
+# ---------------------------------------------------------------------------
+# SFT / pre-saved-grads analysis
+# ---------------------------------------------------------------------------
+
+def _load_grads_for_prefix(
+    grads_path: Path,
+    mode: str,
+    layer_prefix: str,
+    trained_sides: list[str],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Load grad tensors for a layer prefix from a grads.safetensors file."""
+    keys = factor_keys_for_mode(mode, layer_prefix)
+    grads = load_file(str(grads_path))
+    left_grad = grads.get(keys["left"])
+    right_grad = grads.get(keys["right"])
+    left_grad = left_grad.abs().float() if left_grad is not None else None
+    right_grad = right_grad.abs().float() if right_grad is not None else None
+    return left_grad, right_grad
+
+
+def _load_final_factors_sharded(
+    run_dir: Path,
+    mode: str,
+    layer_prefix: str,
+    final_step: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, Path]:
+    """Load final factors from a (possibly sharded) checkpoint."""
+    step = final_step if final_step is not None else find_max_step(run_dir)
+    step_dir = run_dir / f"step={step}"
+    if not step_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {step_dir}")
+
+    keys = factor_keys_for_mode(mode, layer_prefix)
+    left = load_tensor_from_checkpoint(step_dir, keys["left"])
+    right = load_tensor_from_checkpoint(step_dir, keys["right"])
+    singular = load_tensor_from_checkpoint(step_dir, keys["singular"])
+
+    if left is None or right is None:
+        raise KeyError(
+            f"Checkpoint {step_dir} missing required factor keys for {layer_prefix} in mode {mode}"
+        )
+    return left.float(), right.float(), (singular.float() if singular is not None else None), step, step_dir
+
+
+def run_sft_analysis(
+    run_dir: Path,
+    layer_prefix: str,
+    to_plot: list[str],
+    run_cfg: dict[str, Any],
+    base_model: torch.nn.Module | None,
+    grad_n_step: int | None,
+    final_step: int | None,
+) -> dict[str, Any]:
+    """Run analysis for an SFT/RL run with pre-saved grads and checkpoints."""
+    mode = run_cfg["train_mode"]
+    result: dict[str, Any] = {
+        "run_dir": str(run_dir),
+        "mode": mode,
+        "layer_prefix": layer_prefix,
+        "to_plot": to_plot,
+    }
+
+    # Find available grads
+    grad_paths = find_grad_paths(run_dir)
+
+    # Build init factors if we need update or trained_sides resolution
+    init_left = init_right = init_s = None
+    final_left = final_right = final_s = None
+    used_step = None
+    if "update" in to_plot:
+        if base_model is None:
+            raise ValueError("--base-model-id is required for update computation")
+
+        # Load final factors first to infer BTT dimensions from shapes
+        final_left, final_right, final_s, used_step, ckpt_path = _load_final_factors_sharded(
+            run_dir, mode, layer_prefix, final_step,
+        )
+        if mode == "blocktt":
+            dims = infer_blocktt_dims(final_left, final_right)
+            # Override run_cfg with exact dims from checkpoint so init matches
+            run_cfg = {
+                **run_cfg,
+                "blocktt_rank": dims["r"],
+                "_output_factorization": (dims["m"], dims["a"]),
+                "_input_factorization": (dims["n"], dims["b"]),
+            }
+
+        init_left, init_right, init_s = build_initialized_factors(
+            base_model, mode, layer_prefix, run_cfg,
+        )
+
+    # Resolve trained sides from init factors or from grad keys
+    if init_left is not None:
+        trained_sides = resolve_trained_sides(mode, run_cfg, init_left, init_right)
+    else:
+        first_grad_path = grad_paths.get(0) or next(iter(grad_paths.values()), None)
+        if first_grad_path is not None:
+            keys = factor_keys_for_mode(mode, layer_prefix)
+            grads = load_file(str(first_grad_path))
+            trained_sides = []
+            if keys["left"] in grads:
+                trained_sides.append("left")
+            if keys["right"] in grads:
+                trained_sides.append("right")
+        else:
+            trained_sides = ["left", "right"]
+    result["trained_sides"] = trained_sides
+
+    # Grad at step 0
+    if "grad_0" in to_plot:
+        if 0 not in grad_paths:
+            raise FileNotFoundError(f"No grads at step 0 in {run_dir}")
+        left_g0, right_g0 = _load_grads_for_prefix(grad_paths[0], mode, layer_prefix, trained_sides)
+        result["grad_0_left"] = flatten_heatmap_tensor(mode, "left", left_g0) if left_g0 is not None else None
+        result["grad_0_right"] = flatten_heatmap_tensor(mode, "right", right_g0) if right_g0 is not None else None
+        result["grad_0_step"] = 0
+
+    # Grad at step n
+    if "grad_n" in to_plot:
+        if grad_n_step is not None:
+            step_n = grad_n_step
+        else:
+            non_zero = [s for s in grad_paths if s > 0]
+            if not non_zero:
+                raise FileNotFoundError(f"No grads beyond step 0 in {run_dir}")
+            step_n = max(non_zero)
+        if step_n not in grad_paths:
+            raise FileNotFoundError(f"No grads at step {step_n} in {run_dir}. Available: {sorted(grad_paths.keys())}")
+        left_gn, right_gn = _load_grads_for_prefix(grad_paths[step_n], mode, layer_prefix, trained_sides)
+        result["grad_n_left"] = flatten_heatmap_tensor(mode, "left", left_gn) if left_gn is not None else None
+        result["grad_n_right"] = flatten_heatmap_tensor(mode, "right", right_gn) if right_gn is not None else None
+        result["grad_n_step"] = step_n
+
+    # Update (final - init) — final factors already loaded above
+    if "update" in to_plot:
+        update_left = (final_left - init_left).abs() if "left" in trained_sides else None
+        update_right = (final_right - init_right).abs() if "right" in trained_sides else None
+        result["update_left"] = flatten_heatmap_tensor(mode, "left", update_left) if update_left is not None else None
+        result["update_right"] = flatten_heatmap_tensor(mode, "right", update_right) if update_right is not None else None
+        result["final_step"] = used_step
+
+    # BlockTT dims and singular maps for correlation
+    blocktt_dims = None
+    if mode == "blocktt" and init_left is not None:
+        blocktt_dims = infer_blocktt_dims(init_left, init_right)
+    result["blocktt_dims"] = blocktt_dims
+
+    singular = init_s
+    if singular is not None and init_left is not None:
+        left_s_map, right_s_map = build_singular_maps(mode, singular, init_left, init_right)
+    else:
+        left_s_map = right_s_map = None
+    result["left_s_map"] = left_s_map
+    result["right_s_map"] = right_s_map
+
+    return result
+
+
+def save_sft_heatmap_figure(
+    layer_prefix: str,
+    to_plot: list[str],
+    analysis: dict[str, Any],
+    out_path: Path,
+    color_scale: str,
+    blocktt_subplot_shape: tuple[int, int] | None = None,
+) -> list[Path]:
+    """Save heatmap figure(s) for SFT analysis results."""
+    import matplotlib.pyplot as plt
+
+    mode = analysis["mode"]
+    trained_sides = analysis["trained_sides"]
+    blocktt_dims = analysis.get("blocktt_dims")
+
+    # Collect panels: list of (label, side, data_tensor)
+    panels: list[tuple[str, str, torch.Tensor]] = []
+    for plot_type in to_plot:
+        if plot_type == "grad_0":
+            step = analysis.get("grad_0_step", 0)
+            label = f"|grad| step={step}"
+            if "left" in trained_sides and analysis.get("grad_0_left") is not None:
+                panels.append((label, "left", analysis["grad_0_left"]))
+            if "right" in trained_sides and analysis.get("grad_0_right") is not None:
+                panels.append((label, "right", analysis["grad_0_right"]))
+        elif plot_type == "grad_n":
+            step = analysis.get("grad_n_step", "?")
+            label = f"|grad| step={step}"
+            if "left" in trained_sides and analysis.get("grad_n_left") is not None:
+                panels.append((label, "left", analysis["grad_n_left"]))
+            if "right" in trained_sides and analysis.get("grad_n_right") is not None:
+                panels.append((label, "right", analysis["grad_n_right"]))
+        elif plot_type == "update":
+            label = f"|update| (step={analysis.get('final_step', '?')} - init)"
+            if "left" in trained_sides and analysis.get("update_left") is not None:
+                panels.append((label, "left", analysis["update_left"]))
+            if "right" in trained_sides and analysis.get("update_right") is not None:
+                panels.append((label, "right", analysis["update_right"]))
+
+    if not panels:
+        print(f"Warning: no data to plot for {layer_prefix}")
+        return []
+
+    # For blocktt with slice layout, produce per-side slice figures
+    if mode == "blocktt" and blocktt_dims is not None:
+        out_paths: list[Path] = []
+        # Group panels by side
+        by_side: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        for label, side, data in panels:
+            by_side.setdefault(side, []).append((label, data))
+
+        for side, side_panels in by_side.items():
+            n_panels = len(side_panels)
+            side_name = "Core L" if side == "left" else "Core R"
+            m = blocktt_dims["m"]
+            n = blocktt_dims["n"]
+            rows, cols = _resolve_blocktt_slice_layout(blocktt_dims, blocktt_subplot_shape)
+            num_slices = m * n
+
+            _, cell_h, cell_w, _, x_label = _blocktt_flat_to_slices(side, side_panels[0][1], blocktt_dims)
+            fig_w, panel_h = _figure_size_for_square_cells(rows, cols, cell_h, cell_w)
+            fig_h = panel_h * n_panels
+            fig, axes = plt.subplots(
+                rows * n_panels, cols,
+                figsize=(fig_w, fig_h),
+                constrained_layout=True,
+                squeeze=False,
+            )
+
+            # Compute shared vmin/vmax across all panels
+            all_slices = []
+            for label, data in side_panels:
+                slices, _, _, _, _ = _blocktt_flat_to_slices(side, data, blocktt_dims)
+                all_slices.append((label, apply_color_scale(slices, color_scale)))
+            vmin = float(min(np.min(s) for _, s in all_slices))
+            vmax = float(max(np.max(s) for _, s in all_slices))
+            if vmin == vmax:
+                vmax = vmin + 1e-12
+
+            im = None
+            for panel_idx, (label, scaled_slices) in enumerate(all_slices):
+                row_offset = panel_idx * rows
+                for idx in range(rows * cols):
+                    ax = axes[row_offset + idx // cols, idx % cols]
+                    if idx >= num_slices:
+                        ax.axis("off")
+                        continue
+                    mi = idx // n
+                    ni = idx % n
+                    arr = scaled_slices[mi, ni]
+                    im = ax.imshow(arr, aspect="equal", interpolation="nearest", vmin=vmin, vmax=vmax)
+                    ax.set_title(f"{label} | m={mi}, n={ni}", fontsize=9)
+                    ax.set_xlabel(x_label, fontsize=7)
+                    ax.set_ylabel("a" if side == "left" else "r", fontsize=7)
+                    ax.tick_params(labelsize=6)
+
+            if im is not None:
+                fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
+            fig.suptitle(
+                f"SFT BLOCKTT {side_name} by (m,n) slice\n{layer_prefix} ({color_scale} scale)",
+                fontsize=11,
+            )
+            entry_path = out_path.with_name(f"{out_path.stem}_{side}_slices{out_path.suffix}")
+            entry_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(entry_path, dpi=180)
+            plt.close(fig)
+            out_paths.append(entry_path)
+
+        return out_paths
+
+    # Non-blocktt: simple grid layout
+    n_plots = len(panels)
+    n_cols = min(n_plots, 2)
+    n_rows = math.ceil(n_plots / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows), constrained_layout=True)
+    axes = np.array(axes).reshape(n_rows, n_cols) if n_rows * n_cols > 1 else np.array([[axes]])
+
+    left_name = "U" if mode in {"svd", "full"} else "Core L"
+    right_name = "V" if mode in {"svd", "full"} else "Core R"
+
+    for idx, (label, side, data) in enumerate(panels):
+        r = idx // n_cols
+        c = idx % n_cols
+        ax = axes[r, c]
+        side_name = left_name if side == "left" else right_name
+        arr = apply_color_scale(data.cpu().numpy(), color_scale)
+        im = ax.imshow(arr, aspect="auto", interpolation="nearest")
+        ax.set_title(f"{side_name} {label}")
+        ax.set_xlabel("column")
+        ax.set_ylabel("row")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    for idx in range(len(panels), n_rows * n_cols):
+        r = idx // n_cols
+        c = idx % n_cols
+        axes[r, c].axis("off")
+
+    fig.suptitle(f"SFT {mode.upper()} — {layer_prefix} ({color_scale} scale)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return [out_path]
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main(argv=None):
     args = parse_args(argv)
-    parse_layer_prefix(args.layer_prefix)
     blocktt_subplot_shape = parse_subplot_shape(args.blocktt_subplot_shape)
+
+    # SFT run path
+    if args.sft_run is not None:
+        run_dir = args.sft_run
+        run_cfg = parse_run_dir_config(run_dir)
+        mode = run_cfg["train_mode"]
+        to_plot = args.to_plot or ["grad_0", "grad_n", "update"]
+
+        layer_prefixes = resolve_layer_prefixes(args.layer_prefix, run_dir)
+        print(f"Resolved {len(layer_prefixes)} layer prefix(es) for '{args.layer_prefix}'")
+
+        # Load base model if needed
+        base_model = None
+        if "update" in to_plot:
+            model_id = args.base_model_id
+            if model_id is None:
+                raise ValueError("--base-model-id is required when plotting 'update' with --sft-run")
+            from transformers import AutoModelForCausalLM
+            device = torch.device(args.device)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=torch.float32, device_map=None,
+            ).to(device)
+            base_model.eval()
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        all_fig_paths: list[Path] = []
+        for lp in layer_prefixes:
+            print(f"Analyzing {lp} ...")
+            analysis = run_sft_analysis(
+                run_dir=run_dir,
+                layer_prefix=lp,
+                to_plot=to_plot,
+                run_cfg=run_cfg,
+                base_model=base_model,
+                grad_n_step=args.grad_n_step,
+                final_step=args.final_step,
+            )
+            fig_path = args.output_dir / f"sft_{mode}_{lp.replace('.', '_')}_heatmaps.png"
+            fig_paths = save_sft_heatmap_figure(
+                layer_prefix=lp,
+                to_plot=to_plot,
+                analysis=analysis,
+                out_path=fig_path,
+                color_scale=args.color_scale,
+                blocktt_subplot_shape=blocktt_subplot_shape,
+            )
+            for p in fig_paths:
+                print(f"  Saved: {p}")
+            all_fig_paths.extend(fig_paths)
+
+        print(f"Done. {len(all_fig_paths)} figure(s) saved to {args.output_dir}")
+        return
+
+    # Existing RL path
+    if not is_exact_layer_prefix(args.layer_prefix):
+        raise ValueError(
+            "For --svd-run/--blocktt-run/--full-run, --layer-prefix must be fully qualified "
+            "(e.g. model.layers.12.self_attn.q_proj). "
+            "Use --sft-run for flexible prefix patterns."
+        )
+    parse_layer_prefix(args.layer_prefix)
 
     run_by_mode: dict[str, Path] = {}
     if args.svd_run is not None:
@@ -1090,11 +1688,10 @@ def main(argv=None):
         run_by_mode["full"] = args.full_run
 
     if not run_by_mode:
-        raise ValueError("Provide at least one of --svd-run, --blocktt-run, or --full-run")
+        raise ValueError("Provide at least one of --sft-run, --svd-run, --blocktt-run, or --full-run")
 
     model_id = args.base_model_id
     if model_id is None:
-        # Use the first run's recorded model_id.
         first_cfg, _ = load_run_context(next(iter(run_by_mode.values())))
         model_id = first_cfg.get("model_id")
         if model_id is None:

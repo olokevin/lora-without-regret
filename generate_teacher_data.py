@@ -40,7 +40,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dataset-split",
         type=str,
-        default="train[:500]",
+        default="train[:7500]",
         help="Dataset split (default: train[:7500])",
     )
     parser.add_argument(
