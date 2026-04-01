@@ -27,7 +27,7 @@ class TestRunKdCli(unittest.TestCase):
             "/data/yequan/fura/kd/DeepSeek-R1-Distill-Qwen-7B-competition_math",
         )
         self.assertEqual(args.top_k, 256)
-        self.assertEqual(args.save_steps, "1,10,final")
+        self.assertEqual(args.save_steps, "10,30,final")
 
     def test_defaults_kl(self):
         import run_kd
@@ -372,7 +372,7 @@ class TestRunKdIntegration(unittest.TestCase):
                 "--train-mode", "full",
                 "--teacher-data-dir", data_dir,
                 "--student-model-id", "test/student",
-                "--output-dir", out_dir,
+                "--base-dir", out_dir,
                 "--batch-size", "2",
                 "--gradient-accumulation-steps", "1",
                 "--num-epochs", "1",
@@ -394,8 +394,10 @@ class TestRunKdIntegration(unittest.TestCase):
             ):
                 run_kd.main(argv)
 
-            # Check that step=1 checkpoint was saved
-            self.assertTrue(os.path.isdir(os.path.join(out_dir, "step=1")))
+            # Check that step=1 checkpoint was saved under {out_dir}/full/.../step=1
+            import glob as _glob
+            matches = _glob.glob(os.path.join(out_dir, "full", "**", "step=1"), recursive=True)
+            self.assertTrue(len(matches) > 0, "step=1 checkpoint not found")
 
     def test_kl_mode_runs(self):
         import run_kd
@@ -409,7 +411,7 @@ class TestRunKdIntegration(unittest.TestCase):
                 "--train-mode", "full",
                 "--teacher-data-dir", data_dir,
                 "--student-model-id", "test/student",
-                "--output-dir", out_dir,
+                "--base-dir", out_dir,
                 "--top-k", "8",
                 "--batch-size", "2",
                 "--gradient-accumulation-steps", "1",

@@ -199,7 +199,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--base-dir",
         type=str,
-        default="runs",
+        default="/data/yequan/fura/rl_runs",
         help="Base directory for saving runs",
     )
     parser.add_argument(
@@ -242,6 +242,15 @@ def parse_args(argv=None):
         action="store_true",
         help="Stop training immediately after the first optimizer step.",
     )
+    parser.add_argument(
+        "--save-grads-steps",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated optimizer steps to save gradients "
+            "(e.g. '0,10,30'). Step 0 = before first update. Default: disabled."
+        ),
+    )
 
     # LoRA-family args (lora / lora_full)
     parser.add_argument(
@@ -280,6 +289,12 @@ def parse_args(argv=None):
         "--blocktt-normalize-after-update",
         action="store_true",
         help="Normalize trainable BTT cores after each optimizer update",
+    )
+    parser.add_argument(
+        "--blocktt-factorize-by-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align attention layer BTT blocks with head structure (default: enabled)",
     )
 
     # Shared trainable module selector for LoRA/BlockTT/SVD
@@ -360,6 +375,8 @@ def validate_mode_specific_flags(args, argv):
             "--blocktt-rank",
             "--no-train-bias",
             "--blocktt-normalize-after-update",
+            "--blocktt-factorize-by-head",
+            "--no-blocktt-factorize-by-head",
         ],
         "svd": [],
     }
@@ -605,7 +622,7 @@ def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
 
 
 def should_save_checkpoint(step_num: int, total_steps: int) -> bool:
-    return step_num == 1 or step_num == 10 or step_num == total_steps
+    return step_num == 10 or step_num == 30 or step_num == total_steps
 
 
 def save_checkpoint(model, tokenizer, run_dir: str, step_num: int):
@@ -615,6 +632,29 @@ def save_checkpoint(model, tokenizer, run_dir: str, step_num: int):
     model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
     print(f"Checkpoint saved to {ckpt_dir}")
+
+
+def parse_save_grads_steps(s):
+    """Parse comma-separated step numbers, or return empty set if None."""
+    if s is None:
+        return set()
+    return {int(x.strip()) for x in s.split(",")}
+
+
+def save_gradients(trainable_named_params, base_dir, step, subdir="step"):
+    """Save all trainable gradients to {base_dir}/{subdir}={step}/grads.safetensors."""
+    grad_payload = {}
+    for name, p in trainable_named_params:
+        if p.grad is None:
+            continue
+        grad_payload[name] = p.grad.detach().cpu()
+    if not grad_payload:
+        print(f"Warning: no gradients to save at step {step}")
+        return
+    ckpt_dir = os.path.join(base_dir, f"{subdir}={step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    save_safetensors_file(grad_payload, os.path.join(ckpt_dir, "grads.safetensors"))
+    print(f"Saved gradients ({len(grad_payload)} tensors) to {ckpt_dir}")
 
 
 def maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps):
@@ -1104,6 +1144,7 @@ def main(argv=None):
                 "target_modules": blocktt_targets,
                 "train_bias": train_bias,
                 "blocktt_normalize_after_update": args.blocktt_normalize_after_update,
+                "blocktt_factorize_by_head": args.blocktt_factorize_by_head,
             }
         )
     elif args.train_mode == "svd":
@@ -1159,6 +1200,7 @@ def main(argv=None):
             "  Normalize BTT after update: "
             f"{mode_info['blocktt_normalize_after_update']}"
         )
+        print(f"  Factorize by head: {mode_info['blocktt_factorize_by_head']}")
         print(f"  Target modules: {mode_info['target_modules']}")
     if args.train_mode == "svd":
         print(f"  Trainable type: {args.trainable_type}")
@@ -1224,6 +1266,8 @@ def main(argv=None):
             lr_act=False,
             s_merged_to=mode_info["s_merged_to"],
             train_position=mode_info["train_position"],
+            factorize_by_head=mode_info.get("blocktt_factorize_by_head", False),
+            model_config=model.config,
         )
         stats = configure_blocktt_trainability(
             model,
@@ -1304,6 +1348,7 @@ def main(argv=None):
     )
     first_step_grads_saved = False
     optimizer_steps = 0
+    save_grads_steps = parse_save_grads_steps(args.save_grads_steps)
     stop_requested = False
 
     def eval_model(step):
@@ -1463,6 +1508,11 @@ def main(argv=None):
                             "Saved first-step gradients to "
                             f"{args.save_first_step_grads_path} "
                             f"({len(grad_payload)} tensors)"
+                        )
+                    if optimizer_steps in save_grads_steps:
+                        save_gradients(
+                            trainable_named_params, run_dir, optimizer_steps,
+                            subdir="optim_step",
                         )
                     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                     epoch_grad_norms.append(grad_norm.item())

@@ -7,16 +7,15 @@ For a selected layer prefix, this script produces heatmaps for:
 If first-step gradients are not cached, it can replay one RL step via run_rl.py
 and cache gradients for later reuse.
 
---full-run runs/full/full-adamw-lr_2e-5-0325-215533 \
---svd-run runs/svd/svd-adamw-lr_1e-5-s_to_keep-train_input-0317-141139 \
---blocktt-run runs/blocktt/blocktt-adamw-lr_1e-5-output_one_block-s_to_keep-train_both-0317-155422 \
---blocktt-run runs/blocktt/blocktt-adamw-lr_1e-4-output_one_block-s_to_frozen-train_small-0317-150342 \
+--full-run /data/yequan/fura/runs/full/full-adamw-lr_2e-5-0325-215533 \
+--svd-run /data/yequan/fura/runs/svd/svd-adamw-lr_1e-5-s_to_keep-train_input-0317-141139 \
+--blocktt-run /data/yequan/fura/runs/blocktt/blocktt-adamw-lr_1e-5-output_one_block-s_to_keep-train_both-0317-155422 \
+--blocktt-run /data/yequan/fura/runs/blocktt/blocktt-adamw-lr_1e-4-output_one_block-s_to_frozen-train_small-0317-150342 \
 
 CUDA_VISIBLE_DEVICES=0 python analysis/plot_singular_relationship.py \
     --full-run runs/full/full-adamw-lr_2e-5-0325-215533 \
     --layer-prefix model.layers.12.self_attn.q_proj \
     --color-scale log
-
 """
 
 from __future__ import annotations

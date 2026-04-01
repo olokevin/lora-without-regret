@@ -208,6 +208,8 @@ def convert_linear_to_btt(
     lr_act=False,
     s_merged_to=None,
     train_position="small",
+    factorize_by_head=False,
+    model_config=None,
 ):
     if btt_rank is None:
         btt_rank = "full"
@@ -260,6 +262,24 @@ def convert_linear_to_btt(
                 )
             layer_decomp_mode = normalized_decomp_mode[child_name]
 
+        output_factorization = None
+        input_factorization = None
+        if factorize_by_head and model_config is not None:
+            num_heads = getattr(model_config, "num_attention_heads", None)
+            num_kv_heads = getattr(model_config, "num_key_value_heads", num_heads)
+            head_dim = getattr(model_config, "head_dim", None)
+            if head_dim is None and num_heads is not None:
+                hidden_size = getattr(model_config, "hidden_size", None)
+                if hidden_size is not None:
+                    head_dim = hidden_size // num_heads
+            if num_heads is not None and head_dim is not None:
+                if child_name == "q_proj":
+                    output_factorization = (num_heads, head_dim)
+                elif child_name in ("k_proj", "v_proj"):
+                    output_factorization = (num_kv_heads, head_dim)
+                elif child_name == "o_proj":
+                    input_factorization = (num_heads, head_dim)
+
         btt_layer = BTTLayer(
             in_features=linear.in_features,
             out_features=linear.out_features,
@@ -268,6 +288,8 @@ def convert_linear_to_btt(
             lr_act=lr_act,
             decomp_mode=layer_decomp_mode,
             init_mode=init_mode,
+            output_factorization=output_factorization,
+            input_factorization=input_factorization,
         ).to(device=linear.weight.device, dtype=linear.weight.dtype)
 
         btt_layer.init_from_linear_weight(
@@ -403,6 +425,8 @@ class BTTLayer(nn.Module):
         num_cores=2,
         decomp_mode="square",
         init_mode="default",
+        output_factorization=None,
+        input_factorization=None,
     ):
         super(BTTLayer, self).__init__()
 
@@ -420,8 +444,25 @@ class BTTLayer(nn.Module):
         self.lr_act_type = lr_act_type
         self.use_gate_proj = lr_act and lr_act_type == "swiglu"
 
-        out_blocks, out_block_size = _closest_factor_pair(out_features)
-        in_blocks, in_block_size = _closest_factor_pair(in_features)
+        if output_factorization is not None:
+            out_blocks, out_block_size = output_factorization
+            if out_blocks * out_block_size != out_features:
+                raise ValueError(
+                    f"output_factorization {output_factorization} does not match "
+                    f"out_features={out_features}"
+                )
+        else:
+            out_blocks, out_block_size = _closest_factor_pair(out_features)
+
+        if input_factorization is not None:
+            in_blocks, in_block_size = input_factorization
+            if in_blocks * in_block_size != in_features:
+                raise ValueError(
+                    f"input_factorization {input_factorization} does not match "
+                    f"in_features={in_features}"
+                )
+        else:
+            in_blocks, in_block_size = _closest_factor_pair(in_features)
 
         if decomp_mode == "square":
             m = out_blocks

@@ -15,6 +15,8 @@ import sys
 from functools import partial
 
 import numpy as np
+import os
+import time
 import torch
 import wandb
 from btt_layer import (
@@ -33,6 +35,7 @@ from svd_layer import (
     convert_linear_to_svd,
     get_svd_target_module_names,
 )
+from safetensors.torch import save_file as save_safetensors_file
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -43,22 +46,18 @@ MODE_DEFAULTS = {
     "full": {
         "lr": 5e-6,
         "wandb_project": "full-finetuning",
-        "output_dir": "./finetuned_model",
     },
     "lora": {
         "lr": 1e-4,
         "wandb_project": "lora-finetuning",
-        "output_dir": "./lora_model",
     },
     "blocktt": {
         "lr": 1e-4,
         "wandb_project": "blocktt-finetuning",
-        "output_dir": "./blocktt_model",
     },
     "svd": {
         "lr": 1e-4,
         "wandb_project": "svd-finetuning",
-        "output_dir": "./svd_model",
     },
 }
 
@@ -184,6 +183,12 @@ def parse_args(argv=None):
         action="store_true",
         help="Normalize trainable BTT cores after each optimizer update",
     )
+    parser.add_argument(
+        "--blocktt-factorize-by-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align attention layer BTT blocks with head structure (default: enabled)",
+    )
 
     # Shared trainable module selector for LoRA/BlockTT/SVD
     parser.add_argument(
@@ -240,15 +245,24 @@ def parse_args(argv=None):
         help="Number of training epochs (default: 1)",
     )
     parser.add_argument(
-        "--output-dir",
+        "--base-dir",
         type=str,
-        default=None,
-        help="Directory to save the model (default depends on train mode)",
+        default="/data/yequan/fura/sft_runs",
+        help="Base directory for saving runs",
     )
     parser.add_argument(
         "--enable-save-ckpt",
         action="store_true",
-        help="Save final checkpoint after training (default: disabled)",
+        help="Save checkpoints at step 10, 30, and final step (default: disabled)",
+    )
+    parser.add_argument(
+        "--save-grads-steps",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated optimizer steps to save gradients "
+            "(e.g. '0,10,30'). Step 0 = before first update. Default: disabled."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -265,8 +279,6 @@ def apply_mode_defaults(args):
         args.lr = defaults["lr"]
     if args.wandb_project is None:
         args.wandb_project = defaults["wandb_project"]
-    if args.output_dir is None:
-        args.output_dir = defaults["output_dir"]
     if args.train_mode == "blocktt" and args.train_position is None:
         args.train_position = "small"
     if args.train_mode == "svd" and args.train_position is None:
@@ -292,6 +304,8 @@ def validate_mode_specific_flags(args, argv):
             "--blocktt-rank",
             "--no-train-bias",
             "--blocktt-normalize-after-update",
+            "--blocktt-factorize-by-head",
+            "--no-blocktt-factorize-by-head",
         ],
         "svd": [],
     }
@@ -541,6 +555,8 @@ def prepare_model(args):
             lr_act=False,
             s_merged_to=args.s_merged_to,
             train_position=train_position,
+            factorize_by_head=args.blocktt_factorize_by_head,
+            model_config=model.config,
         )
         stats = configure_blocktt_trainability(
             model,
@@ -574,6 +590,7 @@ def prepare_model(args):
             "s_merged_to": args.s_merged_to,
             "train_bias": train_bias,
             "blocktt_normalize_after_update": args.blocktt_normalize_after_update,
+            "blocktt_factorize_by_head": args.blocktt_factorize_by_head,
             "target_modules": target_modules,
         }
         mode_info["print_lines"] = [
@@ -584,6 +601,7 @@ def prepare_model(args):
             f"  S merged to: {args.s_merged_to}",
             f"  Train BTT bias: {train_bias}",
             f"  Normalize BTT after update: {args.blocktt_normalize_after_update}",
+            f"  Factorize by head: {args.blocktt_factorize_by_head}",
             f"  Target modules: {target_modules}",
         ]
 
@@ -643,6 +661,61 @@ def validate_trainable_params(trainable_params):
         raise ValueError("Found non-trainable parameter in optimizer parameter list.")
     if len({id(p) for p in trainable_params}) != len(trainable_params):
         raise ValueError("Duplicate trainable parameters found.")
+
+
+def parse_save_grads_steps(s):
+    """Parse comma-separated step numbers, or return empty set if None."""
+    if s is None:
+        return set()
+    return {int(x.strip()) for x in s.split(",")}
+
+
+def save_gradients(trainable_named_params, base_dir, step, subdir="step"):
+    """Save all trainable gradients to {base_dir}/{subdir}={step}/grads.safetensors."""
+    grad_payload = {}
+    for name, p in trainable_named_params:
+        if p.grad is None:
+            continue
+        grad_payload[name] = p.grad.detach().cpu()
+    if not grad_payload:
+        print(f"Warning: no gradients to save at step {step}")
+        return
+    ckpt_dir = os.path.join(base_dir, f"{subdir}={step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    save_safetensors_file(grad_payload, os.path.join(ckpt_dir, "grads.safetensors"))
+    print(f"Saved gradients ({len(grad_payload)} tensors) to {ckpt_dir}")
+
+
+def compute_run_name(args, mode_info: dict) -> str:
+    """Compute a human-readable run name (used for both directory and W&B)."""
+    if args.wandb_run_name is not None:
+        return args.wandb_run_name
+    if args.train_mode == "full":
+        return f"{args.model_id}_{args.lr:.1e}_full"
+    if args.train_mode == "lora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+    if args.train_mode == "blocktt":
+        decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
+        return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
+    return f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}"
+
+
+def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
+    """Create run directory at {base_dir}/{train_mode}/{run_name}-{timestamp}."""
+    timestamp = time.strftime("%m%d-%H%M%S")
+    run_dir = os.path.join(base_dir, train_mode, f"{run_name}-{timestamp}")
+    os.makedirs(run_dir)
+    return run_dir
+
+
+def save_sft_checkpoint(model, tokenizer, run_dir, step):
+    """Save model checkpoint to {run_dir}/step={step}/."""
+    ckpt_dir = os.path.join(run_dir, f"step={step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"Saving checkpoint to {ckpt_dir}")
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    print(f"Checkpoint saved to {ckpt_dir}")
 
 
 def build_optimizer(args, trainable_params, trainable_named_params):
@@ -766,6 +839,10 @@ def main(argv=None):
     model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
     validate_trainable_params(trainable_params)
 
+    run_name = compute_run_name(args, mode_info)
+    run_dir = create_run_dir(args.base_dir, args.train_mode, run_name)
+    print(f"Created: {run_dir}")
+
     use_wandb = not args.no_wandb
     if use_wandb:
         wandb.init(
@@ -870,6 +947,8 @@ def main(argv=None):
         gradient_accumulation_steps=gradient_accumulation_steps,
     )
     warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
+    ckpt_save_steps = {10, 30, num_training_steps}
+    save_grads_steps = parse_save_grads_steps(args.save_grads_steps)
     print(f"  Optimizer update steps: {num_training_steps}")
     print(f"  Warmup steps (derived): {warmup_steps}")
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
@@ -916,6 +995,8 @@ def main(argv=None):
             loss.backward()
 
             if (step + 1) % gradient_accumulation_steps == 0:
+                if global_step in save_grads_steps:
+                    save_gradients(trainable_named_params, run_dir, global_step)
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 if normalize_blocktt_after_update:
@@ -924,6 +1005,9 @@ def main(argv=None):
                     scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+
+                if args.enable_save_ckpt and global_step in ckpt_save_steps:
+                    save_sft_checkpoint(model, tokenizer, run_dir, global_step)
 
                 if use_wandb:
                     wandb.log(
@@ -962,13 +1046,8 @@ def main(argv=None):
         wandb.summary["final_val_loss"] = final_val_loss
         wandb.summary["total_steps"] = global_step
 
-    if args.enable_save_ckpt:
-        print(f"Saving model to {args.output_dir}")
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        print(f"Model saved to {args.output_dir}")
-    else:
-        print("Final checkpoint save disabled (--enable-save-ckpt not set).")
+    if not args.enable_save_ckpt:
+        print("Checkpoint saving disabled (--enable-save-ckpt not set).")
 
     if use_wandb:
         wandb.finish()

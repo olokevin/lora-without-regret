@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sys
+import time
 from functools import partial
 
 import torch
@@ -57,22 +58,18 @@ MODE_DEFAULTS = {
     "full": {
         "lr": 5e-6,
         "wandb_project": "kd-full",
-        "output_dir": "./kd_full_model",
     },
     "lora": {
         "lr": 1e-4,
         "wandb_project": "kd-lora",
-        "output_dir": "./kd_lora_model",
     },
     "blocktt": {
         "lr": 1e-4,
         "wandb_project": "kd-blocktt",
-        "output_dir": "./kd_blocktt_model",
     },
     "svd": {
         "lr": 1e-4,
         "wandb_project": "kd-svd",
-        "output_dir": "./kd_svd_model",
     },
 }
 
@@ -91,7 +88,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--teacher-data-dir",
         type=str,
-        default="/data/yequan/fura/kd/DeepSeek-R1-Distill-Qwen-7B-competition_math",
+        default="/data/yequan/fura/kd_data/DeepSeek-R1-Distill-Qwen-7B-competition_math",
         help="Path to precomputed teacher data directory",
     )
     parser.add_argument(
@@ -103,8 +100,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--save-steps",
         type=str,
-        default="1,10,final",
-        help="Comma-separated optimizer steps to save checkpoints (default: 1,10,final)",
+        default="10,30,final",
+        help="Comma-separated optimizer steps to save checkpoints (default: 10,30,final)",
     )
 
     # Model args
@@ -144,6 +141,12 @@ def parse_args(argv=None):
     parser.add_argument("--blocktt-rank", type=str, default="full")
     parser.add_argument("--no-train-bias", action="store_true")
     parser.add_argument("--blocktt-normalize-after-update", action="store_true")
+    parser.add_argument(
+        "--blocktt-factorize-by-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align attention layer BTT blocks with head structure (default: enabled)",
+    )
 
     # Shared trainable module selector
     parser.add_argument("--trainable-type", type=str, default="all", choices=["all", "mlp", "attn"])
@@ -160,8 +163,22 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--num-epochs", type=int, default=1)
-    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default="/data/yequan/fura/kd_runs",
+        help="Base directory for saving runs",
+    )
     parser.add_argument("--enable-save-ckpt", action="store_true")
+    parser.add_argument(
+        "--save-grads-steps",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated optimizer steps to save gradients "
+            "(e.g. '0,10,30'). Step 0 = before first update. Default: disabled."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     # Wandb
@@ -182,8 +199,6 @@ def apply_mode_defaults(args):
         args.lr = defaults["lr"]
     if args.wandb_project is None:
         args.wandb_project = defaults["wandb_project"]
-    if args.output_dir is None:
-        args.output_dir = defaults["output_dir"]
     if args.train_mode == "blocktt" and args.train_position is None:
         args.train_position = "small"
     if args.train_mode == "svd" and args.train_position is None:
@@ -210,6 +225,8 @@ def validate_mode_specific_flags(args, argv):
             "--blocktt-rank",
             "--no-train-bias",
             "--blocktt-normalize-after-update",
+            "--blocktt-factorize-by-head",
+            "--no-blocktt-factorize-by-head",
         ],
         "svd": [],
     }
@@ -429,9 +446,31 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
     return masked_kl.sum() / num_tokens
 
 
-def save_kd_checkpoint(model, output_dir, step):
+def compute_run_name(args, mode_info: dict) -> str:
+    """Compute a human-readable run name (used for both directory and W&B)."""
+    if args.wandb_run_name is not None:
+        return args.wandb_run_name
+    if args.train_mode == "full":
+        return f"{args.model_id}_{args.lr:.1e}_full"
+    if args.train_mode == "lora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+    if args.train_mode == "blocktt":
+        decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
+        return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
+    return f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}"
+
+
+def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
+    """Create run directory at {base_dir}/{train_mode}/{run_name}-{timestamp}."""
+    timestamp = time.strftime("%m%d-%H%M%S")
+    run_dir = os.path.join(base_dir, train_mode, f"{run_name}-{timestamp}")
+    os.makedirs(run_dir)
+    return run_dir
+
+
+def save_kd_checkpoint(model, run_dir, step):
     """Save model checkpoint in step={N}/model.safetensors format."""
-    ckpt_dir = os.path.join(output_dir, f"step={step}")
+    ckpt_dir = os.path.join(run_dir, f"step={step}")
     os.makedirs(ckpt_dir, exist_ok=True)
     state_dict = {
         name: param.detach().cpu()
@@ -439,6 +478,29 @@ def save_kd_checkpoint(model, output_dir, step):
     }
     save_safetensors_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
     print(f"Saved checkpoint to {ckpt_dir}")
+
+
+def parse_save_grads_steps(s):
+    """Parse comma-separated step numbers, or return empty set if None."""
+    if s is None:
+        return set()
+    return {int(x.strip()) for x in s.split(",")}
+
+
+def save_gradients(trainable_named_params, base_dir, step, subdir="step"):
+    """Save all trainable gradients to {base_dir}/{subdir}={step}/grads.safetensors."""
+    grad_payload = {}
+    for name, p in trainable_named_params:
+        if p.grad is None:
+            continue
+        grad_payload[name] = p.grad.detach().cpu()
+    if not grad_payload:
+        print(f"Warning: no gradients to save at step {step}")
+        return
+    ckpt_dir = os.path.join(base_dir, f"{subdir}={step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    save_safetensors_file(grad_payload, os.path.join(ckpt_dir, "grads.safetensors"))
+    print(f"Saved gradients ({len(grad_payload)} tensors) to {ckpt_dir}")
 
 
 def build_kd_sft_collate_fn(pad_token_id):
@@ -527,6 +589,10 @@ def main(argv=None):
     model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
     validate_trainable_params(trainable_params)
 
+    run_name = compute_run_name(args, mode_info)
+    run_dir = create_run_dir(args.base_dir, args.train_mode, run_name)
+    print(f"Created: {run_dir}")
+
     # Prepare tokenizer for padding
     from transformers import AutoTokenizer as _AT
     tokenizer = _AT.from_pretrained(args.student_model_id)
@@ -570,6 +636,7 @@ def main(argv=None):
     warmup_steps = resolve_warmup_steps(args.warmup_ratio, num_training_steps)
 
     save_steps = parse_save_steps(args.save_steps, num_training_steps)
+    save_grads_steps = parse_save_grads_steps(args.save_grads_steps)
 
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
     scheduler = build_lr_scheduler(args, optimizer, num_training_steps)
@@ -703,6 +770,8 @@ def main(argv=None):
             loss.backward()
 
             if (step + 1) % gradient_accumulation_steps == 0:
+                if global_step in save_grads_steps:
+                    save_gradients(trainable_named_params, run_dir, global_step)
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 optimizer.step()
                 if normalize_blocktt_after_update:
@@ -727,7 +796,7 @@ def main(argv=None):
 
                 # Checkpoint saving
                 if args.enable_save_ckpt and global_step in save_steps:
-                    save_kd_checkpoint(model, args.output_dir, global_step)
+                    save_kd_checkpoint(model, run_dir, global_step)
 
                 prev_step_loss = prev_step_loss_acc
                 prev_step_loss_acc = 0
@@ -755,7 +824,7 @@ def main(argv=None):
 
     # Save final checkpoint if "final" was in save_steps and not already saved
     if args.enable_save_ckpt and num_training_steps in save_steps and global_step not in save_steps:
-        save_kd_checkpoint(model, args.output_dir, global_step)
+        save_kd_checkpoint(model, run_dir, global_step)
 
     if use_wandb:
         wandb.finish()

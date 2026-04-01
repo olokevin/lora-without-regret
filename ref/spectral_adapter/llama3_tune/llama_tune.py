@@ -1,7 +1,10 @@
-import torch
+import argparse
 import os
+import sys
+from pathlib import Path
+
+import torch
 from datasets import load_dataset, Dataset
-from huggingface_hub import login
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -11,10 +14,23 @@ from transformers import (
     TrainingArguments,
 )
 from peft import LoraConfig, get_peft_model
-from argparse import ArgumentParser
-from pathlib import Path
 
-from blocktt_utils import apply_blocktt_to_model, write_blocktt_metadata
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from blocktt_utils import write_blocktt_metadata  # noqa: E402
+from btt_layer import (  # noqa: E402
+    configure_blocktt_trainability,
+    convert_linear_to_btt,
+    get_blocktt_target_module_names,
+    resolve_blocktt_decomp_modes,
+)
+from svd_layer import (  # noqa: E402
+    configure_svd_trainability,
+    convert_linear_to_svd,
+    get_svd_target_module_names,
+)
 
 import lm_eval
 from lm_eval.models.huggingface import HFLM
@@ -72,7 +88,7 @@ def format_lr(lr: float) -> str:
     return f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
 
 
-def build_wandb_run_name(args, blocktt_metadata):
+def build_wandb_run_name(args, mode_info):
     parts = [args.model, f"lr{format_lr(args.learning_rate)}"]
     if args.model == "lora":
         parts.append(f"r{args.lora_rank}")
@@ -81,19 +97,28 @@ def build_wandb_run_name(args, blocktt_metadata):
     elif args.model == "blocktt":
         parts.extend(
             [
-                f"rank{blocktt_metadata['blocktt_rank']}",
-                blocktt_metadata["blocktt_type"],
-                str(blocktt_metadata["decomp_mode_resolved"]).replace(" ", ""),
-                f"tp{blocktt_metadata['train_position']}",
+                f"rank{mode_info['blocktt_rank']}",
+                mode_info["trainable_type"],
+                str(mode_info.get("decomp_mode_display", mode_info.get("decomp_mode", ""))).replace(" ", ""),
+                f"tp{mode_info['train_position']}",
             ]
         )
-        if blocktt_metadata["s_merged_to"] is not None:
-            parts.append(f"s{blocktt_metadata['s_merged_to']}")
+        if mode_info.get("s_merged_to") is not None:
+            parts.append(f"s{mode_info['s_merged_to']}")
+    elif args.model == "svd":
+        parts.extend(
+            [
+                mode_info["trainable_type"],
+                f"tp{mode_info['train_position']}",
+            ]
+        )
+        if mode_info.get("s_merged_to") is not None:
+            parts.append(f"s{mode_info['s_merged_to']}")
     return "-".join(parts)
 
 
-parser = ArgumentParser()
-parser.add_argument("--model", type=str, default="full", choices=["full", "lora", "spectral", "blocktt"])
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="full", choices=["full", "lora", "spectral", "blocktt", "svd"])
 parser.add_argument(
     "--learning-rate",
     "--lr",
@@ -108,6 +133,8 @@ parser.add_argument(
     default=8,
     help="LoRA rank for lora/spectral modes.",
 )
+
+# BlockTT-only args
 parser.add_argument(
     "--blocktt-rank",
     type=str,
@@ -115,30 +142,10 @@ parser.add_argument(
     help="BlockTT rank as a positive integer or 'full'.",
 )
 parser.add_argument(
-    "--blocktt-type",
-    type=str,
-    default="all",
-    choices=["all", "mlp", "attn"],
-    help="Target module family for BlockTT conversion.",
-)
-parser.add_argument(
     "--decomp-mode",
     type=str,
     default="input_one_block",
     help="BlockTT decomposition mode (scalar or mapping literal).",
-)
-parser.add_argument(
-    "--train-position",
-    type=str,
-    default="small",
-    choices=["small", "large", "both"],
-    help="Select which BlockTT core to train.",
-)
-parser.add_argument(
-    "--s-merged-to",
-    type=str,
-    default=None,
-    help="Optional singular-value merge target for BlockTT init.",
 )
 parser.add_argument(
     "--blocktt-train-bias",
@@ -151,6 +158,34 @@ parser.add_argument(
     action="store_false",
     dest="blocktt_train_bias",
     help="Do not train biases for BlockTT-converted layers.",
+)
+parser.add_argument(
+    "--blocktt-factorize-by-head",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Align attention layer BTT blocks with head structure (default: enabled)",
+)
+
+# Shared BlockTT/SVD args
+parser.add_argument(
+    "--trainable-type",
+    type=str,
+    default="all",
+    choices=["all", "mlp", "attn"],
+    help="Target module family for BlockTT/SVD conversion.",
+)
+parser.add_argument(
+    "--train-position",
+    type=str,
+    default=None,
+    choices=["small", "large", "both", "output", "input"],
+    help="Select which core/factor to train (blocktt: small|large|both, svd: output|input).",
+)
+parser.add_argument(
+    "--s-merged-to",
+    type=str,
+    default=None,
+    help="Optional singular-value merge target for BlockTT/SVD init.",
 )
 parser.add_argument(
     "--enable-eco-ckpt",
@@ -186,18 +221,47 @@ parser.add_argument(
 parser.add_argument(
     "--inline-eval-steps",
     type=int,
-    default=100,
+    default=0,
     dest="inline_eval_steps",
     help="Run GSM8K eval every N steps and log to wandb under val/. 0 disables.",
 )
 parser.add_argument(
     "--inline-eval-nshot",
     type=int,
-    default=0,
+    default=5,
     dest="inline_eval_nshot",
     help="Number of few-shot examples for inline GSM8K eval (default: 0-shot).",
 )
 args = parser.parse_args()
+
+# Apply mode-specific defaults for --train-position
+if args.train_position is None:
+    if args.model == "blocktt":
+        args.train_position = "small"
+    elif args.model == "svd":
+        args.train_position = "output"
+
+
+def resolve_blocktt_rank(rank_arg):
+    if rank_arg == "full":
+        return "full"
+    try:
+        rank = int(rank_arg)
+    except ValueError as exc:
+        raise ValueError("--blocktt-rank must be 'full' or a positive integer") from exc
+    if rank <= 0:
+        raise ValueError("--blocktt-rank must be > 0")
+    return rank
+
+
+def format_blocktt_decomp_mode(decomp_mode):
+    if isinstance(decomp_mode, str):
+        return decomp_mode
+    if isinstance(decomp_mode, dict):
+        order = ["qkv", "o", "mlp_upgate", "mlp_down"]
+        return ",".join(f"{group}={decomp_mode[group]}" for group in order if group in decomp_mode)
+    return str(decomp_mode)
+
 
 torch.manual_seed(0)
 model_checkpoint = "meta-llama/Meta-Llama-3-8B"
@@ -223,36 +287,120 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 
+mode_info = {}
 blocktt_metadata = None
 if args.model in {"lora", "spectral"}:
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 elif args.model == "blocktt":
-    blocktt_metadata, blocktt_stats = apply_blocktt_to_model(
+    blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
+    target_modules = get_blocktt_target_module_names(args.trainable_type)
+    train_bias = args.blocktt_train_bias
+    train_position = args.train_position
+
+    decomp_mode_display, module_decomp_modes = resolve_blocktt_decomp_modes(
+        args.decomp_mode,
+        include_names=target_modules,
+    )
+
+    converted_modules = convert_linear_to_btt(
         model,
-        blocktt_rank=args.blocktt_rank,
-        blocktt_type=args.blocktt_type,
-        decomp_mode=args.decomp_mode,
-        train_position=args.train_position,
+        btt_rank=blocktt_rank,
+        decomp_mode=module_decomp_modes if module_decomp_modes is not None else args.decomp_mode,
+        init_mode="default",
+        include_names=target_modules,
+        skip_names=("lm_head",),
+        lr_act=False,
         s_merged_to=args.s_merged_to,
-        train_bias=args.blocktt_train_bias,
-        set_trainability=True,
+        train_position=train_position,
+        factorize_by_head=args.blocktt_factorize_by_head,
+        model_config=model.config,
     )
-    print("BlockTT configuration:")
-    print(f"  Rank: {blocktt_metadata['blocktt_rank']}")
-    print(f"  Type: {blocktt_metadata['blocktt_type']}")
-    print(f"  Train position: {blocktt_metadata['train_position']}")
-    print(f"  S merged to: {blocktt_metadata['s_merged_to']}")
-    print(f"  Converted layers: {len(blocktt_metadata['converted_modules'])}")
+    stats = configure_blocktt_trainability(
+        model,
+        train_bias=train_bias,
+        train_position=train_position,
+    )
+    if stats["num_btt_layers"] == 0:
+        raise ValueError("No layers were converted to BTT; check --trainable-type selection.")
+
+    print(f"Converted modules: {len(converted_modules)}")
     print(
-        "  Trainable params: "
-        f"{blocktt_stats['trainable_param_count']}/{blocktt_stats['total_param_count']}"
+        f"Trainable params: {stats['trainable_param_count']:,} / "
+        f"{stats['total_param_count']:,} "
+        f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
     )
+    print(
+        f"Tuned cores: left={stats['tuned_left_cores']}, "
+        f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
+    )
+
+    mode_info = {
+        "blocktt_rank": blocktt_rank,
+        "trainable_type": args.trainable_type,
+        "decomp_mode": args.decomp_mode,
+        "decomp_mode_display": format_blocktt_decomp_mode(decomp_mode_display),
+        "train_position": train_position,
+        "s_merged_to": args.s_merged_to,
+        "train_bias": train_bias,
+        "factorize_by_head": args.blocktt_factorize_by_head,
+        "target_modules": target_modules,
+        "converted_modules": converted_modules,
+    }
+
+    # Build blocktt_metadata for checkpoint saving (compatible with blocktt_utils)
+    blocktt_metadata = {
+        "blocktt_rank": blocktt_rank,
+        "blocktt_type": args.trainable_type,
+        "decomp_mode_input": args.decomp_mode,
+        "decomp_mode_resolved": decomp_mode_display,
+        "module_decomp_modes": module_decomp_modes,
+        "target_modules": list(target_modules),
+        "train_position": train_position,
+        "s_merged_to": args.s_merged_to,
+        "train_bias": train_bias,
+        "converted_modules": converted_modules,
+    }
+
+elif args.model == "svd":
+    target_modules = get_svd_target_module_names(args.trainable_type)
+    converted_modules = convert_linear_to_svd(
+        model,
+        include_names=target_modules,
+        skip_names=("lm_head",),
+        s_merged_to=args.s_merged_to,
+        train_position=args.train_position,
+    )
+    stats = configure_svd_trainability(
+        model,
+        train_position=args.train_position,
+        train_bias=True,
+    )
+    if stats["num_svd_layers"] == 0:
+        raise ValueError("No layers were converted to SVD; check --trainable-type selection.")
+
+    print(f"Converted modules: {len(converted_modules)}")
+    print(
+        f"Trainable params: {stats['trainable_param_count']:,} / "
+        f"{stats['total_param_count']:,} "
+        f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
+    )
+    print(
+        f"Tuned factors: output={stats['tuned_output_cores']}, "
+        f"input={stats['tuned_input_cores']}, biases={stats['tuned_biases']}"
+    )
+
+    mode_info = {
+        "trainable_type": args.trainable_type,
+        "train_position": args.train_position,
+        "s_merged_to": args.s_merged_to,
+        "target_modules": target_modules,
+    }
 
 for n, p in model.named_parameters():
     print(n, p.shape)
 
-wandb_run_name = build_wandb_run_name(args, blocktt_metadata)
+wandb_run_name = build_wandb_run_name(args, mode_info)
 suffix = args.suffix.strip()
 if suffix:
     wandb_run_name = f"{wandb_run_name}-{suffix}"

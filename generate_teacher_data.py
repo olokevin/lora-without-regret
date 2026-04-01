@@ -3,7 +3,7 @@
 Generate teacher model completions and top-K logits for knowledge distillation.
 
 Example:
-  CUDA_VISIBLE_DEVICES=0 uv run generate_teacher_data.py \
+  CUDA_VISIBLE_DEVICES=2 uv run generate_teacher_data.py \
     --teacher-model-id deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --top-k 256
 """
@@ -40,13 +40,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dataset-split",
         type=str,
-        default="train[:7500]",
+        default="train[:500]",
         help="Dataset split (default: train[:7500])",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/data/yequan/fura/kd/",
+        default="/data/yequan/fura/kd_data/",
         help="Base output directory",
     )
     parser.add_argument(
@@ -194,6 +194,7 @@ def main(argv=None):
         tensor_parallel_size=1,
         gpu_memory_utilization=0.9,
         max_model_len=2048,
+        max_logprobs=args.top_k,
     )
 
     sampling_params = SamplingParams(
