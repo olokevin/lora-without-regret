@@ -729,7 +729,14 @@ def main(argv=None):
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
     validate_trainable_params(trainable_params)
+    device = model.device
     vllm_generate = build_vllm_generator(args, model)
+
+    teacher_model = None
+    if args.kd_loss_type == "kl_online":
+        print(f"Loading teacher model: {args.teacher_model_id}")
+        teacher_model = load_teacher_model(args.teacher_model_id, device)
+        print("Teacher model loaded.")
 
     run_name = compute_run_name(args, mode_info)
     run_dir = create_run_dir(args.base_dir, args.train_mode, run_name)
@@ -746,10 +753,14 @@ def main(argv=None):
         train_dataset = KDSftDataset(train_completions)
         val_dataset = KDSftDataset(val_completions)
         collate_fn = build_kd_sft_collate_fn(tokenizer.pad_token_id)
-    else:
+    elif args.kd_loss_type == "kl":
         train_dataset = KDKlDataset(train_completions, args.teacher_data_dir, args.top_k)
         val_dataset = KDKlDataset(val_completions, args.teacher_data_dir, args.top_k, index_offset=len(train_completions))
         collate_fn = build_kd_kl_collate_fn(tokenizer.pad_token_id, args.top_k)
+    else:  # kl_online
+        train_dataset = KDOnlineDataset(train_completions)
+        val_dataset = KDOnlineDataset(val_completions)
+        collate_fn = build_kd_online_collate_fn(tokenizer.pad_token_id)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -783,7 +794,6 @@ def main(argv=None):
         )
 
     gradient_accumulation_steps = args.gradient_accumulation_steps
-    device = model.device
     num_training_steps = compute_num_training_steps(
         num_batches=len(train_dataloader),
         num_epochs=args.num_epochs,
@@ -871,18 +881,36 @@ def main(argv=None):
     def eval_model(step=None, compute_accuracy=False):
         model.eval()
 
-        # Part 1: CE loss (unified for both sft and kl)
-        total_ce_loss = 0
+        # Part 1: val loss
+        total_val_loss = 0
         with torch.no_grad():
             for batch in ce_val_dataloader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                total_ce_loss += model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                ).loss.item()
-        val_loss = total_ce_loss / max(1, len(ce_val_dataloader))
-        print(f"val/loss (CE): {val_loss:.4f} at step {step}")
+                if args.kd_loss_type == "kl_online":
+                    teacher_outputs = teacher_model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                    student_outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                    response_mask = (batch["labels"] != -100).float()
+                    total_val_loss += compute_online_kl_loss(
+                        student_outputs.logits,
+                        teacher_outputs.logits,
+                        response_mask,
+                        shared_vocab_size,
+                    ).item()
+                else:
+                    total_val_loss += model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    ).loss.item()
+        val_loss = total_val_loss / max(1, len(ce_val_dataloader))
+        loss_label = "KL online" if args.kd_loss_type == "kl_online" else "CE"
+        print(f"val/loss ({loss_label}): {val_loss:.4f} at step {step}")
 
         log_dict = {"val/loss": val_loss}
 
@@ -939,7 +967,7 @@ def main(argv=None):
                     labels=batch["labels"],
                 )
                 loss = outputs.loss
-            else:
+            elif args.kd_loss_type == "kl":
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -952,6 +980,22 @@ def main(argv=None):
                     batch["teacher_topk_values"],
                     batch["teacher_topk_indices"],
                     batch["response_mask"],
+                )
+            else:  # kl_online
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                student_outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
+                loss = compute_online_kl_loss(
+                    student_outputs.logits,
+                    teacher_outputs.logits,
+                    batch["response_mask"],
+                    shared_vocab_size,
                 )
 
             loss = loss / gradient_accumulation_steps

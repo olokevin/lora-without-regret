@@ -487,6 +487,7 @@ class TestRunKdIntegration(unittest.TestCase):
                     list(model.named_parameters()),
                     {"wandb_extra": {}, "print_lines": []},
                 )),
+                patch("run_kd.build_vllm_generator", return_value=lambda prompts: ["answer"] * len(prompts)),
                 patch("transformers.AutoTokenizer.from_pretrained", return_value=type(
                     "Tok", (), {"pad_token_id": 0, "eos_token_id": 0}
                 )()),
@@ -525,6 +526,46 @@ class TestRunKdIntegration(unittest.TestCase):
                     list(model.named_parameters()),
                     {"wandb_extra": {}, "print_lines": []},
                 )),
+                patch("run_kd.build_vllm_generator", return_value=lambda prompts: ["answer"] * len(prompts)),
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=type(
+                    "Tok", (), {"pad_token_id": 0, "eos_token_id": 0}
+                )()),
+            ):
+                run_kd.main(argv)
+
+
+    def test_kl_online_mode_runs(self):
+        import run_kd
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:
+            self._create_teacher_data(data_dir, top_k=8)
+            student_model = _DummyModel(vocab_size=100)
+            teacher_model = _DummyModel(vocab_size=100)
+            teacher_model.requires_grad_ = lambda x: teacher_model
+
+            argv = [
+                "--kd-loss-type", "kl_online",
+                "--teacher-model-id", "test/teacher",
+                "--train-mode", "full",
+                "--teacher-data-dir", data_dir,
+                "--student-model-id", "test/student",
+                "--base-dir", out_dir,
+                "--batch-size", "2",
+                "--gradient-accumulation-steps", "1",
+                "--num-epochs", "1",
+                "--no-wandb",
+            ]
+
+            with (
+                patch("run_kd.prepare_model", return_value=(
+                    student_model,
+                    list(student_model.parameters()),
+                    list(student_model.named_parameters()),
+                    {"wandb_extra": {}, "print_lines": []},
+                )),
+                patch("run_kd.load_teacher_model", return_value=teacher_model),
+                patch("run_kd.build_vllm_generator", return_value=lambda prompts: ["answer"] * len(prompts)),
                 patch("transformers.AutoTokenizer.from_pretrained", return_value=type(
                     "Tok", (), {"pad_token_id": 0, "eos_token_id": 0}
                 )()),
