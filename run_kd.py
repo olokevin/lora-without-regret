@@ -816,6 +816,7 @@ def main(argv=None):
             config={
                 "train_mode": args.train_mode,
                 "kd_loss_type": args.kd_loss_type,
+                "teacher_model_id": getattr(args, "teacher_model_id", None),
                 "student_model_id": args.student_model_id,
                 "teacher_data_dir": args.teacher_data_dir,
                 "top_k": args.top_k,
@@ -840,6 +841,8 @@ def main(argv=None):
     print(f"  Train mode: {args.train_mode}")
     print(f"  Student model: {args.student_model_id}")
     print(f"  Teacher data: {args.teacher_data_dir}")
+    if args.kd_loss_type == "kl_online":
+        print(f"  Teacher model: {args.teacher_model_id}")
     print(f"  Top-K: {args.top_k}")
     print(f"  Optimizer: {args.optimizer}")
     print(f"  Learning rate: {args.lr}")
