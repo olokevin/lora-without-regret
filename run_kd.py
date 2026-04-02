@@ -39,6 +39,7 @@ from svd_layer import (
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from math_utils import is_equiv, last_boxed_only_string, remove_boxed
 from run_sft import (
     build_collate_fn,
     build_lr_scheduler,
@@ -52,6 +53,7 @@ from run_sft import (
     set_seed,
     validate_trainable_params,
 )
+from run_rl import export_weights_for_vllm
 
 
 MODE_DEFAULTS = {
@@ -82,8 +84,8 @@ def parse_args(argv=None):
         "--kd-loss-type",
         type=str,
         required=True,
-        choices=["sft", "kl"],
-        help="KD loss type: sft (train on teacher completions) or kl (KL divergence on logits)",
+        choices=["sft", "kl", "kl_online"],
+        help="KD loss type: sft (CE on teacher completions), kl (offline KL on top-K logits), or kl_online (live KL against frozen teacher)",
     )
     parser.add_argument(
         "--teacher-data-dir",
@@ -96,6 +98,12 @@ def parse_args(argv=None):
         type=int,
         default=256,
         help="Top-K for KL loss; must match generated data (default: 256)",
+    )
+    parser.add_argument(
+        "--teacher-model-id",
+        type=str,
+        default=None,
+        help="Teacher model ID for kl_online mode (e.g. deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)",
     )
     parser.add_argument(
         "--save-steps",
@@ -204,7 +212,7 @@ def apply_mode_defaults(args):
     if args.train_mode == "svd" and args.train_position is None:
         args.train_position = "output"
     if args.train_mode in {"blocktt", "svd"} and args.s_merged_to is None:
-        if args.train_mode == "blocktt" and args.train_position == "both":
+        if args.train_position == "both":
             args.s_merged_to = "split"
         else:
             args.s_merged_to = "frozen"
@@ -261,8 +269,8 @@ def validate_mode_specific_flags(args, argv):
         if args.train_position not in {"small", "large", "both"}:
             raise ValueError("--train-position for blocktt must be one of: small, large, both")
     if args.train_mode == "svd" and train_position_passed:
-        if args.train_position not in {"output", "input"}:
-            raise ValueError("--train-position for svd must be one of: output, input")
+        if args.train_position not in {"output", "input", "both"}:
+            raise ValueError("--train-position for svd must be one of: output, input, both")
 
     s_merged_to_passed = _flag_was_passed(argv, "--s-merged-to")
     if args.train_mode in {"full", "lora"} and s_merged_to_passed:
@@ -277,6 +285,9 @@ def validate_mode_specific_flags(args, argv):
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
             "use output, input, or split"
         )
+
+    if args.kd_loss_type == "kl_online" and not getattr(args, "teacher_model_id", None):
+        raise ValueError("--teacher-model-id is required when --kd-loss-type kl_online")
 
 
 def parse_save_steps(save_steps_str, total_steps):
@@ -462,6 +473,36 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
     return masked_kl.sum() / num_tokens
 
 
+def build_vllm_generator(args, model):
+    """Build a greedy generation function backed by a local vLLM engine."""
+    os.environ["VLLM_USE_V1"] = "0"
+    from vllm import LLM, SamplingParams
+
+    vllm_model = LLM(
+        model=args.model_id,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.4,
+        max_model_len=2048,
+        max_num_batched_tokens=4096,
+        logprobs_mode="processed_logprobs",
+    )
+    sampling_params = SamplingParams(max_tokens=1024, temperature=0, n=1)
+
+    def generate(prompts: list[str]) -> list[str]:
+        if args.train_mode in {"blocktt", "svd"}:
+            weight_tuples = export_weights_for_vllm(model)
+        else:
+            weight_tuples = list(model.named_parameters())
+        vllm_internal_model = (
+            vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
+        )
+        vllm_internal_model.load_weights(weight_tuples)
+        outputs = vllm_model.generate(prompts, sampling_params)
+        return [o.text for output in outputs for o in output.outputs]
+
+    return generate
+
+
 def compute_run_name(args, mode_info: dict) -> str:
     """Compute a human-readable run name (used for both directory and W&B)."""
     if args.wandb_run_name is not None:
@@ -604,6 +645,7 @@ def main(argv=None):
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
     validate_trainable_params(trainable_params)
+    vllm_generate = build_vllm_generator(args, model)
 
     run_name = compute_run_name(args, mode_info)
     run_dir = create_run_dir(args.base_dir, args.train_mode, run_name)
@@ -641,6 +683,20 @@ def main(argv=None):
         pin_memory=True,
         collate_fn=collate_fn,
     )
+
+    # Unified CE val dataloader (for comparable val/loss across sft and kl modes)
+    if args.kd_loss_type == "sft":
+        ce_val_dataloader = val_dataloader
+    else:
+        ce_val_dataset = KDSftDataset(val_completions)
+        ce_val_dataloader = DataLoader(
+            ce_val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=build_kd_sft_collate_fn(tokenizer.pad_token_id),
+        )
 
     gradient_accumulation_steps = args.gradient_accumulation_steps
     device = model.device
@@ -703,46 +759,78 @@ def main(argv=None):
     print(f"  Save steps: {sorted(save_steps)}")
     print()
 
+    # Build val prompts for accuracy evaluation
+    prompt_template_path = teacher_config.get("prompt_template", "boxed.prompt")
+    if os.path.exists(prompt_template_path):
+        with open(prompt_template_path, "r", encoding="utf-8") as f:
+            _prompt_template = f.read().strip()
+    else:
+        _prompt_template = "{question}"
+
+    val_prompts_for_gen = []
+    val_ground_truths = []
+    has_chat_template = hasattr(tokenizer, "apply_chat_template")
+    for c in val_completions:
+        content = _prompt_template.replace("{question}", c["question"])
+        if has_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = content
+        val_prompts_for_gen.append(prompt)
+        val_ground_truths.append(c["ground_truth"])
+
     # Eval function
-    def eval_model(step=None):
+    def eval_model(step=None, compute_accuracy=False):
         model.eval()
-        total_loss = 0
+
+        # Part 1: CE loss (unified for both sft and kl)
+        total_ce_loss = 0
         with torch.no_grad():
-            for batch in val_dataloader:
+            for batch in ce_val_dataloader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                if args.kd_loss_type == "sft":
-                    loss = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                    ).loss
-                else:
-                    outputs = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                    )
-                    logits = outputs.logits
-                    if shared_vocab_size is not None:
-                        logits = logits[:, :, :shared_vocab_size]
-                    loss = compute_kl_loss(
-                        logits,
-                        batch["teacher_topk_values"],
-                        batch["teacher_topk_indices"],
-                        batch["response_mask"],
-                    )
-                total_loss += loss.item()
-        val_loss = total_loss / max(1, len(val_dataloader))
-        print(f"val_loss: {val_loss:.4f} at step {step}")
+                total_ce_loss += model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                ).loss.item()
+        val_loss = total_ce_loss / max(1, len(ce_val_dataloader))
+        print(f"val/loss (CE): {val_loss:.4f} at step {step}")
+
+        log_dict = {"val/loss": val_loss}
+
+        # Part 2: Accuracy via generation (only when requested — generation is slow)
+        if compute_accuracy and has_chat_template:
+            eval_start = time.time()
+            outputs = vllm_generate(val_prompts_for_gen)
+            eval_time = time.time() - eval_start
+
+            correct = 0
+            for i, output in enumerate(outputs):
+                gen_ans = remove_boxed(last_boxed_only_string(output))
+                if gen_ans is not None and is_equiv(gen_ans, val_ground_truths[i]):
+                    correct += 1
+            accuracy = correct / len(outputs) if outputs else 0
+            print(f"val/accuracy: {correct}/{len(outputs)} ({accuracy:.2%}) at step {step}")
+            log_dict.update({
+                "val/accuracy": accuracy,
+                "val/correct": correct,
+                "val/total": len(outputs),
+                "val/eval_time_seconds": eval_time,
+            })
 
         if use_wandb and step is not None:
-            wandb.log({"val/loss": val_loss}, step=step)
+            wandb.log(log_dict, step=step)
 
         model.train()
         return val_loss
 
     # Training loop
     print("Starting initial evaluation...")
-    eval_model()
+    eval_model(compute_accuracy=False)
     model.train()
     global_step = 0
     total_loss = 0
@@ -810,8 +898,9 @@ def main(argv=None):
                 if global_step % 10 == 0:
                     eval_model(step=global_step)
 
-                # Checkpoint saving
+                # Checkpoint saving (with accuracy eval)
                 if args.enable_save_ckpt and global_step in save_steps:
+                    eval_model(step=global_step, compute_accuracy=False)
                     save_kd_checkpoint(model, run_dir, global_step)
 
                 prev_step_loss = prev_step_loss_acc
@@ -832,7 +921,7 @@ def main(argv=None):
     print("Training complete!")
 
     print("Running final evaluation...")
-    final_val_loss = eval_model(step=global_step)
+    final_val_loss = eval_model(step=global_step, compute_accuracy=True)
 
     if use_wandb:
         wandb.summary["final_val_loss"] = final_val_loss

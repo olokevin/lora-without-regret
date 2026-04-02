@@ -89,6 +89,31 @@ class TestRunKdCli(unittest.TestCase):
         run_kd.apply_mode_defaults(args)
         self.assertEqual(args.train_position, "output")
 
+    def test_kl_online_choice_accepted(self):
+        import run_kd
+        args = run_kd.parse_args([
+            "--kd-loss-type", "kl_online",
+            "--train-mode", "full",
+            "--teacher-model-id", "test/teacher",
+        ])
+        self.assertEqual(args.kd_loss_type, "kl_online")
+        self.assertEqual(args.teacher_model_id, "test/teacher")
+
+    def test_kl_online_requires_teacher_model_id(self):
+        import run_kd
+        argv = ["--kd-loss-type", "kl_online", "--train-mode", "full"]
+        args = run_kd.parse_args(argv)
+        with self.assertRaises(ValueError):
+            run_kd.validate_mode_specific_flags(args, argv)
+
+    def test_teacher_model_id_ignored_for_sft(self):
+        import run_kd
+        # Should not raise even though --teacher-model-id is absent
+        argv = ["--kd-loss-type", "sft", "--train-mode", "full"]
+        args = run_kd.parse_args(argv)
+        run_kd.validate_mode_specific_flags(args, argv)
+        self.assertIsNone(args.teacher_model_id)
+
 
 class TestTeacherDataLoading(unittest.TestCase):
     def _create_teacher_data(self, tmp_dir, num_examples=4, top_k=8, max_tokens=16):
