@@ -298,6 +298,50 @@ class TestKLLoss(unittest.TestCase):
         self.assertFalse(torch.isnan(loss_half))
 
 
+    def test_online_kl_loss_shape(self):
+        import run_kd
+        import torch
+        student_logits = torch.randn(2, 4, 100)
+        teacher_logits = torch.randn(2, 4, 100)
+        response_mask = torch.ones(2, 4)
+        loss = run_kd.compute_online_kl_loss(student_logits, teacher_logits, response_mask)
+        self.assertEqual(loss.shape, ())
+        self.assertFalse(torch.isnan(loss))
+
+    def test_online_kl_loss_zero_when_identical(self):
+        import run_kd
+        import torch
+        logits = torch.randn(1, 3, 50)
+        response_mask = torch.ones(1, 3)
+        loss = run_kd.compute_online_kl_loss(logits, logits, response_mask)
+        self.assertAlmostEqual(loss.item(), 0.0, places=4)
+
+    def test_online_kl_loss_respects_shared_vocab_size(self):
+        import run_kd
+        import torch
+        # Teacher has larger vocab (150), student smaller (100)
+        student_logits = torch.randn(1, 3, 100)
+        teacher_logits = torch.randn(1, 3, 150)
+        response_mask = torch.ones(1, 3)
+        loss = run_kd.compute_online_kl_loss(
+            student_logits, teacher_logits, response_mask, shared_vocab_size=100
+        )
+        self.assertEqual(loss.shape, ())
+        self.assertFalse(torch.isnan(loss))
+
+    def test_online_kl_loss_respects_response_mask(self):
+        import run_kd
+        import torch
+        student_logits = torch.randn(1, 4, 50)
+        teacher_logits = torch.randn(1, 4, 50)
+        mask_all = torch.ones(1, 4)
+        mask_half = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        loss_all = run_kd.compute_online_kl_loss(student_logits, teacher_logits, mask_all)
+        loss_half = run_kd.compute_online_kl_loss(student_logits, teacher_logits, mask_half)
+        self.assertFalse(torch.isnan(loss_all))
+        self.assertFalse(torch.isnan(loss_half))
+
+
 class TestCheckpointSaving(unittest.TestCase):
     def test_save_kd_checkpoint_creates_safetensors(self):
         import run_kd

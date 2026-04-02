@@ -495,6 +495,48 @@ def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, r
     return masked_kl.sum() / num_tokens
 
 
+def compute_online_kl_loss(student_logits, teacher_logits, response_mask, shared_vocab_size=None):
+    """
+    Compute token-wise KL(student || teacher) over full shared vocab.
+
+    Args:
+        student_logits: [batch, seq_len, student_vocab_size]
+        teacher_logits: [batch, seq_len, teacher_vocab_size]
+        response_mask: [batch, seq_len] - 1 for response tokens, 0 for padding
+        shared_vocab_size: if set, both logit tensors are sliced to this size
+
+    Returns:
+        Scalar KL loss averaged over response tokens.
+    """
+    if shared_vocab_size is not None:
+        student_logits = student_logits[:, :, :shared_vocab_size]
+        teacher_logits = teacher_logits[:, :, :shared_vocab_size]
+
+    teacher_log_probs = F.log_softmax(teacher_logits.float(), dim=-1)
+    student_log_probs = F.log_softmax(student_logits.float(), dim=-1)
+
+    # F.kl_div(input=log_q, target=log_p, log_target=True) = KL(p || q) = sum p*(log_p - log_q)
+    kl_per_token = F.kl_div(
+        teacher_log_probs,
+        student_log_probs,
+        log_target=True,
+        reduction="none",
+    ).sum(dim=-1)  # [batch, seq_len]
+
+    masked_kl = kl_per_token * response_mask
+    num_tokens = response_mask.sum().clamp(min=1)
+    return masked_kl.sum() / num_tokens
+
+
+def load_teacher_model(teacher_model_id, device):
+    """Load a frozen teacher model for online KL distillation."""
+    from transformers import AutoModelForCausalLM
+    teacher = AutoModelForCausalLM.from_pretrained(teacher_model_id, torch_dtype=torch.bfloat16)
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher.to(device)
+
+
 def build_vllm_generator(args, model):
     """Build a greedy generation function backed by a local vLLM engine."""
     os.environ["VLLM_USE_V1"] = "0"
