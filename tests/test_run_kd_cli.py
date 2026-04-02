@@ -209,6 +209,36 @@ class TestTeacherDataLoading(unittest.TestCase):
             self.assertIn("teacher_topk_indices", item)
             self.assertIn("response_mask", item)
 
+    def test_build_online_dataset(self):
+        import run_kd
+        completions = [
+            {"prompt": "Q?", "completion": "A", "token_ids": [1, 2, 3]},
+            {"prompt": "Q2?", "completion": "A2", "token_ids": [4, 5, 6, 7]},
+        ]
+        dataset = run_kd.KDOnlineDataset(completions, max_length=32)
+        self.assertEqual(len(dataset), 2)
+        item = dataset[0]
+        self.assertIn("input_ids", item)
+        self.assertIn("attention_mask", item)
+        self.assertIn("response_mask", item)
+        self.assertNotIn("labels", item)
+        self.assertEqual(item["input_ids"], [1, 2, 3])
+        self.assertEqual(item["response_mask"], [1, 1, 1])
+
+    def test_online_collate_fn_pads(self):
+        import run_kd
+        import torch
+        collate = run_kd.build_kd_online_collate_fn(pad_token_id=0)
+        batch = [
+            {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "response_mask": [1, 1, 1]},
+            {"input_ids": [4, 5],    "attention_mask": [1, 1],    "response_mask": [1, 1]},
+        ]
+        out = collate(batch)
+        self.assertEqual(out["input_ids"].shape, (2, 3))
+        self.assertEqual(out["input_ids"][1, 2].item(), 0)   # padded
+        self.assertEqual(out["response_mask"][1, 2].item(), 0)  # padded
+        self.assertEqual(out["attention_mask"][1, 2].item(), 0)  # padded
+
 
 class TestKLLoss(unittest.TestCase):
     def test_kl_loss_shape(self):

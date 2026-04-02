@@ -417,6 +417,28 @@ class KDKlDataset(Dataset):
         }
 
 
+class KDOnlineDataset(Dataset):
+    """Dataset for online KL KD: provides token_ids for live teacher inference."""
+
+    def __init__(self, completions, max_length=2048):
+        self.completions = completions
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.completions)
+
+    def __getitem__(self, idx):
+        entry = self.completions[idx]
+        input_ids = entry["token_ids"][: self.max_length]
+        attention_mask = [1] * len(input_ids)
+        response_mask = [1] * len(input_ids)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "response_mask": response_mask,
+        }
+
+
 def compute_kl_loss(student_logits, teacher_topk_values, teacher_topk_indices, response_mask):
     """
     Compute token-wise KL(student || teacher) over teacher's top-K positions.
@@ -614,6 +636,26 @@ def build_kd_kl_collate_fn(pad_token_id, top_k):
             "response_mask": torch.stack(response_mask) if isinstance(response_mask[0], torch.Tensor) else torch.tensor(response_mask, dtype=torch.float32),
             "teacher_topk_values": torch.stack(teacher_topk_values),
             "teacher_topk_indices": torch.stack(teacher_topk_indices),
+        }
+    return collate_fn
+
+
+def build_kd_online_collate_fn(pad_token_id):
+    """Collate for online KL KD: pad input_ids, attention_mask, response_mask."""
+    def collate_fn(batch):
+        max_len = max(len(item["input_ids"]) for item in batch)
+        input_ids = []
+        attention_mask = []
+        response_mask = []
+        for item in batch:
+            padding_len = max_len - len(item["input_ids"])
+            input_ids.append(item["input_ids"] + [pad_token_id] * padding_len)
+            attention_mask.append(item["attention_mask"] + [0] * padding_len)
+            response_mask.append(item["response_mask"] + [0] * padding_len)
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "response_mask": torch.tensor(response_mask, dtype=torch.float32),
         }
     return collate_fn
 
