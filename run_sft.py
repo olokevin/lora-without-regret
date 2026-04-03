@@ -284,7 +284,7 @@ def apply_mode_defaults(args):
     if args.train_mode == "svd" and args.train_position is None:
         args.train_position = "output"
     if args.train_mode in {"blocktt", "svd"} and args.s_merged_to is None:
-        if args.train_mode == "blocktt" and args.train_position == "both":
+        if args.train_position == "both":
             args.s_merged_to = "split"
         else:
             args.s_merged_to = "frozen"
@@ -344,8 +344,8 @@ def validate_mode_specific_flags(args, argv):
         if args.train_position not in {"small", "large", "both"}:
             raise ValueError("--train-position for blocktt must be one of: small, large, both")
     if args.train_mode == "svd" and train_position_passed:
-        if args.train_position not in {"output", "input"}:
-            raise ValueError("--train-position for svd must be one of: output, input")
+        if args.train_position not in {"output", "input", "both"}:
+            raise ValueError("--train-position for svd must be one of: output, input, both")
 
     s_merged_to_passed = _flag_was_passed(argv, "--s-merged-to")
     if args.train_mode in {"full", "lora"} and s_merged_to_passed:
@@ -618,6 +618,7 @@ def prepare_model(args):
             model,
             train_position=args.train_position,
             train_bias=True,
+            train_embed_lm_head=(args.train_position == "both"),
         )
         if stats["num_svd_layers"] == 0:
             raise ValueError("No layers were converted to SVD; check --trainable-type selection.")

@@ -178,9 +178,9 @@ def convert_linear_to_svd(
     return [name for name, _ in modules_to_replace]
 
 
-def configure_svd_trainability(model, train_position="output", train_bias=True):
-    if train_position not in {"output", "input"}:
-        raise ValueError("train_position must be one of: output, input")
+def configure_svd_trainability(model, train_position="output", train_bias=True, train_embed_lm_head=False):
+    if train_position not in {"output", "input", "both"}:
+        raise ValueError("train_position must be one of: output, input, both")
 
     for p in model.parameters():
         p.requires_grad = False
@@ -195,12 +195,10 @@ def configure_svd_trainability(model, train_position="output", train_bias=True):
             continue
         num_svd_layers += 1
 
-        if train_position == "output":
+        if train_position in {"output", "both"}:
             module.svd_a.requires_grad = True
-            module.svd_b.requires_grad = False
             tuned_output_cores += 1
-        else:
-            module.svd_a.requires_grad = False
+        if train_position in {"input", "both"}:
             module.svd_b.requires_grad = True
             tuned_input_cores += 1
         if module.svd_s is not None:
@@ -210,6 +208,13 @@ def configure_svd_trainability(model, train_position="output", train_bias=True):
             module.bias.requires_grad = train_bias
             if train_bias:
                 tuned_biases += 1
+
+    if train_embed_lm_head:
+        for name, module in model.named_modules():
+            leaf_name = name.split(".")[-1]
+            if leaf_name in ("embed_tokens", "lm_head"):
+                for p in module.parameters():
+                    p.requires_grad = True
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     trainable_param_count = sum(p.numel() for p in trainable_params)

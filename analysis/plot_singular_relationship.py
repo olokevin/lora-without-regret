@@ -24,6 +24,12 @@ CUDA_VISIBLE_DEVICES=2 python analysis/plot_singular_relationship.py \
     --base-model-id Qwen/Qwen3-4B \
     --layer-prefix model.layers.12.self_attn.q_proj \
     --color-scale log
+
+CUDA_VISIBLE_DEVICES=2 python analysis/plot_singular_relationship.py \
+    --sft-run /data/yequan/fura/kd_runs/blocktt/blocktt-sft-adamw-lr_1e-4-output_one_block-s_to_input-train_both-0401-212120 \
+    --base-model-id Qwen/Qwen2.5-0.5B \
+    --layer-prefix model.layers.12 \
+    --color-scale log
 """
 
 from __future__ import annotations
@@ -952,10 +958,14 @@ def save_blocktt_side_figure(
 
     scaled_grad = apply_color_scale(grad_slices, color_scale)
     scaled_update = apply_color_scale(update_slices, color_scale)
-    vmin = float(min(np.min(scaled_grad), np.min(scaled_update)))
-    vmax = float(max(np.max(scaled_grad), np.max(scaled_update)))
-    if vmin == vmax:
-        vmax = vmin + 1e-12
+    grad_vmin = float(np.min(scaled_grad))
+    grad_vmax = float(np.max(scaled_grad))
+    if grad_vmin == grad_vmax:
+        grad_vmax = grad_vmin + 1e-12
+    update_vmin = float(np.min(scaled_update))
+    update_vmax = float(np.max(scaled_update))
+    if update_vmin == update_vmax:
+        update_vmax = update_vmin + 1e-12
 
     fig_w, panel_h = _figure_size_for_square_cells(rows, cols, cell_h, cell_w)
     fig_h = panel_h * 2.0
@@ -966,14 +976,15 @@ def save_blocktt_side_figure(
         constrained_layout=True,
         squeeze=False,
     )
-    im = None
+    last_grad_im = None
+    last_update_im = None
 
     sections = [
-        ("grad", scaled_grad, grad_corr, 0),
-        ("update", scaled_update, update_corr, rows),
+        ("grad", scaled_grad, grad_corr, 0, grad_vmin, grad_vmax),
+        ("update", scaled_update, update_corr, rows, update_vmin, update_vmax),
     ]
     num_slices = m * n
-    for section_name, section_data, corr_value, row_offset in sections:
+    for section_name, section_data, corr_value, row_offset, vmin, vmax in sections:
         for idx in range(rows * cols):
             ax = axes[row_offset + idx // cols, idx % cols]
             if idx >= num_slices:
@@ -988,9 +999,18 @@ def save_blocktt_side_figure(
             ax.set_xlabel(x_label, fontsize=8)
             ax.set_ylabel("a" if side == "left" else "r", fontsize=8)
             ax.tick_params(labelsize=7)
+            if section_name == "grad":
+                last_grad_im = im
+            else:
+                last_update_im = im
 
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
+    # One colorbar per section, placed beside the last column of each section's rows.
+    grad_axes = axes[:rows, :].ravel().tolist()
+    update_axes = axes[rows:, :].ravel().tolist()
+    if last_grad_im is not None:
+        fig.colorbar(last_grad_im, ax=grad_axes, fraction=0.02, pad=0.01)
+    if last_update_im is not None:
+        fig.colorbar(last_update_im, ax=update_axes, fraction=0.02, pad=0.01)
 
     fig.suptitle(
         f"BLOCKTT {side_name} by (m,n) slice | top=grad (corr={_format_corr(grad_corr)}), "
@@ -1127,17 +1147,45 @@ def save_heatmap_figure(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 5 * n_rows), constrained_layout=True)
     axes = np.array(axes).reshape(n_rows, n_cols)
 
+    # Compute per-kind (grad / update) shared vmin/vmax.
+    kind_scaled: dict[str, list[np.ndarray]] = {}
+    for entry in entries:
+        scaled = apply_color_scale(entry["data"].cpu().numpy(), color_scale)
+        kind_scaled.setdefault(entry["kind"], []).append(scaled)
+    kind_vmin: dict[str, float] = {}
+    kind_vmax: dict[str, float] = {}
+    for kind, arrays in kind_scaled.items():
+        vmin_k = float(min(a.min() for a in arrays))
+        vmax_k = float(max(a.max() for a in arrays))
+        if vmin_k == vmax_k:
+            vmax_k = vmin_k + 1e-12
+        kind_vmin[kind] = vmin_k
+        kind_vmax[kind] = vmax_k
+
+    last_im_by_kind: dict[str, Any] = {}
+    kind_axes: dict[str, list] = {}
     for idx, entry in enumerate(entries):
         r = idx // n_cols
         c = idx % n_cols
         ax = axes[r, c]
+        kind = entry["kind"]
         data = apply_color_scale(entry["data"].cpu().numpy(), color_scale)
-        title = entry["title"]
-        im = ax.imshow(data, aspect="auto", interpolation="nearest")
-        ax.set_title(title)
+        im = ax.imshow(
+            data,
+            aspect="auto",
+            interpolation="nearest",
+            vmin=kind_vmin[kind],
+            vmax=kind_vmax[kind],
+        )
+        ax.set_title(entry["title"])
         ax.set_xlabel("column")
         ax.set_ylabel("row")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        last_im_by_kind[kind] = im
+        kind_axes.setdefault(kind, []).append(ax)
+
+    # One colorbar per kind, shared across all axes of that kind.
+    for kind, im in last_im_by_kind.items():
+        fig.colorbar(im, ax=kind_axes[kind], fraction=0.046, pad=0.04)
 
     # Hide unused axes.
     for idx in range(len(entries), n_rows * n_cols):
