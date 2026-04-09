@@ -194,12 +194,18 @@ run_blocktt_muon()
 
 run_sequential()
 {
-  # LR=3e-5 run_full
-  # LR=2e-4 LORA_RANK=64 run_lora
-  # LR=2e-4 TRAIN_POSITION=input S_MERGED_TO=frozen run_svd
-  # LR=2e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt
-  # LR=2e-4 TRAIN_POSITION=small S_MERGED_TO=frozen run_blocktt_muon
-  :
+  ### wider test
+  LR=2e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  LR=4e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+
+  LR=2e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  LR=4e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+
+  # LR=3e-5 TRAIN_POSITION=output S_MERGED_TO=output run_svd
+  # LR=3e-5 TRAIN_POSITION=output S_MERGED_TO=input run_svd
+
+  # LR=3e-5 TRAIN_POSITION=input S_MERGED_TO=input run_svd
+  # LR=3e-5 TRAIN_POSITION=input S_MERGED_TO=output run_svd
 }
 
 if [[ "$TRAIN_MODE" == "full" ]]; then
@@ -226,6 +232,8 @@ fi
 # DEVICE=3 LR=2e-4 TRAIN_MODE=lora LORA_RANK=64 bash run_sft.sh >/dev/null 2>&1 &
 # DEVICE=2 LR=2e-4 TRAIN_MODE=svd TRAIN_POSITION=input bash run_sft.sh >/dev/null 2>&1 &
 # DEVICE=2 LR=2e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=frozen CFG_SUFFIX="--enable-save-ckpt --save-grads-steps=0,10,30" bash run_sft.sh >/dev/null 2>&1 &
+
+# DEVICE=7 TRAIN_MODE=sequential bash run_sft.sh >/dev/null 2>&1 &
 
 # CFG_SUFFIX examples:
 # CFG_SUFFIX="--no-wandb"

@@ -1583,18 +1583,20 @@ def save_sft_heatmap_figure(
                 squeeze=False,
             )
 
-            # Compute shared vmin/vmax across all panels
+            # Compute per-panel vmin/vmax (each panel gets its own shared range across its slices)
             all_slices = []
             for label, data in side_panels:
                 slices, _, _, _, _ = _blocktt_flat_to_slices(side, data, blocktt_dims)
-                all_slices.append((label, apply_color_scale(slices, color_scale)))
-            vmin = float(min(np.min(s) for _, s in all_slices))
-            vmax = float(max(np.max(s) for _, s in all_slices))
-            if vmin == vmax:
-                vmax = vmin + 1e-12
+                scaled = apply_color_scale(slices, color_scale)
+                p_vmin = float(np.min(scaled))
+                p_vmax = float(np.max(scaled))
+                if p_vmin == p_vmax:
+                    p_vmax = p_vmin + 1e-12
+                all_slices.append((label, scaled, p_vmin, p_vmax))
 
-            im = None
-            for panel_idx, (label, scaled_slices) in enumerate(all_slices):
+            last_im_by_panel: list[Any] = [None] * n_panels
+            panel_axes: list[list] = [[] for _ in range(n_panels)]
+            for panel_idx, (label, scaled_slices, p_vmin, p_vmax) in enumerate(all_slices):
                 row_offset = panel_idx * rows
                 for idx in range(rows * cols):
                     ax = axes[row_offset + idx // cols, idx % cols]
@@ -1604,14 +1606,17 @@ def save_sft_heatmap_figure(
                     mi = idx // n
                     ni = idx % n
                     arr = scaled_slices[mi, ni]
-                    im = ax.imshow(arr, aspect="equal", interpolation="nearest", vmin=vmin, vmax=vmax)
+                    im = ax.imshow(arr, aspect="equal", interpolation="nearest", vmin=p_vmin, vmax=p_vmax)
                     ax.set_title(f"{label} | m={mi}, n={ni}", fontsize=9)
                     ax.set_xlabel(x_label, fontsize=7)
                     ax.set_ylabel("a" if side == "left" else "r", fontsize=7)
                     ax.tick_params(labelsize=6)
+                    last_im_by_panel[panel_idx] = im
+                    panel_axes[panel_idx].append(ax)
 
-            if im is not None:
-                fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.01)
+            for panel_idx, im in enumerate(last_im_by_panel):
+                if im is not None:
+                    fig.colorbar(im, ax=panel_axes[panel_idx], fraction=0.02, pad=0.01)
             fig.suptitle(
                 f"SFT BLOCKTT {side_name} by (m,n) slice\n{layer_prefix} ({color_scale} scale)",
                 fontsize=11,

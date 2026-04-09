@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+Do not invoke superpowers skills unless the user explicitly requests them.
+
 ## Project Structure & Module Organization
 This repository is a compact Python research codebase for reproducing LoRA vs full fine-tuning results.
 

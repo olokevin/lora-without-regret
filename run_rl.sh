@@ -218,8 +218,8 @@ run_blocktt_muon()
 run_sequential()
 {
   ### baseline
-  LR=3e-5 run_full
-  LR=5e-5 run_full
+  # LR=3e-5 run_full
+  # LR=5e-5 run_full
 
   # LR=1e-5 run_full
   # LR=1e-5 run_full
@@ -266,7 +266,18 @@ run_sequential()
   # LR=1e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=frozen CFG_SUFFIX="--enable-save-ckpt" run_blocktt
   # LR=1e-5 DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep CFG_SUFFIX="--enable-save-ckpt" run_blocktt
 
+  ### wider test
+  # LR=2e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  # LR=4e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
 
+  LR=2e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  LR=4e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+
+  # LR=1e-5 TRAIN_POSITION=output S_MERGED_TO=output run_svd
+  # LR=1e-5 TRAIN_POSITION=output S_MERGED_TO=input run_svd
+
+  # LR=1e-5 TRAIN_POSITION=input S_MERGED_TO=input run_svd
+  # LR=1e-5 TRAIN_POSITION=input S_MERGED_TO=output run_svd
 }
 
 
@@ -298,7 +309,7 @@ fi
 # DEVICE=1 LR=8e-5 TRAIN_MODE=svd bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt bash run_rl.sh >/dev/null 2>&1 &
 
-# DEVICE=1 TRAIN_MODE=sequential bash run_rl.sh >logs/ckpt_runs.log 2>&1 &
+# DEVICE=1 TRAIN_MODE=sequential bash run_rl.sh >/dev/null 2>&1 &
 
 # DECOMP_MODE='{qkv:input,o:output,mlp_upgate:output,mlp_down:output}' \
 # CFG_SUFFIX="--enable-save-ckpt"
