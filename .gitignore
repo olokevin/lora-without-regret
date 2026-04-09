@@ -14,8 +14,8 @@ sft/
 wandb/
 tests/
 logs/
-docs/
 analysis_results/
+*.pdf
 
 adapter_fusion/
 deberta_tune/
