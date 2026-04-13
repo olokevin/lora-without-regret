@@ -1,13 +1,13 @@
 """
-Unified RL training entrypoint.
+Unified RL training entrypoint with DAPO support.
 
 Examples:
-  uv run run_rl.py --train-mode full --lr 1e-5 --no-wandb
-  uv run run_rl.py --train-mode full --optimizer muon --lr 1e-5 --no-wandb
-  uv run run_rl.py --train-mode lora --lr 1e-4 --lora-rank 1 --trainable-type all --no-wandb
-  uv run run_rl.py --train-mode lora_full --lr 1e-4 --lora-rank 1 --trainable-type all --no-wandb
-  uv run run_rl.py --train-mode blocktt --lr 1e-4 --trainable-type all --decomp-mode input_one_block --train-position small --no-wandb
-  uv run run_rl.py --train-mode svd --lr 1e-4 --trainable-type all --train-position output --no-wandb
+  CUDA_VISIBLE_DEVICES=6 uv run run_rl_dapo.py --train-mode full --loss-type dapo --lr 1e-5 
+  CUDA_VISIBLE_DEVICES=6 uv run run_rl_dapo.py --train-mode lora --loss-type dapo --lr 1e-4 --lora-rank 1 --trainable-type all
+  
+  CUDA_VISIBLE_DEVICES=6 uv run run_rl_dapo.py --train-mode blocktt --loss-type dapo --lr 1e-4 --blocktt-rank full --decomp-mode input_one_block --s-merged-to frozen --train-position small
+  CUDA_VISIBLE_DEVICES=6 uv run run_rl_dapo.py --train-mode blocktt --loss-type dapo --lr 1e-4 --blocktt-rank full --decomp-mode input_one_block --s-merged-to trainable --train-position small
+  CUDA_VISIBLE_DEVICES=6 uv run run_rl_dapo.py --train-mode blocktt --loss-type dapo --lr 1e-4 --blocktt-rank full --decomp-mode input_one_block --s-merged-to split --train-position both
 """
 
 import argparse
@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+from collections import Counter
 from functools import partial
 from pathlib import Path
 
@@ -50,8 +51,8 @@ MODE_DEFAULTS = {
     "full": {
         "lr": 1e-5,
         "wandb_project": "math_grpo_full",
-        "micro_batch_size": 4,
-        "gradient_accumulation_steps": 64,
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
     },
     "lora": {
         "lr": 9e-5,
@@ -79,9 +80,16 @@ MODE_DEFAULTS = {
     },
 }
 
+DEFAULT_TRAIN_DATASET_ID = "BytedTsinghua-SIA/DAPO-Math-17k"
+DEFAULT_TRAIN_SPLIT = "train"
+DEFAULT_MATH500_DATASET_ID = "HuggingFaceH4/MATH-500"
+DEFAULT_MATH500_SPLIT = "test"
+DEFAULT_AIME24_DATASET_ID = "BytedTsinghua-SIA/AIME-2024"
+DEFAULT_AIME24_SPLIT = "train"
+
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Unified RL training script")
+    parser = argparse.ArgumentParser(description="Unified RL training script (GRPO + DAPO)")
     parser.add_argument(
         "--train-mode",
         type=str,
@@ -179,6 +187,49 @@ def parse_args(argv=None):
         help="Number of rollouts per prompt",
     )
     parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="grpo",
+        choices=["grpo", "dapo"],
+        help="Policy loss type: grpo (current behavior) or dapo",
+    )
+    parser.add_argument(
+        "--clip-ratio-low",
+        type=float,
+        default=0.2,
+        help="Lower clip ratio for DAPO decoupled clipping (default: 0.2)",
+    )
+    parser.add_argument(
+        "--clip-ratio-high",
+        type=float,
+        default=0.28,
+        help="Upper clip ratio for DAPO decoupled clipping (default: 0.28)",
+    )
+    parser.add_argument(
+        "--mask-truncated-completions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask truncated completions in DAPO loss (default: enabled)",
+    )
+    parser.add_argument(
+        "--dynamic-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable DAPO dynamic group filtering and refill (default: enabled)",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-max-rounds",
+        type=int,
+        default=4,
+        help="Max refill rounds for DAPO dynamic sampling (default: 4)",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-oversample",
+        type=float,
+        default=1.5,
+        help="Oversampling factor per refill round for DAPO dynamic sampling (default: 1.5)",
+    )
+    parser.add_argument(
         "--epochs-per-step",
         type=int,
         default=1,
@@ -219,6 +270,90 @@ def parse_args(argv=None):
         type=float,
         default=0.4,
         help="vLLM GPU memory utilization fraction for local rollout backends (default: 0.4)",
+    )
+    parser.add_argument(
+        "--train-dataset-id",
+        type=str,
+        default=DEFAULT_TRAIN_DATASET_ID,
+        help="Training dataset ID (default: official DAPO-Math-17k)",
+    )
+    parser.add_argument(
+        "--train-split",
+        type=str,
+        default=DEFAULT_TRAIN_SPLIT,
+        help="Training split name (default: train)",
+    )
+    parser.add_argument(
+        "--val-size",
+        type=int,
+        default=1000,
+        help="Validation subset size sampled from the tail of the train split (default: 1000)",
+    )
+    parser.add_argument(
+        "--eval-math500-dataset-id",
+        type=str,
+        default=DEFAULT_MATH500_DATASET_ID,
+        help="Final-eval dataset ID for MATH-500",
+    )
+    parser.add_argument(
+        "--eval-math500-split",
+        type=str,
+        default=DEFAULT_MATH500_SPLIT,
+        help="Final-eval split for MATH-500",
+    )
+    parser.add_argument(
+        "--eval-aime24-dataset-id",
+        type=str,
+        default=DEFAULT_AIME24_DATASET_ID,
+        help="Final-eval dataset ID for AIME-24",
+    )
+    parser.add_argument(
+        "--eval-aime24-split",
+        type=str,
+        default=DEFAULT_AIME24_SPLIT,
+        help="Final-eval split for AIME-24",
+    )
+    parser.add_argument(
+        "--final-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run final evaluation on MATH-500 and AIME-24 (default: enabled)",
+    )
+    parser.add_argument(
+        "--eval-pass1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log pass@1 in final evaluation (default: enabled)",
+    )
+    parser.add_argument(
+        "--eval-majority",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log majority@k in final evaluation (default: enabled)",
+    )
+    parser.add_argument(
+        "--eval-majority-k",
+        type=int,
+        default=32,
+        help="Number of samples per prompt for majority@k final eval (default: 32)",
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for majority@k final eval samples (default: 1.0)",
+    )
+    parser.add_argument(
+        "--eval-top-p",
+        type=float,
+        default=0.7,
+        help="Top-p for majority@k final eval samples (default: 0.7)",
+    )
+    parser.add_argument(
+        "--eval-max-tokens",
+        type=int,
+        default=1024,
+        help="Max completion tokens for final evaluation (default: 1024)",
     )
     parser.add_argument(
         "--seed",
@@ -338,7 +473,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--wandb-project",
         type=str,
-        default=None,
+        default="RL-DAPO",
         help="W&B project name (default depends on train mode)",
     )
     parser.add_argument(
@@ -549,44 +684,122 @@ def export_weights_for_vllm(model: torch.nn.Module):
     return weight_tuples
 
 
-def load_datasets_and_tokenizer(model_id, prompt_template_path):
-    train_dataset = load_dataset("qwedsacf/competition_math", split="train[:7500]")
-    val_dataset = load_dataset("qwedsacf/competition_math", split="train[-5000:]")
+def canonicalize_answer(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if len(value) == 0:
+            return None
+        value = value[0]
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.strip()
+    if len(value) == 0:
+        return None
+    boxed = remove_boxed(last_boxed_only_string(value))
+    return boxed if boxed is not None else value
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+def parse_ground_truth_from_example(example):
+    reward_model = example.get("reward_model")
+    if isinstance(reward_model, dict) and "ground_truth" in reward_model:
+        return canonicalize_answer(reward_model["ground_truth"])
+    for key in ("ground_truth", "answer", "final_answer", "solution"):
+        if key in example:
+            return canonicalize_answer(example[key])
+    return None
+
+
+def build_prompt_from_example(example, tokenizer, template):
+    if "prompt" in example:
+        prompt = example["prompt"]
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+            return tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        if isinstance(prompt, str):
+            return tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    question = None
+    for key in ("problem", "question", "query", "input"):
+        if key in example and example[key] is not None:
+            question = str(example[key])
+            break
+    if question is None:
+        raise ValueError(
+            "Unable to build prompt: expected one of prompt/problem/question/query/input."
+        )
+    prompt_text = template.replace("{question}", question)
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt_text}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def process_math_example(example, tokenizer, template):
+    return {
+        "prompt": build_prompt_from_example(example, tokenizer, template),
+        "answer": parse_ground_truth_from_example(example),
+    }
+
+
+def _dataset_tail_splits(dataset, val_size):
+    if val_size <= 0 or len(dataset) <= val_size:
+        n = min(1000, len(dataset))
+        return dataset, dataset.select(range(n))
+    split_at = len(dataset) - val_size
+    train = dataset.select(range(0, split_at))
+    val = dataset.select(range(split_at, len(dataset)))
+    return train, val
+
+
+def load_datasets_and_tokenizer(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    with open(prompt_template_path, "r", encoding="utf-8") as f:
+    with open(args.prompt_template, "r", encoding="utf-8") as f:
         template = f.read().strip()
 
-    def process_data(example):
-        with_template = template.replace("{question}", example["problem"])
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": with_template}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        answer = remove_boxed(last_boxed_only_string(example["solution"]))
-        return {"prompt": prompt, "answer": answer}
+    base_dataset = load_dataset(args.train_dataset_id, split=args.train_split)
+    train_dataset, val_dataset = _dataset_tail_splits(base_dataset, args.val_size)
+    process_fn = lambda example: process_math_example(example, tokenizer, template)
+    train_dataset = train_dataset.map(process_fn)
+    val_dataset = val_dataset.map(process_fn)
+    return train_dataset, val_dataset, tokenizer, template
 
-    train_dataset = train_dataset.map(process_data)
-    val_dataset = val_dataset.map(process_data)
-    return train_dataset, val_dataset, tokenizer
+
+def load_eval_dataset(dataset_id, split, tokenizer, template):
+    dataset = load_dataset(dataset_id, split=split)
+    return dataset.map(lambda example: process_math_example(example, tokenizer, template))
 
 
 def tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
     tokenizer: PreTrainedTokenizerBase,
+    *,
+    max_completion_tokens=None,
+    mask_truncated=False,
 ) -> dict[str, torch.Tensor]:
     prompt_t = [tokenizer.encode(p) for p in prompt_strs]
     output_t = [tokenizer.encode(o) for o in output_strs]
+    truncated_flags = []
     full = []
     max_len = 0
 
     for i in range(len(prompt_t)):
         row_len = len(prompt_t[i]) + len(output_t[i])
+        truncated_flags.append(
+            max_completion_tokens is not None and len(output_t[i]) >= max_completion_tokens
+        )
         max_len = max(max_len, row_len)
 
     for i in range(len(prompt_t)):
@@ -601,6 +814,8 @@ def tokenize_prompt_and_output(
 
     response_mask = torch.zeros(len(prompt_strs), max_len - 1)
     for i in range(len(prompt_t)):
+        if mask_truncated and truncated_flags[i]:
+            continue
         response_mask[
             i, len(prompt_t[i]) - 1 : len(prompt_t[i]) + len(output_t[i]) - 1
         ] = 1
@@ -609,6 +824,7 @@ def tokenize_prompt_and_output(
         "input_ids": input_ids,
         "labels": labels,
         "response_mask": response_mask.bool(),
+        "is_truncated": torch.tensor(truncated_flags, dtype=torch.bool),
     }
 
 
@@ -624,20 +840,121 @@ def get_response_log_probs(
     return torch.gather(logprobs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
 
 
+def extract_generated_answer(text):
+    if text is None:
+        return None
+    return remove_boxed(last_boxed_only_string(text))
+
+
+def compute_rewards_from_outputs(outputs, answers, group_size):
+    generated_answers = [extract_generated_answer(o) for o in outputs]
+    raw_reward = [
+        ans is not None and is_equiv(ans, answers[j // group_size])
+        for j, ans in enumerate(generated_answers)
+    ]
+    return torch.tensor(raw_reward, dtype=torch.float).reshape((-1, group_size))
+
+
+def compute_advantages(raw_reward_tensor):
+    means = raw_reward_tensor.mean(dim=-1).unsqueeze(1)
+    return (raw_reward_tensor - means).reshape(-1)
+
+
+def select_informative_groups(raw_reward_tensor):
+    reward_std = raw_reward_tensor.std(dim=-1)
+    return (reward_std > 0).tolist()
+
+
+def filter_rollouts_by_group_mask(prompts, answers, outputs, group_size, keep_mask):
+    kept_prompts = []
+    kept_answers = []
+    kept_outputs = []
+    for idx, keep in enumerate(keep_mask):
+        if not keep:
+            continue
+        kept_prompts.append(prompts[idx])
+        kept_answers.append(answers[idx])
+        start = idx * group_size
+        end = start + group_size
+        kept_outputs.extend(outputs[start:end])
+    return kept_prompts, kept_answers, kept_outputs
+
+
+def majority_vote_answer(candidate_answers):
+    valid = [a for a in candidate_answers if a is not None]
+    if len(valid) == 0:
+        return None
+    return Counter(valid).most_common(1)[0][0]
+
+
+def unique_by_problem(dataset):
+    seen = set()
+    unique_rows = []
+    for row in dataset:
+        key = (
+            row.get("problem_id")
+            or row.get("question_id")
+            or row.get("id")
+            or row.get("problem")
+            or row.get("question")
+            or row.get("prompt")
+        )
+        if isinstance(key, (list, dict)):
+            key = str(key)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    return unique_rows
+
+
+def compute_policy_loss(
+    loss_type,
+    ratio,
+    advantages,
+    mask,
+    *,
+    clip_ratio_low,
+    clip_ratio_high,
+):
+    adv = advantages.unsqueeze(-1)
+    if loss_type == "dapo":
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+        objective = torch.minimum(ratio * adv, clipped_ratio * adv)
+        per_token_loss = -objective
+        masked_loss = per_token_loss * mask
+        loss = masked_loss.sum() / mask.sum().clamp_min(1)
+        clip_fraction = ((ratio != clipped_ratio).float() * mask).sum() / mask.sum().clamp_min(1)
+        return loss, clip_fraction.item()
+
+    per_token_loss = -ratio * adv
+    masked_loss = per_token_loss * mask
+    denom = mask.sum(dim=-1).clamp_min(1)
+    loss_per_prompt = masked_loss.sum(dim=-1) / denom
+    return loss_per_prompt.mean(), 0.0
+
+
 def compute_run_name(args, mode_info: dict) -> str:
     """Compute a human-readable run name (used for both directory and W&B)."""
+    loss_tag = args.loss_type
     if args.wandb_run_name is not None:
         return args.wandb_run_name
     if args.train_mode == "full":
-        return f"{args.model_id}_{args.lr:.1e}_full"
+        return f"{args.model_id}_{args.lr:.1e}_full_{loss_tag}"
     if args.train_mode == "lora":
-        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_{loss_tag}"
     if args.train_mode == "lora_full":
-        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_lora_full"
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_lora_full_{loss_tag}"
     if args.train_mode == "blocktt":
         decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
-        return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
-    return f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}"
+        return (
+            f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_"
+            f"{args.train_position}_{args.trainable_type}_{loss_tag}"
+        )
+    return (
+        f"{args.model_id}_{args.lr:.1e}_{args.train_position}_{args.trainable_type}_"
+        f"{loss_tag}"
+    )
 
 
 def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
@@ -709,6 +1026,11 @@ def maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps):
             "n_grpo_steps": args.n_grpo_steps,
             "n_prompts_per_step": args.n_prompts_per_step,
             "group_size": args.group_size,
+            "loss_type": args.loss_type,
+            "clip_ratio_low": args.clip_ratio_low,
+            "clip_ratio_high": args.clip_ratio_high,
+            "mask_truncated_completions": args.mask_truncated_completions,
+            "dynamic_sampling": args.dynamic_sampling,
             "epochs_per_step": args.epochs_per_step,
             "micro_batch_size": args.micro_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
@@ -716,6 +1038,20 @@ def maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps):
             "prompt_template": args.prompt_template,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "train_dataset_id": args.train_dataset_id,
+            "train_split": args.train_split,
+            "val_size": args.val_size,
+            "eval_math500_dataset_id": args.eval_math500_dataset_id,
+            "eval_math500_split": args.eval_math500_split,
+            "eval_aime24_dataset_id": args.eval_aime24_dataset_id,
+            "eval_aime24_split": args.eval_aime24_split,
+            "final_eval": args.final_eval,
+            "eval_pass1": args.eval_pass1,
+            "eval_majority": args.eval_majority,
+            "eval_majority_k": args.eval_majority_k,
+            "eval_temperature": args.eval_temperature,
+            "eval_top_p": args.eval_top_p,
+            "eval_max_tokens": args.eval_max_tokens,
             "enable_save_ckpt": args.enable_save_ckpt,
             "run_dir": run_dir,
             **mode_info,
@@ -757,14 +1093,23 @@ def normalize_lora_merged_weight_name(name: str) -> str | None:
 def build_lora_http_generators(args, model, run_dir):
     loaded_loras = []
 
-    def generate_http(prompts: list[str], vllm_model_id: str, temperature=0, responses_per_prompt=1):
+    def generate_http(
+        prompts: list[str],
+        vllm_model_id: str,
+        *,
+        temperature=0,
+        responses_per_prompt=1,
+        top_p=1.0,
+        max_tokens=1024,
+    ):
         api_url = f"{args.vllm_url}/v1/completions"
         headers = {"Content-Type": "application/json"}
         payload = {
             "model": vllm_model_id,
             "prompt": prompts,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_p": top_p,
             "n": responses_per_prompt,
         }
         response = requests.post(api_url, headers=headers, json=payload)
@@ -789,27 +1134,47 @@ def build_lora_http_generators(args, model, run_dir):
             model.save_pretrained(lora_name)
         return lora_name
 
-    def generate_for_train(prompts: list[str], step: int):
+    def generate_with_params(
+        prompts: list[str],
+        step: int,
+        *,
+        temperature,
+        responses_per_prompt,
+        top_p,
+        max_tokens,
+    ):
         vllm_model_id = save_lora(step)
         load_lora(vllm_model_id)
         return generate_http(
             prompts,
             vllm_model_id=vllm_model_id,
-            temperature=1,
+            temperature=temperature,
+            responses_per_prompt=responses_per_prompt,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
+    def generate_for_train(prompts: list[str], step: int):
+        return generate_with_params(
+            prompts,
+            step,
+            temperature=1.0,
             responses_per_prompt=args.group_size,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
         )
 
     def generate_for_eval(prompts: list[str], step: int):
-        vllm_model_id = save_lora(step)
-        load_lora(vllm_model_id)
-        return generate_http(
+        return generate_with_params(
             prompts,
-            vllm_model_id=vllm_model_id,
-            temperature=0,
+            step,
+            temperature=0.0,
             responses_per_prompt=1,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
         )
 
-    return generate_for_train, generate_for_eval
+    return generate_for_train, generate_for_eval, generate_with_params
 
 
 def build_lora_local_generators(args, model):
@@ -850,7 +1215,14 @@ def build_lora_local_generators(args, model):
             finally:
                 model.unmerge_adapter()
 
-    def generate(prompts: list[str], temperature=0, responses_per_prompt=1):
+    def generate(
+        prompts: list[str],
+        *,
+        temperature=0,
+        responses_per_prompt=1,
+        top_p=1.0,
+        max_tokens=1024,
+    ):
         weight_tuples = export_lora_merged_weights()
         vllm_internal_model = (
             vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
@@ -858,9 +1230,10 @@ def build_lora_local_generators(args, model):
         vllm_internal_model.load_weights(weight_tuples)
 
         sampling_params = SamplingParams(
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=temperature,
             n=responses_per_prompt,
+            top_p=top_p,
         )
         outputs = vllm_model.generate(prompts, sampling_params)
         return [o.text for output in outputs for o in output.outputs]
@@ -870,12 +1243,37 @@ def build_lora_local_generators(args, model):
             prompts,
             temperature=1,
             responses_per_prompt=args.group_size,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
         )
 
     def generate_for_eval(prompts: list[str], _step: int):
-        return generate(prompts, temperature=0, responses_per_prompt=1)
+        return generate(
+            prompts,
+            temperature=0.0,
+            responses_per_prompt=1,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
+        )
 
-    return generate_for_train, generate_for_eval
+    def generate_with_params(
+        prompts: list[str],
+        _step: int,
+        *,
+        temperature,
+        responses_per_prompt,
+        top_p,
+        max_tokens,
+    ):
+        return generate(
+            prompts,
+            temperature=temperature,
+            responses_per_prompt=responses_per_prompt,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
+    return generate_for_train, generate_for_eval, generate_with_params
 
 
 def build_local_vllm_generators(args, model):
@@ -891,7 +1289,14 @@ def build_local_vllm_generators(args, model):
         logprobs_mode="processed_logprobs",
     )
 
-    def generate(prompts: list[str], temperature=0, responses_per_prompt=1):
+    def generate(
+        prompts: list[str],
+        *,
+        temperature=0,
+        responses_per_prompt=1,
+        top_p=1.0,
+        max_tokens=1024,
+    ):
         if args.train_mode in {"blocktt", "svd"}:
             weight_tuples = export_weights_for_vllm(model)
         else:
@@ -903,9 +1308,10 @@ def build_local_vllm_generators(args, model):
         vllm_internal_model.load_weights(weight_tuples)
 
         sampling_params = SamplingParams(
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=temperature,
             n=responses_per_prompt,
+            top_p=top_p,
         )
         outputs = vllm_model.generate(prompts, sampling_params)
         return [o.text for output in outputs for o in output.outputs]
@@ -915,12 +1321,37 @@ def build_local_vllm_generators(args, model):
             prompts,
             temperature=1,
             responses_per_prompt=args.group_size,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
         )
 
     def generate_for_eval(prompts: list[str], _step: int):
-        return generate(prompts, temperature=0, responses_per_prompt=1)
+        return generate(
+            prompts,
+            temperature=0.0,
+            responses_per_prompt=1,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
+        )
 
-    return generate_for_train, generate_for_eval
+    def generate_with_params(
+        prompts: list[str],
+        _step: int,
+        *,
+        temperature,
+        responses_per_prompt,
+        top_p,
+        max_tokens,
+    ):
+        return generate(
+            prompts,
+            temperature=temperature,
+            responses_per_prompt=responses_per_prompt,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
+    return generate_for_train, generate_for_eval, generate_with_params
 
 
 def validate_trainable_params(trainable_params):
@@ -1105,9 +1536,9 @@ def compute_num_training_steps(args):
         raise ValueError("--gradient-accumulation-steps must be > 0")
 
     samples_per_step = args.n_prompts_per_step * args.group_size
-    micro_batches_per_epoch = samples_per_step // args.micro_batch_size
-    optimizer_steps_per_epoch = (
-        micro_batches_per_epoch // args.gradient_accumulation_steps
+    micro_batches_per_epoch = math.ceil(samples_per_step / args.micro_batch_size)
+    optimizer_steps_per_epoch = math.ceil(
+        micro_batches_per_epoch / args.gradient_accumulation_steps
     )
     return args.n_grpo_steps * args.epochs_per_step * optimizer_steps_per_epoch
 
@@ -1120,16 +1551,149 @@ def resolve_warmup_steps(warmup_ratio, num_training_steps):
     return int(math.ceil(num_training_steps * warmup_ratio))
 
 
+def collect_rollouts_for_step(args, train_dataset, generate_for_train, step_idx):
+    if len(train_dataset) == 0:
+        raise ValueError("Training dataset is empty.")
+
+    target_prompts = args.n_prompts_per_step
+    if args.loss_type != "dapo" or not args.dynamic_sampling:
+        sample_n = min(len(train_dataset), target_prompts)
+        sample_indices = random.sample(range(0, len(train_dataset)), sample_n)
+        batch = train_dataset[sample_indices]
+        outputs = generate_for_train(batch["prompt"], step_idx)
+        return batch["prompt"], batch["answer"], outputs, 1.0
+
+    kept_prompts = []
+    kept_answers = []
+    kept_outputs = []
+    sampled_groups = 0
+    kept_groups = 0
+
+    for _ in range(args.dynamic_sampling_max_rounds):
+        if len(kept_prompts) >= target_prompts:
+            break
+
+        missing = target_prompts - len(kept_prompts)
+        sampled = int(math.ceil(missing * args.dynamic_sampling_oversample))
+        sample_n = max(missing, sampled)
+        sample_n = min(sample_n, len(train_dataset))
+        sample_indices = random.sample(range(0, len(train_dataset)), sample_n)
+        batch = train_dataset[sample_indices]
+
+        outputs = generate_for_train(batch["prompt"], step_idx)
+        raw_reward_tensor = compute_rewards_from_outputs(
+            outputs, batch["answer"], args.group_size
+        )
+        keep_mask = select_informative_groups(raw_reward_tensor)
+        prompts, answers, outputs = filter_rollouts_by_group_mask(
+            batch["prompt"],
+            batch["answer"],
+            outputs,
+            args.group_size,
+            keep_mask,
+        )
+        kept_prompts.extend(prompts)
+        kept_answers.extend(answers)
+        kept_outputs.extend(outputs)
+        sampled_groups += len(keep_mask)
+        kept_groups += sum(keep_mask)
+
+    if len(kept_prompts) < target_prompts:
+        missing = target_prompts - len(kept_prompts)
+        sample_n = min(len(train_dataset), missing)
+        sample_indices = random.sample(range(0, len(train_dataset)), sample_n)
+        batch = train_dataset[sample_indices]
+        outputs = generate_for_train(batch["prompt"], step_idx)
+        kept_prompts.extend(batch["prompt"])
+        kept_answers.extend(batch["answer"])
+        kept_outputs.extend(outputs)
+        sampled_groups += sample_n
+        kept_groups += sample_n
+
+    kept_prompts = kept_prompts[:target_prompts]
+    kept_answers = kept_answers[:target_prompts]
+    kept_outputs = kept_outputs[: target_prompts * args.group_size]
+    keep_ratio = kept_groups / max(1, sampled_groups)
+    return kept_prompts, kept_answers, kept_outputs, keep_ratio
+
+
+def evaluate_rows(rows, generate_with_params, step, args, prefix):
+    prompts = [row["prompt"] for row in rows]
+    answers = [row["answer"] for row in rows]
+    metrics = {f"eval/{prefix}/total": len(rows)}
+    logs = []
+
+    if len(rows) == 0:
+        return metrics
+
+    if args.eval_pass1:
+        outputs = generate_with_params(
+            prompts,
+            step,
+            temperature=0.0,
+            responses_per_prompt=1,
+            top_p=1.0,
+            max_tokens=args.eval_max_tokens,
+        )
+        correct = sum(
+            1
+            for i, output in enumerate(outputs)
+            if (
+                (pred := extract_generated_answer(output)) is not None
+                and is_equiv(pred, answers[i])
+            )
+        )
+        acc = correct / len(rows)
+        metrics[f"eval/{prefix}/pass@1"] = acc
+        logs.append(f"pass@1={acc:.2%}")
+
+    if args.eval_majority:
+        k = args.eval_majority_k
+        outputs = generate_with_params(
+            prompts,
+            step,
+            temperature=args.eval_temperature,
+            responses_per_prompt=k,
+            top_p=args.eval_top_p,
+            max_tokens=args.eval_max_tokens,
+        )
+        correct = 0
+        for i in range(len(rows)):
+            start = i * k
+            end = start + k
+            candidates = [extract_generated_answer(t) for t in outputs[start:end]]
+            voted = majority_vote_answer(candidates)
+            if voted is not None and is_equiv(voted, answers[i]):
+                correct += 1
+        acc = correct / len(rows)
+        metrics[f"eval/{prefix}/majority@{k}"] = acc
+        logs.append(f"majority@{k}={acc:.2%}")
+
+    print(f"Final eval {prefix}: " + ", ".join(logs))
+    return metrics
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
     validate_mode_specific_flags(args, argv)
     apply_mode_defaults(args)
-    require_cuda_for_structured_conversion(args.train_mode, entrypoint="run_rl.py")
+    require_cuda_for_structured_conversion(args.train_mode, entrypoint="run_rl_dapo.py")
+    if args.loss_type == "dapo":
+        if args.clip_ratio_low < 0 or args.clip_ratio_high < 0:
+            raise ValueError("--clip-ratio-low/high must be non-negative.")
+    if args.eval_majority_k <= 0:
+        raise ValueError("--eval-majority-k must be > 0.")
+    if args.eval_max_tokens <= 0:
+        raise ValueError("--eval-max-tokens must be > 0.")
     if args.max_model_len <= 0:
         raise ValueError("--max-model-len must be > 0.")
     if not 0.0 < args.gpu_memory_utilization <= 1.0:
         raise ValueError("--gpu-memory-utilization must be in (0, 1].")
+    if args.dynamic_sampling_max_rounds <= 0:
+        raise ValueError("--dynamic-sampling-max-rounds must be > 0.")
+    if args.dynamic_sampling_oversample <= 0:
+        raise ValueError("--dynamic-sampling-oversample must be > 0.")
     grad_prefixes = None
     if args.save_first_step_grads_prefixes is not None:
         grad_prefixes = [
@@ -1199,6 +1763,11 @@ def main(argv=None):
     print(f"  Learning rate: {args.lr}")
     print(f"  vLLM max model len: {args.max_model_len}")
     print(f"  vLLM GPU memory utilization: {args.gpu_memory_utilization}")
+    print(f"  Loss type: {args.loss_type}")
+    if args.loss_type == "dapo":
+        print(f"  Clip ratio low/high: {args.clip_ratio_low}/{args.clip_ratio_high}")
+        print(f"  Mask truncated completions: {args.mask_truncated_completions}")
+        print(f"  Dynamic sampling: {args.dynamic_sampling}")
     print(f"  LR scheduler: {args.lr_scheduler}")
     print(f"  Warmup ratio: {args.warmup_ratio}")
     if args.lr_scheduler == "cosine":
@@ -1209,12 +1778,14 @@ def main(argv=None):
         print(f"  Muon lr_adam: {args.lr_adam}")
         print(f"  Muon lr_embedding: {args.lr_embedding}")
         print(f"  Muon norm_method: {args.norm_method}")
-    print(f"  GRPO steps: {args.n_grpo_steps}")
+    print(f"  RL steps: {args.n_grpo_steps}")
     print(f"  Prompts per step: {args.n_prompts_per_step}")
     print(f"  Group size: {args.group_size}")
     print(f"  Epochs per step: {args.epochs_per_step}")
     print(f"  Micro batch size: {args.micro_batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"  Train dataset: {args.train_dataset_id} [{args.train_split}]")
+    print(f"  Final eval datasets: {args.eval_math500_dataset_id}, {args.eval_aime24_dataset_id}")
     if args.train_mode in {"lora", "lora_full"}:
         print(f"  LoRA rank: {args.lora_rank}")
         print(f"  Trainable type: {args.trainable_type}")
@@ -1258,10 +1829,7 @@ def main(argv=None):
 
     maybe_init_wandb(args, run_dir, run_name, mode_info, num_training_steps)
 
-    train_dataset, val_dataset, tokenizer = load_datasets_and_tokenizer(
-        args.model_id,
-        args.prompt_template,
-    )
+    train_dataset, val_dataset, tokenizer, template = load_datasets_and_tokenizer(args)
 
     device_id = get_local_cuda_device_id()
     device = f"cuda:{device_id}"
@@ -1364,18 +1932,18 @@ def main(argv=None):
 
     if args.train_mode in {"lora", "lora_full"}:
         if lora_rollout_backend == "http":
-            generate_for_train, generate_for_eval = build_lora_http_generators(
+            generate_for_train, generate_for_eval, generate_with_params = build_lora_http_generators(
                 args,
                 model,
                 run_dir,
             )
         else:
-            generate_for_train, generate_for_eval = build_lora_local_generators(
+            generate_for_train, generate_for_eval, generate_with_params = build_lora_local_generators(
                 args,
                 model,
             )
     else:
-        generate_for_train, generate_for_eval = build_local_vllm_generators(args, model)
+        generate_for_train, generate_for_eval, generate_with_params = build_local_vllm_generators(args, model)
 
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
     if args.optimizer == "muon":
@@ -1390,7 +1958,9 @@ def main(argv=None):
     stop_requested = False
 
     def eval_model(step):
-        val_prompts = val_dataset[:1000]["prompt"]
+        n = min(len(val_dataset), 1000)
+        val_prompts = val_dataset[:n]["prompt"]
+        val_answers = val_dataset[:n]["answer"]
 
         eval_start = time.time()
         outputs = generate_for_eval(val_prompts, step)
@@ -1398,8 +1968,8 @@ def main(argv=None):
 
         correct = 0
         for i in range(len(outputs)):
-            correct_answer = val_dataset[i]["answer"]
-            generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
+            correct_answer = val_answers[i]
+            generated_answer = extract_generated_answer(outputs[i])
             if generated_answer is not None and is_equiv(generated_answer, correct_answer):
                 correct += 1
 
@@ -1425,28 +1995,17 @@ def main(argv=None):
     for i in range(args.n_grpo_steps):
         step_start_time = time.time()
 
-        sample_indices = random.sample(
-            range(0, len(train_dataset)),
-            args.n_prompts_per_step,
-        )
-        batch = train_dataset[sample_indices]
-
         generation_start = time.time()
-        outputs = generate_for_train(batch["prompt"], i)
+        prompts, answers, outputs, dynamic_keep_ratio = collect_rollouts_for_step(
+            args,
+            train_dataset,
+            generate_for_train,
+            i,
+        )
         generation_time = time.time() - generation_start
 
-        generated_answers = [remove_boxed(last_boxed_only_string(o)) for o in outputs]
-        raw_reward = [
-            ans is not None and is_equiv(ans, batch["answer"][j // args.group_size])
-            for j, ans in enumerate(generated_answers)
-        ]
-        raw_reward_tensor = torch.tensor(raw_reward, dtype=torch.float).reshape(
-            (args.n_prompts_per_step, args.group_size)
-        )
-        means = raw_reward_tensor.mean(dim=-1).unsqueeze(1)
-        advantages = (raw_reward_tensor - means).reshape(
-            (args.n_prompts_per_step * args.group_size,)
-        )
+        raw_reward_tensor = compute_rewards_from_outputs(outputs, answers, args.group_size)
+        advantages = compute_advantages(raw_reward_tensor)
 
         train_accuracy = raw_reward_tensor.mean().item()
         reward_std = raw_reward_tensor.std().item()
@@ -1457,17 +2016,23 @@ def main(argv=None):
         advantage_max = advantages.max().item()
         advantage_min = advantages.min().item()
 
-        prompts_expanded = [x for x in batch["prompt"] for _ in range(args.group_size)]
-        data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
+        prompts_expanded = [x for x in prompts for _ in range(args.group_size)]
+        data = tokenize_prompt_and_output(
+            prompts_expanded,
+            outputs,
+            tokenizer,
+            max_completion_tokens=args.eval_max_tokens,
+            mask_truncated=(args.loss_type == "dapo" and args.mask_truncated_completions),
+        )
         input_ids = data["input_ids"].to(device)
         labels = data["labels"].to(device)
         response_mask = data["response_mask"].to(device)
+        truncated_fraction = data["is_truncated"].float().mean().item()
 
         with torch.inference_mode():
             old_logprobs_all = []
-            for b in range(len(input_ids) // args.micro_batch_size):
-                idx = b * args.micro_batch_size
-                end = idx + args.micro_batch_size
+            for idx in range(0, len(input_ids), args.micro_batch_size):
+                end = min(idx + args.micro_batch_size, len(input_ids))
                 old_logprobs_all.append(
                     get_response_log_probs(model, input_ids[idx:end], labels[idx:end]).detach()
                 )
@@ -1477,45 +2042,55 @@ def main(argv=None):
         epoch_grad_norms = []
         epoch_policy_ratios = []
         epoch_kl_divs = []
+        epoch_clip_fracs = []
 
         training_start = time.time()
         for epoch in range(args.epochs_per_step):
+            batch_starts = list(range(0, len(input_ids), args.micro_batch_size))
             for b in tqdm(
-                range(len(input_ids) // args.micro_batch_size),
+                range(len(batch_starts)),
                 desc=(
                     f"Step {i + 1}/{args.n_grpo_steps}, "
                     f"Epoch {epoch + 1}/{args.epochs_per_step}"
                 ),
             ):
-                idx = b * args.micro_batch_size
-                end = idx + args.micro_batch_size
+                idx = batch_starts[b]
+                end = min(idx + args.micro_batch_size, len(input_ids))
                 x = input_ids[idx:end]
                 y = labels[idx:end]
                 mask = response_mask[idx:end]
-                micro_batch_adv = advantages[idx:end].unsqueeze(-1).to(device)
+                micro_batch_adv = advantages[idx:end].to(device)
 
                 policy_logprobs = get_response_log_probs(model, x, y)
                 old_logprobs = old_logprobs_all[idx:end]
 
                 ratio = torch.exp(policy_logprobs - old_logprobs)
-                per_token_loss = -ratio * micro_batch_adv
-
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - torch.log(ratio)) * mask
-                    approx_kl_mean = approx_kl.sum() / mask.sum()
+                    approx_kl_mean = approx_kl.sum() / mask.sum().clamp_min(1)
                     epoch_kl_divs.append(approx_kl_mean.item())
 
-                    policy_ratio_mean = (ratio * mask).sum() / mask.sum()
+                    policy_ratio_mean = (ratio * mask).sum() / mask.sum().clamp_min(1)
                     epoch_policy_ratios.append(policy_ratio_mean.item())
 
-                masked_loss = per_token_loss * mask
-                denom = mask.sum(dim=-1).clamp_min(1)
-                loss_per_prompt = masked_loss.sum(dim=-1) / denom
-                loss = loss_per_prompt.mean() / args.gradient_accumulation_steps
+                loss_value, clip_frac = compute_policy_loss(
+                    args.loss_type,
+                    ratio,
+                    micro_batch_adv,
+                    mask,
+                    clip_ratio_low=args.clip_ratio_low,
+                    clip_ratio_high=args.clip_ratio_high,
+                )
+                epoch_clip_fracs.append(clip_frac)
+                loss = loss_value / args.gradient_accumulation_steps
 
                 loss.backward()
 
-                if (b + 1) % args.gradient_accumulation_steps == 0:
+                should_step = (
+                    ((b + 1) % args.gradient_accumulation_steps == 0)
+                    or (b + 1 == len(batch_starts))
+                )
+                if should_step:
                     if (
                         args.save_first_step_grads_path is not None
                         and not first_step_grads_saved
@@ -1581,6 +2156,9 @@ def main(argv=None):
             else 0
         )
         mean_kl = sum(epoch_kl_divs) / len(epoch_kl_divs) if epoch_kl_divs else 0
+        mean_clip_frac = (
+            sum(epoch_clip_fracs) / len(epoch_clip_fracs) if epoch_clip_fracs else 0
+        )
 
         total_tokens = response_mask.sum().item()
         tokens_per_sec = total_tokens / generation_time if generation_time > 0 else 0
@@ -1601,6 +2179,11 @@ def main(argv=None):
                     "train/grad_norm": mean_grad_norm,
                     "train/policy_ratio": mean_policy_ratio,
                     "train/approx_kl": mean_kl,
+                    "train/loss_type": 1 if args.loss_type == "dapo" else 0,
+                    "train/clip_frac": mean_clip_frac,
+                    "train/active_tokens": total_tokens,
+                    "train/dynamic_keep_ratio": dynamic_keep_ratio,
+                    "train/truncated_fraction": truncated_fraction,
                     "train/avg_gen_length": avg_generation_len,
                     "time/step_time": step_time,
                     "time/generation_time": generation_time,
@@ -1626,6 +2209,52 @@ def main(argv=None):
                 save_checkpoint(model, tokenizer, run_dir, step_num)
         if stop_requested:
             break
+
+    if args.final_eval:
+        print("Running final benchmark evaluation (MATH-500 + AIME-24)...")
+
+        math500_rows = [
+            row
+            for row in load_eval_dataset(
+                args.eval_math500_dataset_id,
+                args.eval_math500_split,
+                tokenizer,
+                template,
+            )
+            if row["answer"] is not None
+        ]
+
+        aime24_raw = load_dataset(
+            args.eval_aime24_dataset_id,
+            split=args.eval_aime24_split,
+        )
+        aime24_unique = unique_by_problem(aime24_raw)
+        aime24_rows = []
+        for row in aime24_unique:
+            processed = process_math_example(row, tokenizer, template)
+            if processed["answer"] is not None:
+                aime24_rows.append(processed)
+
+        final_step = args.n_grpo_steps
+        math500_metrics = evaluate_rows(
+            math500_rows,
+            generate_with_params,
+            final_step,
+            args,
+            prefix="math500",
+        )
+        aime24_metrics = evaluate_rows(
+            aime24_rows,
+            generate_with_params,
+            final_step,
+            args,
+            prefix="aime24",
+        )
+        dedup_ratio = len(aime24_unique) / max(1, len(aime24_raw))
+        extra_metrics = {"eval/aime24/dedup_ratio": dedup_ratio}
+
+        if not args.no_wandb:
+            wandb.log({**math500_metrics, **aime24_metrics, **extra_metrics}, step=final_step)
 
     if not args.enable_save_ckpt:
         print("Checkpoint saving disabled (--enable-save-ckpt not set).")

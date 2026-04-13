@@ -290,6 +290,21 @@ def apply_mode_defaults(args):
             args.s_merged_to = "frozen"
 
 
+def require_cuda_for_structured_conversion(train_mode, entrypoint):
+    if train_mode not in {"blocktt", "svd"}:
+        return
+    if torch.cuda.is_available():
+        return
+    raise RuntimeError(
+        f"{entrypoint}: --train-mode {train_mode} requires CUDA so SVD/BTT conversion "
+        "runs on GPU. No CUDA device is available."
+    )
+
+
+def get_local_cuda_device_id():
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
 def _flag_was_passed(argv, flag_name):
     return any(
         token == flag_name or token.startswith(f"{flag_name}=") for token in argv
@@ -489,12 +504,17 @@ def build_collate_fn(tokenizer):
 
 
 def prepare_model(args):
+    require_cuda_for_structured_conversion(args.train_mode, entrypoint="run_sft.py")
+
     model_kwargs = dict(
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         use_cache=False,
-        device_map="auto",
     )
+    if args.train_mode in {"blocktt", "svd"}:
+        model_kwargs["device_map"] = {"": get_local_cuda_device_id()}
+    else:
+        model_kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     mode_info = {}

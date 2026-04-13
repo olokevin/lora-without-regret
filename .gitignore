@@ -22,6 +22,8 @@ deberta_tune/
 mistral_tune/
 adapter_efficiency/
 
+ref/LIFT/LLM-Adapters/
+
 *.safetensors
 *.pth
 

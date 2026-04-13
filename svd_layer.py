@@ -5,6 +5,15 @@ import torch.nn as nn
 VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
 
 
+def _raise_if_non_cuda_weight(full_name, weight):
+    if weight.is_cuda:
+        return
+    raise RuntimeError(
+        "Linear->SVD conversion requires CUDA weights so decomposition runs on GPU. "
+        f"Module '{full_name}' is on device={weight.device}."
+    )
+
+
 def resolve_svd_s_merged_to(train_position, s_merged_to=None):
     if train_position not in {"output", "input", "both"}:
         raise ValueError("train_position must be one of: output, input, both")
@@ -66,6 +75,11 @@ class SVDLayer(nn.Module):
         s_merged_to=None,
         train_position="output",
     ):
+        if not weight.is_cuda:
+            raise RuntimeError(
+                "SVD initialization requires CUDA weights so decomposition runs on GPU. "
+                f"Got device={weight.device}."
+            )
         compute_dtype = (
             torch.float32 if weight.dtype in (torch.float16, torch.bfloat16) else weight.dtype
         )
@@ -152,9 +166,26 @@ def convert_linear_to_svd(
             continue
         modules_to_replace.append((name, module))
 
+    non_cuda_modules = [
+        (name, module.weight.device)
+        for name, module in modules_to_replace
+        if not module.weight.is_cuda
+    ]
+    if non_cuda_modules:
+        preview = ", ".join(
+            f"{name}({device})" for name, device in non_cuda_modules[:3]
+        )
+        if len(non_cuda_modules) > 3:
+            preview += f", ... (+{len(non_cuda_modules) - 3} more)"
+        raise RuntimeError(
+            "Linear->SVD conversion requires all target Linear weights on CUDA. "
+            f"Found non-CUDA modules: {preview}"
+        )
+
     print(f"Converting {len(modules_to_replace)} Linear layers to SVD factors")
 
     for full_name, linear in modules_to_replace:
+        _raise_if_non_cuda_weight(full_name, linear.weight)
         path = full_name.split(".")
         parent = model
         for key in path[:-1]:

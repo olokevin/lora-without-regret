@@ -128,6 +128,26 @@ parser.add_argument(
     help="Learning rate.",
 )
 parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=8,
+    help="Per-device train batch size.",
+)
+parser.add_argument(
+    "--gradient-accumulation-steps",
+    type=int,
+    default=1,
+    dest="gradient_accumulation_steps",
+    help="Number of gradient accumulation steps.",
+)
+parser.add_argument(
+    "--weight-decay",
+    type=float,
+    default=0.1,
+    dest="weight_decay",
+    help="Weight decay coefficient.",
+)
+parser.add_argument(
     "--lora-rank",
     type=int,
     default=8,
@@ -263,10 +283,31 @@ def format_blocktt_decomp_mode(decomp_mode):
     return str(decomp_mode)
 
 
+def require_cuda_for_structured_conversion(mode):
+    if mode not in {"blocktt", "svd"}:
+        return
+    if torch.cuda.is_available():
+        return
+    raise RuntimeError(
+        "llama_tune.py: blocktt/svd conversion requires CUDA so SVD/BTT conversion "
+        "runs on GPU. No CUDA device is available."
+    )
+
+
+def get_local_cuda_device_id():
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
 torch.manual_seed(0)
 model_checkpoint = "meta-llama/Meta-Llama-3-8B"
 tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
+
+require_cuda_for_structured_conversion(args.model)
+if args.model in {"blocktt", "svd"}:
+    model_device_map = {"": get_local_cuda_device_id()}
+else:
+    model_device_map = "auto"
 
 if args.model in {"lora", "spectral"}:
     peft_config = LoraConfig(
@@ -281,7 +322,7 @@ if args.model in {"lora", "spectral"}:
 
 model = AutoModelForCausalLM.from_pretrained(
     model_checkpoint,
-    device_map="auto",
+    device_map=model_device_map,
     torch_dtype=torch.bfloat16,
     trust_remote_code=True,
 )
@@ -421,7 +462,6 @@ def tokenize(sample):
 
 tokenized_data = data.map(tokenize, batched=True, desc="Tokenizing data", remove_columns=data.column_names)
 
-batch_size = 8
 save_kwargs = {}
 if args.enable_eco_ckpt:
     save_kwargs["save_strategy"] = "no"
@@ -431,10 +471,10 @@ else:
 
 training_arguments = TrainingArguments(
     output_dir=args.ckpt_dir,
-    per_device_train_batch_size=batch_size,
-    gradient_accumulation_steps=1,
+    per_device_train_batch_size=args.batch_size,
+    gradient_accumulation_steps=args.gradient_accumulation_steps,
     learning_rate=args.learning_rate,
-    weight_decay=0.1,
+    weight_decay=args.weight_decay,
     logging_steps=1,
     num_train_epochs=1,
     push_to_hub=False,
