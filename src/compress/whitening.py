@@ -27,7 +27,7 @@ def compute_whitening(
         Phi: (d_in, d_in) whitening factor (float32, on CPU)
         Phi_inv: (d_in, d_in) inverse whitening factor (float32, on CPU)
     """
-    C = covariance.to(dtype=torch.float64, device=device)
+    C = covariance.to(dtype=torch.float32, device=device)
 
     # SVD of symmetric PSD matrix C = U_s S_s U_s^T
     U_s, S_s, _ = torch.linalg.svd(C, full_matrices=False)

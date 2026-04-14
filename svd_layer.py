@@ -2,7 +2,15 @@ import torch
 import torch.nn as nn
 
 
-VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
+VALID_S_MERGED_TO = {
+    "frozen",
+    "trainable",
+    "output",
+    "input",
+    "split",
+    "keep_frozen",
+    "keep_trainable",
+}
 
 
 def _raise_if_non_cuda_weight(full_name, weight):
@@ -25,10 +33,11 @@ def resolve_svd_s_merged_to(train_position, s_merged_to=None):
 
     if s_merged_to not in VALID_S_MERGED_TO:
         raise ValueError(
-            "s_merged_to must be one of: frozen, trainable, output, input, split, keep"
+            "s_merged_to must be one of: "
+            "frozen, trainable, output, input, split, keep_frozen, keep_trainable"
         )
 
-    if s_merged_to in {"output", "input", "split", "keep"}:
+    if s_merged_to in {"output", "input", "split", "keep_frozen", "keep_trainable"}:
         return s_merged_to
 
     if s_merged_to == "trainable":
@@ -90,7 +99,7 @@ class SVDLayer(nn.Module):
             train_position=train_position,
             s_merged_to=s_merged_to,
         )
-        if merge_target == "keep":
+        if merge_target in {"keep_frozen", "keep_trainable"}:
             a = u
             b = vh
             s_keep = torch.ones(
@@ -99,7 +108,9 @@ class SVDLayer(nn.Module):
                 dtype=weight.dtype,
             )
             s_keep[: s.shape[0]] = s.to(device=weight.device, dtype=weight.dtype)
-            self.svd_s = nn.Parameter(s_keep, requires_grad=False)
+            self.svd_s = nn.Parameter(
+                s_keep, requires_grad=(merge_target == "keep_trainable")
+            )
         elif merge_target == "split":
             s_sqrt = torch.sqrt(s)
             a = u * s_sqrt.unsqueeze(0)
@@ -110,7 +121,7 @@ class SVDLayer(nn.Module):
         else:
             a = u
             b = s.unsqueeze(1) * vh
-        if merge_target != "keep":
+        if merge_target not in {"keep_frozen", "keep_trainable"}:
             self.svd_s = None
 
         self.svd_a.copy_(a.to(device=weight.device, dtype=weight.dtype))
@@ -209,7 +220,13 @@ def convert_linear_to_svd(
     return [name for name, _ in modules_to_replace]
 
 
-def configure_svd_trainability(model, train_position="output", train_bias=True, train_embed_lm_head=False):
+def configure_svd_trainability(
+    model,
+    train_position="output",
+    train_bias=True,
+    train_embed_lm_head=False,
+    train_singular_values=False,
+):
     if train_position not in {"output", "input", "both"}:
         raise ValueError("train_position must be one of: output, input, both")
 
@@ -233,7 +250,7 @@ def configure_svd_trainability(model, train_position="output", train_bias=True, 
             module.svd_b.requires_grad = True
             tuned_input_cores += 1
         if module.svd_s is not None:
-            module.svd_s.requires_grad = False
+            module.svd_s.requires_grad = bool(train_singular_values)
 
         if module.bias is not None:
             module.bias.requires_grad = train_bias

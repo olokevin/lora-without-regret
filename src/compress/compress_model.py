@@ -6,10 +6,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch.nn as nn
 from loguru import logger
+import torch
 from compress.aa_btt import aa_btt_decompose_layer
-from compress.baselines.svd_llm_v2 import svd_llm_v2_compress_model
+from compress.baselines.svd_als import svd_als_compress_model
+from compress.baselines.svd_twosteps import svd_twosteps_compress_model
+from compress.baselines.svd_llm_v2 import svd_compress_layer, svd_compress_layer_combined, svd_llm_v2_compress_model
 from compress.btt_linear import BTTLinear
 from compress.calibration import (
+    collect_backward_covariances_from_loader,
+    collect_both_covariances_from_loader,
     collect_calibration_covariances,
     collect_covariances_from_loader,
     collect_mixed_statistics,
@@ -18,8 +23,31 @@ from compress.nystrom import nystrom_compress_model
 from compress.whitening import compute_whitening
 from compress.utils import _closest_factor_pair
 
-SUPPORTED_METHODS = ("svd", "svd_llm_v2", "vanilla_btt", "aa_btt")
+# Method name registry:
+#   svd           — plain SVD on raw weight matrix, no calibration data needed
+#   svd_llm       — activation-whitened SVD (SVD-LLM V1), uniform rank across layers
+#   svd_llm_v2    — activation-whitened SVD (SVD-LLM V2), heterogeneous rank allocation
+#   svd_llm_v2_bp — SVD-LLM V2 with backward reconstruction objective (uses Cov(dy))
+#   btt           — BTT decomposition on raw weight matrix, no calibration data needed
+#   aa_btt        — activation-aware BTT decomposition with whitening
+SUPPORTED_METHODS = (
+    "svd",
+    "svd_llm",
+    "svd_llm_v2",
+    "svd_llm_v2_bp",
+    "svd_llm_v2_combined",
+    "svd_als",
+    "svd_twosteps",
+    "btt",
+    "aa_btt",
+)
 SUPPORTED_METHOD_SET = set(SUPPORTED_METHODS)
+# Methods that require calibration data to collect input activation covariances
+_CALIB_FREE_METHODS = {"svd", "btt"}
+# Methods that collect output gradient covariances instead of input activation covariances
+_BACKWARD_CALIB_METHODS = {"svd_llm_v2_bp"}
+# Methods that collect both forward and backward covariances
+_BOTH_CALIB_METHODS = {"svd_llm_v2_combined", "svd_als", "svd_twosteps"}
 
 
 @dataclass(frozen=True)
@@ -73,6 +101,13 @@ def _parse_method_spec_dict(payload: Dict[str, Any]) -> MethodSpec:
     if attn == "nystrom":
         raise ValueError("attn='nystrom' is not supported; nystrom is only valid for mlp")
 
+    for key, val in (("attn", attn), ("mlp", mlp)):
+        if val in _BACKWARD_CALIB_METHODS or val in _BOTH_CALIB_METHODS:
+            raise ValueError(
+                f"{key}={val!r} requires backward calibration and cannot be used in a mixed MethodSpec; "
+                "use the plain string method path instead."
+            )
+
     return MethodSpec(attn=attn, mlp=mlp)
 
 
@@ -115,14 +150,24 @@ def _compress_with_covariances(
     skip_layers: Tuple[str, ...],
 ) -> nn.Module:
     """Core compression logic shared by both entry points."""
-    # Delegate to SVD baselines
-    if method in ("svd", "svd_llm_v2"):
+    # Delegate to activation-whitened SVD baselines
+    if method in ("svd_llm", "svd_llm_v2"):
         return svd_llm_v2_compress_model(
             model, covariances,
             compression_ratio=compression_ratio,
             skip_layers=skip_layers,
             heterogeneous=(method == "svd_llm_v2"),
             device=device,
+            objective="forward",
+        )
+    if method == "svd_llm_v2_bp":
+        return svd_llm_v2_compress_model(
+            model, covariances,
+            compression_ratio=compression_ratio,
+            skip_layers=skip_layers,
+            heterogeneous=True,
+            device=device,
+            objective="backward",
         )
 
     # Collect layers to compress
@@ -133,7 +178,7 @@ def _compress_with_covariances(
         leaf = name.split(".")[-1]
         if leaf in skip_layers:
             continue
-        if name not in covariances:
+        if method not in _CALIB_FREE_METHODS and name not in covariances:
             logger.warning(f"No covariance for {name}, skipping")
             continue
         layers_to_compress.append((name, module))
@@ -143,6 +188,29 @@ def _compress_with_covariances(
                 f"{total_orig_params} original params")
     if total_orig_params == 0:
         logger.info("No eligible layers found for compression; returning model unchanged.")
+        return model
+
+    # Plain SVD: no calibration, no whitening
+    if method == "svd":
+        for name, module in layers_to_compress:
+            d_out, d_in = module.weight.shape
+            if compression_ratio >= 1.0:
+                r = min(d_out, d_in)
+            else:
+                r = max(1, int(compression_ratio * d_out * d_in / (d_out + d_in)))
+            compressed = svd_compress_layer(
+                module.weight.data,
+                rank=r,
+                bias=module.bias.data if module.bias is not None else None,
+                precomputed_whitening=None,
+                device=device,
+            ).to(device=module.weight.device, dtype=module.weight.dtype)
+            path = name.split(".")
+            parent = model
+            for key in path[:-1]:
+                parent = getattr(parent, key)
+            setattr(parent, path[-1], compressed)
+            logger.info(f"  {name}: ({d_out}, {d_in}) → rank {r}")
         return model
 
     use_whitening = method == "aa_btt"
@@ -159,8 +227,11 @@ def _compress_with_covariances(
     per_block_ranks = {}
     for name, info in layer_info.items():
         m, a, d_in = info["m"], info["a"], info["d_in"]
-        r = int(compression_ratio * a * d_in / (d_in + a))
-        r = max(1, min(r, min(a, d_in)))
+        if compression_ratio >= 1.0:
+            r = min(a, d_in)  # full-rank: apply transform only, no truncation
+        else:
+            r = int(compression_ratio * a * d_in / (d_in + a))
+            r = max(1, min(r, min(a, d_in)))
         per_block_ranks[name] = [r] * m
 
     # Decompose and replace each layer: compute whitening lazily and discard immediately
@@ -206,6 +277,52 @@ def _compress_with_covariances(
         f"({total_compressed_params/total_orig_params:.1%})"
     )
     return model
+
+
+def _compress_with_covariances_combined(
+    model: nn.Module,
+    fwd_covariances: Dict[str, "torch.Tensor"],
+    bwd_covariances: Dict[str, "torch.Tensor"],
+    compression_ratio: float,
+    method: str,
+    device: str,
+    skip_layers: Tuple[str, ...],
+    als_n_iter: int = 10,
+    als_tol: float = 1e-6,
+    als_weighting: str = "equal",
+    als_reg_eps: float = 1e-4,
+    twosteps_n_refine: int = 1,
+    twosteps_reg_eps: float = 1e-4,
+) -> nn.Module:
+    """Core compression logic for methods needing both forward and backward covariances."""
+    if method == "svd_als":
+        return svd_als_compress_model(
+            model, fwd_covariances, bwd_covariances,
+            compression_ratio=compression_ratio,
+            skip_layers=skip_layers,
+            device=device,
+            als_n_iter=als_n_iter,
+            als_tol=als_tol,
+            als_weighting=als_weighting,
+            als_reg_eps=als_reg_eps,
+        )
+    if method == "svd_twosteps":
+        return svd_twosteps_compress_model(
+            model, fwd_covariances, bwd_covariances,
+            compression_ratio=compression_ratio,
+            skip_layers=skip_layers,
+            device=device,
+            n_refine=twosteps_n_refine,
+            reg_eps=twosteps_reg_eps,
+        )
+    return svd_llm_v2_compress_model(
+        model, fwd_covariances,
+        compression_ratio=compression_ratio,
+        skip_layers=skip_layers,
+        device=device,
+        objective="combined",
+        backward_covariances=bwd_covariances,
+    )
 
 
 def _compress_with_method_spec(
@@ -285,7 +402,9 @@ def compress_model(
         model: pretrained HuggingFace model
         tokenizer: model tokenizer
         compression_ratio: fraction of params to retain (0.5 = 50%)
-        method: "svd", "svd_llm_v2", "vanilla_btt", "aa_btt"
+        method: "svd", "svd_llm", "svd_llm_v2", "btt", "aa_btt"
+            (not "svd_llm_v2_bp"/"svd_llm_v2_combined"/"svd_als" —
+             those require backward calibration; use compress_model_with_loader())
         n_calib_samples: calibration samples
         seq_len: calibration sequence length
         batch_size: calibration batch size
@@ -297,6 +416,11 @@ def compress_model(
     """
     if method not in SUPPORTED_METHODS:
         raise ValueError(f"Unknown method {method!r}, choose from {SUPPORTED_METHODS}")
+
+    if method in _BACKWARD_CALIB_METHODS or method in _BOTH_CALIB_METHODS:
+        raise ValueError(
+            f"Method {method!r} requires backward calibration; use compress_model_with_loader() instead."
+        )
 
     logger.info(f"Compressing with method={method}, ratio={compression_ratio:.0%}")
 
@@ -321,6 +445,12 @@ def compress_model_with_loader(
     method: str = "aa_btt",
     device: str = "cuda",
     skip_layers: Tuple[str, ...] = ("lm_head",),
+    als_n_iter: int = 10,
+    als_tol: float = 1e-6,
+    als_weighting: str = "equal",
+    als_reg_eps: float = 1e-4,
+    twosteps_n_refine: int = 1,
+    twosteps_reg_eps: float = 1e-4,
 ) -> nn.Module:
     """Compress a model using activations collected from an external DataLoader.
 
@@ -331,7 +461,8 @@ def compress_model_with_loader(
         model: pretrained HuggingFace model
         calib_loader: DataLoader yielding {input_ids, attention_mask, ...}
         compression_ratio: fraction of params to retain (0.5 = 50%)
-        method: "svd", "svd_llm_v2", "vanilla_btt", "aa_btt"
+        method: "svd", "svd_llm", "svd_llm_v2", "svd_llm_v2_bp",
+            "svd_llm_v2_combined", "svd_als", "btt", "aa_btt"
         device: compute device
         skip_layers: layers to skip
 
@@ -354,10 +485,34 @@ def compress_model_with_loader(
         logger.info(
             f"Compressing with method={normalized_method}, ratio={compression_ratio:.0%}"
         )
-        logger.info("Collecting calibration covariances from DataLoader...")
-        covariances = collect_covariances_from_loader(
-            model, calib_loader, device=device, skip_layers=skip_layers,
-        )
+        if normalized_method in _CALIB_FREE_METHODS:
+            logger.info("Calibration-free method — skipping DataLoader pass.")
+            covariances = {}
+        elif normalized_method in _BACKWARD_CALIB_METHODS:
+            logger.info("Collecting backward (gradient) covariances from DataLoader...")
+            covariances = collect_backward_covariances_from_loader(
+                model, calib_loader, device=device, skip_layers=skip_layers,
+            )
+        elif normalized_method in _BOTH_CALIB_METHODS:
+            logger.info("Collecting forward and backward covariances from DataLoader...")
+            fwd_covariances, bwd_covariances = collect_both_covariances_from_loader(
+                model, calib_loader, device=device, skip_layers=skip_layers,
+            )
+            return _compress_with_covariances_combined(
+                model, fwd_covariances, bwd_covariances,
+                compression_ratio, normalized_method, device, skip_layers,
+                als_n_iter=als_n_iter,
+                als_tol=als_tol,
+                als_weighting=als_weighting,
+                als_reg_eps=als_reg_eps,
+                twosteps_n_refine=twosteps_n_refine,
+                twosteps_reg_eps=twosteps_reg_eps,
+            )
+        else:
+            logger.info("Collecting calibration covariances from DataLoader...")
+            covariances = collect_covariances_from_loader(
+                model, calib_loader, device=device, skip_layers=skip_layers,
+            )
         return _compress_with_covariances(
             model, covariances, compression_ratio, normalized_method, device, skip_layers,
         )

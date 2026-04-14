@@ -328,10 +328,18 @@ def parse_args(argv=None):
         "--s-merged-to",
         type=str,
         default=None,
-        choices=["frozen", "trainable", "output", "input", "split", "keep"],
+        choices=[
+            "frozen",
+            "trainable",
+            "output",
+            "input",
+            "split",
+            "keep_frozen",
+            "keep_trainable",
+        ],
         help=(
             "Where to merge S during SVD init for svd/blocktt: "
-            "frozen, trainable, output, input, split, or keep"
+            "frozen, trainable, output, input, split, keep_frozen, or keep_trainable"
         ),
     )
 
@@ -1310,6 +1318,7 @@ def main(argv=None):
             model,
             train_bias=mode_info["train_bias"],
             train_position=mode_info["train_position"],
+            train_singular_values=(mode_info["s_merged_to"] == "keep_trainable"),
         )
         if stats["num_btt_layers"] == 0:
             raise ValueError(
@@ -1339,6 +1348,7 @@ def main(argv=None):
             train_position=args.train_position,
             train_bias=True,
             train_embed_lm_head=(args.train_position == "both"),
+            train_singular_values=(mode_info["s_merged_to"] == "keep_trainable"),
         )
         if stats["num_svd_layers"] == 0:
             raise ValueError("No layers were converted to SVD; check --trainable-type selection.")

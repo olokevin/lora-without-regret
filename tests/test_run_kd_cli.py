@@ -10,13 +10,13 @@ from safetensors.torch import save_file as save_safetensors_file
 
 class TestRunKdCli(unittest.TestCase):
     def test_kd_loss_type_required(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with self.assertRaises(SystemExit):
             run_kd.parse_args(["--train-mode", "full"])
 
     def test_defaults_sft(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         args = run_kd.parse_args(["--kd-loss-type", "sft", "--train-mode", "full"])
         run_kd.apply_mode_defaults(args)
@@ -30,32 +30,32 @@ class TestRunKdCli(unittest.TestCase):
         self.assertEqual(args.save_steps, "10,30,final")
 
     def test_defaults_kl(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         args = run_kd.parse_args(["--kd-loss-type", "kl", "--train-mode", "svd"])
         run_kd.apply_mode_defaults(args)
         self.assertEqual(args.kd_loss_type, "kl")
 
     def test_parse_save_steps_default(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         steps = run_kd.parse_save_steps("1,10,final", total_steps=50)
         self.assertEqual(steps, {1, 10, 50})
 
     def test_parse_save_steps_custom(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         steps = run_kd.parse_save_steps("1,5,20,final", total_steps=100)
         self.assertEqual(steps, {1, 5, 20, 100})
 
     def test_parse_save_steps_no_final(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         steps = run_kd.parse_save_steps("1,10", total_steps=50)
         self.assertEqual(steps, {1, 10})
 
     def test_mode_defaults_lr(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         for mode in ["full", "lora", "blocktt", "svd"]:
             args = run_kd.parse_args(["--kd-loss-type", "sft", "--train-mode", mode])
@@ -63,7 +63,7 @@ class TestRunKdCli(unittest.TestCase):
             self.assertIsNotNone(args.lr, f"lr should be set for mode {mode}")
 
     def test_reject_lora_flags_for_non_lora_mode(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         argv = ["--kd-loss-type", "sft", "--train-mode", "full", "--lora-rank", "4"]
         args = run_kd.parse_args(argv)
@@ -71,7 +71,7 @@ class TestRunKdCli(unittest.TestCase):
             run_kd.validate_mode_specific_flags(args, argv)
 
     def test_reject_blocktt_flags_for_non_blocktt_mode(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         argv = ["--kd-loss-type", "sft", "--train-mode", "lora", "--decomp-mode", "input_one_block"]
         args = run_kd.parse_args(argv)
@@ -79,7 +79,7 @@ class TestRunKdCli(unittest.TestCase):
             run_kd.validate_mode_specific_flags(args, argv)
 
     def test_train_position_defaults(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         args = run_kd.parse_args(["--kd-loss-type", "sft", "--train-mode", "blocktt"])
         run_kd.apply_mode_defaults(args)
@@ -90,7 +90,7 @@ class TestRunKdCli(unittest.TestCase):
         self.assertEqual(args.train_position, "output")
 
     def test_kl_online_choice_accepted(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         args = run_kd.parse_args([
             "--kd-loss-type", "kl_online",
             "--train-mode", "full",
@@ -100,14 +100,14 @@ class TestRunKdCli(unittest.TestCase):
         self.assertEqual(args.teacher_model_id, "test/teacher")
 
     def test_kl_online_requires_teacher_model_id(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         argv = ["--kd-loss-type", "kl_online", "--train-mode", "full"]
         args = run_kd.parse_args(argv)
         with self.assertRaises(ValueError):
             run_kd.validate_mode_specific_flags(args, argv)
 
     def test_teacher_model_id_ignored_for_sft(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         # Should not raise even though --teacher-model-id is absent
         argv = ["--kd-loss-type", "sft", "--train-mode", "full"]
         args = run_kd.parse_args(argv)
@@ -156,7 +156,7 @@ class TestTeacherDataLoading(unittest.TestCase):
         )
 
     def test_load_teacher_config(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with tempfile.TemporaryDirectory() as tmp:
             self._create_teacher_data(tmp)
@@ -165,13 +165,13 @@ class TestTeacherDataLoading(unittest.TestCase):
             self.assertEqual(config["shared_vocab_size"], 100)
 
     def test_load_teacher_config_missing_dir_raises(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with self.assertRaises(FileNotFoundError):
             run_kd.load_teacher_config("/nonexistent/path")
 
     def test_load_completions(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with tempfile.TemporaryDirectory() as tmp:
             self._create_teacher_data(tmp, num_examples=3)
@@ -181,7 +181,7 @@ class TestTeacherDataLoading(unittest.TestCase):
             self.assertEqual(completions[2]["index"], 2)
 
     def test_build_sft_dataset(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         completions = [
             {"prompt": "What is 1+1?", "completion": "2", "token_ids": [1, 2, 3]},
@@ -195,7 +195,7 @@ class TestTeacherDataLoading(unittest.TestCase):
         self.assertIn("attention_mask", item)
 
     def test_build_kl_dataset(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with tempfile.TemporaryDirectory() as tmp:
             self._create_teacher_data(tmp, num_examples=2, top_k=8, max_tokens=16)
@@ -210,7 +210,7 @@ class TestTeacherDataLoading(unittest.TestCase):
             self.assertIn("response_mask", item)
 
     def test_build_online_dataset(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         completions = [
             {"prompt": "Q?", "completion": "A", "token_ids": [1, 2, 3]},
             {"prompt": "Q2?", "completion": "A2", "token_ids": [4, 5, 6, 7]},
@@ -226,7 +226,7 @@ class TestTeacherDataLoading(unittest.TestCase):
         self.assertEqual(item["response_mask"], [1, 1, 1])
 
     def test_online_collate_fn_pads(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         import torch
         collate = run_kd.build_kd_online_collate_fn(pad_token_id=0)
         batch = [
@@ -242,7 +242,7 @@ class TestTeacherDataLoading(unittest.TestCase):
 
 class TestKLLoss(unittest.TestCase):
     def test_kl_loss_shape(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         # student_logits: [batch, seq_len, vocab_size]
         student_logits = torch.randn(2, 4, 100)
@@ -258,7 +258,7 @@ class TestKLLoss(unittest.TestCase):
         self.assertFalse(torch.isnan(loss))
 
     def test_kl_loss_zero_when_identical(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         # If student logits at teacher's top-K positions match teacher logprobs,
         # KL should be ~0
@@ -278,7 +278,7 @@ class TestKLLoss(unittest.TestCase):
         self.assertAlmostEqual(loss.item(), 0.0, places=4)
 
     def test_kl_loss_respects_response_mask(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         student_logits = torch.randn(1, 4, 100)
         teacher_topk_values = torch.randn(1, 4, 8)
@@ -299,7 +299,7 @@ class TestKLLoss(unittest.TestCase):
 
 
     def test_online_kl_loss_shape(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         import torch
         student_logits = torch.randn(2, 4, 100)
         teacher_logits = torch.randn(2, 4, 100)
@@ -309,7 +309,7 @@ class TestKLLoss(unittest.TestCase):
         self.assertFalse(torch.isnan(loss))
 
     def test_online_kl_loss_zero_when_identical(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         import torch
         logits = torch.randn(1, 3, 50)
         response_mask = torch.ones(1, 3)
@@ -317,7 +317,7 @@ class TestKLLoss(unittest.TestCase):
         self.assertAlmostEqual(loss.item(), 0.0, places=4)
 
     def test_online_kl_loss_respects_shared_vocab_size(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         import torch
         # Teacher has larger vocab (150), student smaller (100)
         student_logits = torch.randn(1, 3, 100)
@@ -330,7 +330,7 @@ class TestKLLoss(unittest.TestCase):
         self.assertFalse(torch.isnan(loss))
 
     def test_online_kl_loss_respects_response_mask(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         import torch
         student_logits = torch.randn(1, 4, 50)
         teacher_logits = torch.randn(1, 4, 50)
@@ -344,7 +344,7 @@ class TestKLLoss(unittest.TestCase):
 
 class TestCheckpointSaving(unittest.TestCase):
     def test_save_kd_checkpoint_creates_safetensors(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         model = torch.nn.Linear(4, 2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,7 +354,7 @@ class TestCheckpointSaving(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "model.safetensors")))
 
     def test_save_kd_checkpoint_roundtrips_weights(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         from safetensors.torch import load_file
 
         model = torch.nn.Linear(4, 2, bias=True)
@@ -365,13 +365,13 @@ class TestCheckpointSaving(unittest.TestCase):
             torch.testing.assert_close(loaded["bias"], model.bias.data.cpu())
 
     def test_parse_save_steps_with_final(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         steps = run_kd.parse_save_steps("1,10,final", total_steps=50)
         self.assertEqual(steps, {1, 10, 50})
 
     def test_parse_save_steps_deduplicates(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         steps = run_kd.parse_save_steps("1,10,10,final", total_steps=10)
         self.assertEqual(steps, {1, 10})
@@ -460,7 +460,7 @@ class TestRunKdIntegration(unittest.TestCase):
         )
 
     def test_sft_mode_runs(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:
             self._create_teacher_data(data_dir)
@@ -500,7 +500,7 @@ class TestRunKdIntegration(unittest.TestCase):
             self.assertTrue(len(matches) > 0, "step=1 checkpoint not found")
 
     def test_kl_mode_runs(self):
-        import run_kd
+        import legacy.run_kd as run_kd
 
         with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:
             self._create_teacher_data(data_dir, top_k=8)
@@ -535,7 +535,7 @@ class TestRunKdIntegration(unittest.TestCase):
 
 
     def test_kl_online_mode_runs(self):
-        import run_kd
+        import legacy.run_kd as run_kd
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as out_dir:

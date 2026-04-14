@@ -59,7 +59,7 @@ def aa_btt_decompose_layer(
         ranks = [uniform_r] * m
         max_rank = uniform_r
 
-    # Whitening (on GPU) — None means naive SVD (vanilla_btt)
+    # Whitening (on GPU) — None means BTT on raw weight (btt)
     use_whitening = False
     if precomputed_whitening is not None:
         Phi, Phi_inv = precomputed_whitening

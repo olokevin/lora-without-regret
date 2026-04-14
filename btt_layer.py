@@ -8,7 +8,15 @@ import json
 import re
 
 
-VALID_S_MERGED_TO = {"frozen", "trainable", "output", "input", "split", "keep"}
+VALID_S_MERGED_TO = {
+    "frozen",
+    "trainable",
+    "output",
+    "input",
+    "split",
+    "keep_frozen",
+    "keep_trainable",
+}
 VALID_BLOCKTT_DECOMP_MODES = {"square", "input_one_block", "output_one_block"}
 BLOCKTT_DECOMP_MODE_ALIASES = {
     "input": "input_one_block",
@@ -171,10 +179,11 @@ def resolve_blocktt_s_merged_to(train_position, s_merged_to=None, left_size=None
 
     if s_merged_to not in VALID_S_MERGED_TO:
         raise ValueError(
-            "s_merged_to must be one of: frozen, trainable, output, input, split, keep"
+            "s_merged_to must be one of: "
+            "frozen, trainable, output, input, split, keep_frozen, keep_trainable"
         )
 
-    if s_merged_to in {"output", "input", "split", "keep"}:
+    if s_merged_to in {"output", "input", "split", "keep_frozen", "keep_trainable"}:
         return s_merged_to
 
     if left_size is None or right_size is None:
@@ -348,7 +357,12 @@ def get_blocktt_target_module_names(blocktt_type):
     raise ValueError("blocktt_type must be one of: all, mlp, attn")
 
 
-def configure_blocktt_trainability(model, train_bias=True, train_position="small"):
+def configure_blocktt_trainability(
+    model,
+    train_bias=True,
+    train_position="small",
+    train_singular_values=False,
+):
     if train_position not in {"small", "large", "both"}:
         raise ValueError("BlockTT train_position must be one of: small, large, both")
 
@@ -377,7 +391,7 @@ def configure_blocktt_trainability(model, train_bias=True, train_position="small
         module.btt_l.requires_grad = train_left
         module.btt_r.requires_grad = train_right
         if module.btt_s is not None:
-            module.btt_s.requires_grad = False
+            module.btt_s.requires_grad = bool(train_singular_values)
         tuned_left_cores += int(train_left)
         tuned_right_cores += int(train_right)
 
@@ -692,7 +706,7 @@ class BTTLayer(nn.Module):
         vh_used = Vh[:, :use_rank, :].to(dtype=param_dtype)
         s_used = torch.clamp(S[:, :use_rank], min=0).to(dtype=param_dtype)
 
-        if merge_target == "keep":
+        if merge_target in {"keep_frozen", "keep_trainable"}:
             core_l[:, :, :use_rank] = u_used
             core_r[:, :use_rank, :] = vh_used
             s_keep = torch.zeros(
@@ -703,7 +717,8 @@ class BTTLayer(nn.Module):
             )
             s_keep[:, :use_rank] = s_used
             self.btt_s = nn.Parameter(
-                s_keep.reshape(self.m, self.n, self.rank), requires_grad=False
+                s_keep.reshape(self.m, self.n, self.rank),
+                requires_grad=(merge_target == "keep_trainable"),
             )
         elif merge_target == "split":
             sqrt_s = torch.sqrt(s_used)
@@ -715,7 +730,7 @@ class BTTLayer(nn.Module):
         else:
             core_l[:, :, :use_rank] = u_used
             core_r[:, :use_rank, :] = s_used.unsqueeze(-1) * vh_used
-        if merge_target != "keep":
+        if merge_target not in {"keep_frozen", "keep_trainable"}:
             self.btt_s = None
 
         core_l = core_l.reshape(self.m, self.n, self.a, self.rank)

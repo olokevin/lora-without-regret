@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 from loguru import logger
 from typing import Any, Dict, Optional, Tuple
@@ -48,12 +49,24 @@ def _run_forward_accumulate_cov(
         d_in = module.weight.shape[1]
         cov_store[name] = torch.zeros(d_in, d_in, dtype=torch.float32, device="cpu")
         token_counts[name] = 0
+    current_attention_mask: Optional[torch.Tensor] = None
 
     def _make_hook(name):
         def _hook(module, inputs, output):
             x = inputs[0].detach()
             if x.ndim == 3:
-                x = x.reshape(-1, x.shape[-1])  # (B*T, d_in)
+                if (
+                    current_attention_mask is not None
+                    and tuple(current_attention_mask.shape[:2]) == tuple(x.shape[:2])
+                ):
+                    mask = current_attention_mask.to(device=x.device).bool()
+                    x = x[mask]  # (N_valid, d_in)
+                else:
+                    x = x.reshape(-1, x.shape[-1])  # (B*T, d_in)
+            elif x.ndim > 2:
+                x = x.reshape(-1, x.shape[-1])
+            if x.numel() == 0:
+                return
             x = x.to(dtype=torch.float32)
             cov_store[name] += (x.t() @ x).to(device="cpu")
             token_counts[name] += x.shape[0]
@@ -68,6 +81,7 @@ def _run_forward_accumulate_cov(
                 input_ids = input_ids.to(device)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
+                current_attention_mask = attention_mask
                 model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 if (idx + 1) % log_interval == 0:
                     logger.info(f"  Processed {idx + 1} batches")
@@ -117,7 +131,7 @@ def collect_calibration_covariances(
         N = token_counts[name]
         if N == 0:
             continue
-        covariances[name] = (C / N).to(device=device)
+        covariances[name] = C / N  # float32 on CPU; moved to GPU per-layer during compression
         logger.info(f"  {name}: cov shape {covariances[name].shape}, N={N}")
 
     return covariances
@@ -161,10 +175,251 @@ def collect_covariances_from_loader(
         N = token_counts[name]
         if N == 0:
             continue
-        covariances[name] = (C / N).to(device=device)
+        covariances[name] = C / N  # float32 on CPU; moved to GPU per-layer during compression
         logger.info(f"  {name}: cov shape {covariances[name].shape}, N={N}")
 
     return covariances
+
+
+def collect_backward_covariances_from_loader(
+    model: nn.Module,
+    calib_loader,
+    device: str = "cuda",
+    skip_layers: tuple = ("lm_head",),
+) -> Dict[str, torch.Tensor]:
+    """Collect output gradient covariance matrices Cov(dy) from a DataLoader.
+
+    This is used by the ``svd_llm_v2_bp`` method which minimises backward
+    reconstruction error instead of forward (input-activation) reconstruction
+    error.
+
+    Args:
+        model: pretrained HuggingFace model
+        calib_loader: DataLoader yielding dicts with 'input_ids' (and optionally
+            'attention_mask', 'labels')
+        device: compute device
+        skip_layers: leaf layer names to skip
+
+    Returns:
+        Dict mapping "layer_name" -> (d_out, d_out) float32 gradient covariance
+        matrix (on CPU).
+    """
+    linear_layers = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and name.split(".")[-1] not in skip_layers
+    }
+    logger.info(f"Hooking {len(linear_layers)} linear layers for backward covariance accumulation")
+
+    cov_store: Dict[str, torch.Tensor] = {}
+    token_counts: Dict[str, int] = {}
+    for name, module in linear_layers.items():
+        d_out = module.weight.shape[0]
+        cov_store[name] = torch.zeros(d_out, d_out, dtype=torch.float32, device="cpu")
+        token_counts[name] = 0
+
+    def _make_bwd_hook(name):
+        # Note: unlike the forward collector, padding positions are not masked out here.
+        # Padding tokens' gradients will be included if present in the batch.
+        # For uniform-length calibration data this is benign; padded batches may
+        # introduce noise proportional to the padding fraction.
+        def _hook(module, grad_input, grad_output):
+            dy = grad_output[0].detach()
+            if dy.ndim >= 3:
+                dy = dy.reshape(-1, dy.shape[-1])
+            if dy.numel() == 0:
+                return
+            dy = dy.to(dtype=torch.float32)
+            cov_store[name] += (dy.t() @ dy).to(device="cpu")
+            token_counts[name] += dy.shape[0]
+            del dy
+        return _hook
+
+    handles = [m.register_full_backward_hook(_make_bwd_hook(n)) for n, m in linear_layers.items()]
+    model.eval()
+    try:
+        for idx, batch in enumerate(calib_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            logits = outputs.logits
+
+            if "labels" in batch and batch["labels"] is not None:
+                labels = batch["labels"].to(device)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+            else:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = batch["input_ids"][..., 1:].to(device).contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.shape[-1]),
+                    shift_labels.reshape(-1),
+                )
+
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+            if (idx + 1) % 10 == 0:
+                logger.info(f"  Processed {idx + 1} batches")
+    finally:
+        for h in handles:
+            h.remove()
+
+    covariances: Dict[str, torch.Tensor] = {}
+    for name, C in cov_store.items():
+        N = token_counts[name]
+        if N == 0:
+            continue
+        covariances[name] = C / N
+        logger.info(f"  {name}: bwd cov shape {covariances[name].shape}, N={N}")
+
+    return covariances
+
+
+def collect_both_covariances_from_loader(
+    model: nn.Module,
+    calib_loader,
+    device: str = "cuda",
+    skip_layers: tuple = ("lm_head",),
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Collect both input activation and output gradient covariances in one pass.
+
+    Registers forward hooks (for C_x = X^T X) and backward hooks (for C_g = G^T G)
+    simultaneously, performing forward + backward on each batch.
+
+    Args:
+        model: pretrained HuggingFace model
+        calib_loader: DataLoader yielding dicts with 'input_ids' (and optionally
+            'attention_mask', 'labels')
+        device: compute device
+        skip_layers: leaf layer names to skip
+
+    Returns:
+        (forward_covariances, backward_covariances) where:
+        - forward_covariances: {layer_name: (d_in, d_in) float32 on CPU}
+        - backward_covariances: {layer_name: (d_out, d_out) float32 on CPU}
+    """
+    linear_layers = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and name.split(".")[-1] not in skip_layers
+    }
+    logger.info(
+        f"Hooking {len(linear_layers)} linear layers for combined covariance accumulation"
+    )
+
+    # Forward covariance stores (C_x: d_in x d_in)
+    fwd_cov_store: Dict[str, torch.Tensor] = {}
+    fwd_token_counts: Dict[str, int] = {}
+    # Backward covariance stores (C_g: d_out x d_out)
+    bwd_cov_store: Dict[str, torch.Tensor] = {}
+    bwd_token_counts: Dict[str, int] = {}
+
+    for name, module in linear_layers.items():
+        d_out, d_in = module.weight.shape
+        fwd_cov_store[name] = torch.zeros(d_in, d_in, dtype=torch.float32, device="cpu")
+        fwd_token_counts[name] = 0
+        bwd_cov_store[name] = torch.zeros(d_out, d_out, dtype=torch.float32, device="cpu")
+        bwd_token_counts[name] = 0
+
+    current_attention_mask: Optional[torch.Tensor] = None
+
+    def _make_fwd_hook(name):
+        def _hook(module, inputs, output):
+            x = inputs[0].detach()
+            if x.ndim == 3:
+                if (
+                    current_attention_mask is not None
+                    and tuple(current_attention_mask.shape[:2]) == tuple(x.shape[:2])
+                ):
+                    mask = current_attention_mask.to(device=x.device).bool()
+                    x = x[mask]
+                else:
+                    x = x.reshape(-1, x.shape[-1])
+            elif x.ndim > 2:
+                x = x.reshape(-1, x.shape[-1])
+            if x.numel() == 0:
+                return
+            x = x.to(dtype=torch.float32)
+            fwd_cov_store[name] += (x.t() @ x).to(device="cpu")
+            fwd_token_counts[name] += x.shape[0]
+            del x
+        return _hook
+
+    def _make_bwd_hook(name):
+        def _hook(module, grad_input, grad_output):
+            dy = grad_output[0].detach()
+            if dy.ndim >= 3:
+                dy = dy.reshape(-1, dy.shape[-1])
+            if dy.numel() == 0:
+                return
+            dy = dy.to(dtype=torch.float32)
+            bwd_cov_store[name] += (dy.t() @ dy).to(device="cpu")
+            bwd_token_counts[name] += dy.shape[0]
+            del dy
+        return _hook
+
+    fwd_handles = [m.register_forward_hook(_make_fwd_hook(n)) for n, m in linear_layers.items()]
+    bwd_handles = [m.register_full_backward_hook(_make_bwd_hook(n)) for n, m in linear_layers.items()]
+    model.eval()
+    try:
+        for idx, batch in enumerate(calib_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            current_attention_mask = attention_mask
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            logits = outputs.logits
+
+            if "labels" in batch and batch["labels"] is not None:
+                labels = batch["labels"].to(device)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                )
+            else:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = batch["input_ids"][..., 1:].to(device).contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.shape[-1]),
+                    shift_labels.reshape(-1),
+                )
+
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+            if (idx + 1) % 10 == 0:
+                logger.info(f"  Processed {idx + 1} batches")
+    finally:
+        for h in fwd_handles:
+            h.remove()
+        for h in bwd_handles:
+            h.remove()
+
+    fwd_covariances: Dict[str, torch.Tensor] = {}
+    bwd_covariances: Dict[str, torch.Tensor] = {}
+    for name in linear_layers:
+        fwd_N = fwd_token_counts[name]
+        bwd_N = bwd_token_counts[name]
+        if fwd_N == 0 or bwd_N == 0:
+            continue
+        fwd_covariances[name] = fwd_cov_store[name] / fwd_N
+        bwd_covariances[name] = bwd_cov_store[name] / bwd_N
+        logger.info(
+            f"  {name}: fwd cov {fwd_covariances[name].shape}, "
+            f"bwd cov {bwd_covariances[name].shape}"
+        )
+
+    return fwd_covariances, bwd_covariances
 
 
 def collect_mixed_statistics(
@@ -186,7 +441,7 @@ def collect_mixed_statistics(
     valid_methods = (
         set(valid_methods)
         if valid_methods is not None
-        else {"svd", "svd_llm_v2", "vanilla_btt", "aa_btt"}
+        else {"svd", "svd_llm", "svd_llm_v2", "btt", "aa_btt"}
     )
     mlp_method = getattr(method_spec, "mlp", None)
     attn_method = getattr(method_spec, "attn", None)
@@ -236,12 +491,24 @@ def collect_mixed_statistics(
         d_in = module.weight.shape[1]
         cov_store[name] = torch.zeros(d_in, d_in, dtype=torch.float32, device="cpu")
         token_counts[name] = 0
+    current_attention_mask: Optional[torch.Tensor] = None
 
     def _make_hook(name):
         def _hook(module, inputs, output):
             x = inputs[0].detach()
             if x.ndim == 3:
+                if (
+                    current_attention_mask is not None
+                    and tuple(current_attention_mask.shape[:2]) == tuple(x.shape[:2])
+                ):
+                    mask = current_attention_mask.to(device=x.device).bool()
+                    x = x[mask]
+                else:
+                    x = x.reshape(-1, x.shape[-1])
+            elif x.ndim > 2:
                 x = x.reshape(-1, x.shape[-1])
+            if x.numel() == 0:
+                return
             x = x.to(dtype=torch.float32)
             cov_store[name] += (x.t() @ x).to(device="cpu")
             token_counts[name] += x.shape[0]
@@ -257,6 +524,7 @@ def collect_mixed_statistics(
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device)
+                current_attention_mask = attention_mask
                 model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 if (idx + 1) % 10 == 0:
                     logger.info(f"  Processed {idx + 1} batches")
@@ -269,7 +537,7 @@ def collect_mixed_statistics(
         N = token_counts[name]
         if N == 0:
             continue
-        statistics[name] = (C / N).to(device=device)
+        statistics[name] = C / N  # float32 on CPU; moved to GPU per-layer during compression
         logger.info(f"  {name}: mixed stat shape {statistics[name].shape}, N={N}")
 
     return statistics

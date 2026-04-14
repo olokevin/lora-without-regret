@@ -205,7 +205,19 @@ parser.add_argument(
     "--s-merged-to",
     type=str,
     default=None,
-    help="Optional singular-value merge target for BlockTT/SVD init.",
+    choices=[
+        "frozen",
+        "trainable",
+        "output",
+        "input",
+        "split",
+        "keep_frozen",
+        "keep_trainable",
+    ],
+    help=(
+        "Where to merge S during SVD init for blocktt/svd: "
+        "frozen, trainable, output, input, split, keep_frozen, keep_trainable."
+    ),
 )
 parser.add_argument(
     "--enable-eco-ckpt",
@@ -361,6 +373,7 @@ elif args.model == "blocktt":
         model,
         train_bias=train_bias,
         train_position=train_position,
+        train_singular_values=(args.s_merged_to == "keep_trainable"),
     )
     if stats["num_btt_layers"] == 0:
         raise ValueError("No layers were converted to BTT; check --trainable-type selection.")
@@ -416,6 +429,7 @@ elif args.model == "svd":
         model,
         train_position=args.train_position,
         train_bias=True,
+        train_singular_values=(args.s_merged_to == "keep_trainable"),
     )
     if stats["num_svd_layers"] == 0:
         raise ValueError("No layers were converted to SVD; check --trainable-type selection.")
