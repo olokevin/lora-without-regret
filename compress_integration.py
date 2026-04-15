@@ -276,7 +276,23 @@ def build_decomposition_config(args, *, hyphen_style: bool = True, model=None) -
 def build_training_data_calib_loader(
     dataset, collate_fn, *, num_seqs: int, batch_size: int, seed: int,
 ) -> DataLoader:
-    raise NotImplementedError("filled in Task 9")
+    """Take a deterministic subset of the training dataset and wrap it in a
+    DataLoader using the training collate function. Yields the same batch shape
+    the training loop sees."""
+    import random
+    n_available = len(dataset)
+    n_take = min(int(num_seqs), n_available)
+    rng = random.Random(int(seed))
+    indices = list(range(n_available))
+    rng.shuffle(indices)
+    subset = Subset(dataset, indices[:n_take])
+    return DataLoader(
+        subset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
 
 
 def build_rl_rollout_calib_loader(
