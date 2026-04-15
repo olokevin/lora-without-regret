@@ -111,6 +111,54 @@ class TestBuildConfig(unittest.TestCase):
         self.assertEqual(cfg.s_merged_to, "trainable")
         self.assertTrue(cfg.factorize_by_head)
 
+    def test_integer_rank_rejected(self):
+        # Direct call (bypassing validate) should still reject integer ranks.
+        args = _parse(["--calib-mode", "v2", "--calib-source", "c4", "--blocktt-rank", "4"])
+        with self.assertRaisesRegex(ValueError, "integer"):
+            ci.build_decomposition_config(args, model=ToyModel())
+
+    def test_nan_rank_rejected(self):
+        args = _parse(["--calib-mode", "v2", "--calib-source", "c4", "--blocktt-rank", "nan"])
+        with self.assertRaisesRegex(ValueError, "finite"):
+            ci.build_decomposition_config(args, model=ToyModel())
+
+    def test_zero_rank_rejected(self):
+        args = _parse(["--calib-mode", "v2", "--calib-source", "c4", "--blocktt-rank", "0"])
+        # "0" is an integer-string — caught by integer check.
+        with self.assertRaisesRegex(ValueError, "integer"):
+            ci.build_decomposition_config(args, model=ToyModel())
+
+    def test_missing_calib_mode_raises(self):
+        # Parser without add_calibrated_btt_args — args has no calib_mode attr.
+        import argparse as _ap
+        p = _ap.ArgumentParser()
+        p.add_argument("--train-mode", default="blocktt")
+        p.add_argument("--blocktt-rank", default="full")
+        p.add_argument("--trainable-type", default="all")
+        p.add_argument("--decomp-mode", default="square")
+        p.add_argument("--train-position", default="small")
+        p.add_argument("--s-merged-to", default=None)
+        p.add_argument("--blocktt-factorize-by-head", action="store_true", default=True)
+        args = p.parse_args([])
+        with self.assertRaisesRegex(ValueError, "calib_mode"):
+            ci.build_decomposition_config(args, model=ToyModel())
+
+    def test_default_train_position_both(self):
+        # Parser that leaves train_position attr as default "both" rather than "small".
+        import argparse as _ap
+        p = _ap.ArgumentParser()
+        p.add_argument("--train-mode", default="blocktt")
+        p.add_argument("--blocktt-rank", default="full")
+        p.add_argument("--trainable-type", default="all")
+        p.add_argument("--decomp-mode", default="square")
+        p.add_argument("--train-position", default="both")  # intentionally default to "both"
+        p.add_argument("--s-merged-to", default=None)
+        p.add_argument("--blocktt-factorize-by-head", action="store_true", default=True)
+        ci.add_calibrated_btt_args(p, hyphen_style=True)
+        args = p.parse_args(["--calib-mode", "v2", "--calib-source", "c4"])
+        cfg = ci.build_decomposition_config(args, model=ToyModel())
+        self.assertEqual(cfg.train_position, "both")
+
 
 if __name__ == "__main__":
     unittest.main()

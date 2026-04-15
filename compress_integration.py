@@ -8,6 +8,7 @@ when --calib-mode (or --calib_mode) is non-'none'.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import asdict
@@ -184,10 +185,26 @@ _BLOCKTT_TARGET_NAMES = {
 
 
 def _resolve_ratio_from_rank(rank_raw) -> float:
-    """--blocktt-rank on the calibrated path: 'full' -> 1.0; float in (0, 1] -> itself."""
+    """--blocktt-rank on the calibrated path: 'full' -> 1.0; float in (0, 1] -> itself.
+
+    Integer strings like '4' are rejected: on the calibrated path, rank is a
+    compression ratio, not a fixed rank. `validate_calibrated_btt_args` also
+    catches this, but we re-enforce here so direct callers (tests, LIFT) get
+    a clear error.
+    """
+    if isinstance(rank_raw, bool):
+        raise ValueError(f"--blocktt-rank must be 'full' or a float; got bool {rank_raw!r}")
     if isinstance(rank_raw, str):
         if rank_raw == "full":
             return 1.0
+        # Reject integer-string form ('4', '+4', '-1') before the float parse.
+        if "." not in rank_raw and "e" not in rank_raw.lower():
+            stripped = rank_raw.lstrip("+-")
+            if stripped.isdigit():
+                raise ValueError(
+                    "integer --blocktt-rank is only valid when --calib-mode=none; "
+                    f"for calibrated BTT pass 'full' or a float in (0, 1] (got {rank_raw!r})"
+                )
         try:
             val = float(rank_raw)
         except ValueError as exc:
@@ -196,6 +213,8 @@ def _resolve_ratio_from_rank(rank_raw) -> float:
         val = float(rank_raw)
     else:
         raise ValueError(f"--blocktt-rank has unsupported type {type(rank_raw).__name__}")
+    if not math.isfinite(val):
+        raise ValueError(f"--blocktt-rank must be finite; got {val}")
     if not (0.0 < val <= 1.0):
         raise ValueError(f"--blocktt-rank float must be in (0, 1]; got {val}")
     return val
@@ -218,10 +237,22 @@ def _build_skip_layers(model: nn.Module, trainable_type: str) -> str:
 def build_decomposition_config(args, *, hyphen_style: bool = True, model=None) -> DecompositionConfig:
     """Translate CLI args to a DecompositionConfig. `model` is required so that
     --trainable-type can be inverted into a skip_layers list."""
+    del hyphen_style  # kept for signature stability; routed via _arg_name upstream
     if model is None:
         raise ValueError("build_decomposition_config requires model= for skip_layers inversion")
 
-    train_mode = CALIB_MODE_TO_TRAIN_MODE[getattr(args, "calib_mode")]
+    calib_mode = getattr(args, "calib_mode", None)
+    if calib_mode is None:
+        raise ValueError(
+            "build_decomposition_config requires args.calib_mode; did you call "
+            "add_calibrated_btt_args() on the parser?"
+        )
+    if calib_mode not in CALIB_MODE_TO_TRAIN_MODE:
+        raise ValueError(
+            f"calib_mode must be one of {sorted(CALIB_MODE_TO_TRAIN_MODE.keys())}; "
+            f"got {calib_mode!r}"
+        )
+    train_mode = CALIB_MODE_TO_TRAIN_MODE[calib_mode]
     ratio = _resolve_ratio_from_rank(getattr(args, "blocktt_rank", "full"))
     trainable_type = getattr(args, "trainable_type", "all")
     skip_layers = _build_skip_layers(model, trainable_type)
