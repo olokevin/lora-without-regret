@@ -95,8 +95,67 @@ def add_calibrated_btt_args(parser, *, hyphen_style: bool = True) -> None:
 
 # ---- stubs below; filled in by subsequent tasks ----
 
+_CALIB_FLAG_NAMES_HYPHEN = (
+    "--calib-mode", "--calib-source", "--calib-traces-path",
+    "--calib-num-seqs", "--calib-max-length", "--calib-seed",
+    "--calib-batch-size",
+)
+_CALIB_FLAG_NAMES_UNDER = tuple(f.replace("-", "_") for f in _CALIB_FLAG_NAMES_HYPHEN)
+
+
+def _flag_was_passed(argv: Sequence[str], flag: str) -> bool:
+    for tok in argv:
+        if tok == flag or tok.startswith(flag + "="):
+            return True
+    return False
+
+
 def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: bool = True) -> None:
-    raise NotImplementedError("filled in Task 7")
+    """Raise ValueError if the calib-* args are inconsistent with train-mode / blocktt-rank."""
+    calib_mode = getattr(args, "calib_mode", "none")
+    calib_source = getattr(args, "calib_source", "c4")
+
+    # 1. --calib-mode != none requires --train-mode blocktt (if parser has train_mode)
+    if calib_mode != "none" and hasattr(args, "train_mode"):
+        if args.train_mode != "blocktt":
+            raise ValueError(
+                "--calib-mode only valid with --train-mode blocktt "
+                f"(got --train-mode={args.train_mode!r})"
+            )
+
+    # 2. --calib-source=traces requires --calib-traces-path
+    if calib_mode != "none" and calib_source == "traces":
+        path = getattr(args, "calib_traces_path", None)
+        if not path:
+            flag = "--calib-traces-path" if hyphen_style else "--calib_traces_path"
+            raise ValueError(f"{flag} must be set when --calib-source=traces")
+
+    # 3. --calib-mode=none forbids any --calib-* flag being passed explicitly
+    flags = _CALIB_FLAG_NAMES_HYPHEN if hyphen_style else _CALIB_FLAG_NAMES_UNDER
+    if calib_mode == "none":
+        passed = [f for f in flags if f != ("--calib-mode" if hyphen_style else "--calib_mode")
+                  and _flag_was_passed(argv, f)]
+        if passed:
+            raise ValueError(
+                f"{', '.join(passed)} requires --calib-mode!=none "
+                "(got --calib-mode=none)"
+            )
+
+    # 4. Integer --blocktt-rank rejected on calibrated path
+    if calib_mode != "none":
+        rank_raw = getattr(args, "blocktt_rank", "full")
+        if isinstance(rank_raw, str):
+            if rank_raw != "full":
+                try:
+                    int(rank_raw)
+                    is_int = "." not in rank_raw
+                except ValueError:
+                    is_int = False
+                if is_int:
+                    raise ValueError(
+                        "integer --blocktt-rank is only valid when --calib-mode=none; "
+                        "for calibrated BTT pass 'full' or a float in (0, 1]"
+                    )
 
 
 def build_decomposition_config(args, *, hyphen_style: bool = True) -> DecompositionConfig:
