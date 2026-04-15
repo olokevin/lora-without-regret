@@ -399,12 +399,30 @@ def apply_calibrated_btt(
     return model, stats
 
 
+@torch.no_grad()
 def materialize_calibrated_btt_weights(model) -> List[Tuple[str, torch.Tensor]]:
-    raise NotImplementedError("filled in Task 14")
+    """Return [(param_name, dense_tensor)] for every BTTLinear in the model.
+
+    For each BTTLinear `M` at path `p`, yields (`p.weight`, dense) and
+    optionally (`p.bias`, bias). This list is appended to any other
+    (name, tensor) pairs the caller assembles for vLLM weight sync.
+    """
+    out: List[Tuple[str, torch.Tensor]] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, BTTLinear):
+            continue
+        out.append((f"{name}.weight", module.materialize_dense_weight()))
+        if module.bias is not None:
+            out.append((f"{name}.bias", module.bias.detach()))
+    return out
 
 
 def restore_calibrated_btt_weights(model, saved_state) -> None:
-    raise NotImplementedError("filled in Task 14")
+    """No-op: BTTLinear weights are never overwritten by vLLM weight export,
+    only materialized-and-copied. The real factored cores remain in place
+    on the training model, so no restore is needed. Provided for API
+    symmetry with the legacy SVDLayer/BTTLayer restore flow."""
+    return None
 
 
 def save_calibrated_btt_checkpoint(model, out_dir: str) -> None:
