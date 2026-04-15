@@ -296,10 +296,49 @@ def build_training_data_calib_loader(
 
 
 def build_rl_rollout_calib_loader(
-    *, rl_rollout_fn, tokenizer, num_seqs: int, batch_size: int,
-    max_length: int, seed: int,
+    *, rl_rollout_fn: Callable[[int], List[Tuple[str, str]]],
+    tokenizer, num_seqs: int, batch_size: int, max_length: int, seed: int,
 ) -> DataLoader:
-    raise NotImplementedError("filled in Task 13")
+    """Run a caller-supplied rollout function to produce (prompt, completion)
+    text pairs; tokenize each pair; build a DataLoader of
+    {input_ids, attention_mask, labels} where prompt tokens are masked to -100
+    in labels (mirroring the RL loss mask)."""
+    pairs = rl_rollout_fn(int(num_seqs))
+    if len(pairs) == 0:
+        raise ValueError("rl_rollout_fn returned no (prompt, completion) pairs")
+
+    examples = []
+    for prompt, completion in pairs[:int(num_seqs)]:
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        completion_ids = tokenizer.encode(completion, add_special_tokens=False)
+        full = (prompt_ids + completion_ids)[: int(max_length)]
+        prompt_len = min(len(prompt_ids), len(full))
+        labels = [-100] * prompt_len + full[prompt_len:]
+        # If prompt was truncated away entirely, fall back to masking half.
+        if all(l == -100 for l in labels):
+            labels = full.copy()
+        examples.append({
+            "input_ids": torch.tensor(full, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        })
+
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+
+    def _collate(batch):
+        max_len = max(e["input_ids"].shape[0] for e in batch)
+        input_ids = torch.full((len(batch), max_len), fill_value=pad_id, dtype=torch.long)
+        attn = torch.zeros((len(batch), max_len), dtype=torch.long)
+        labels = torch.full((len(batch), max_len), fill_value=-100, dtype=torch.long)
+        for i, e in enumerate(batch):
+            L = e["input_ids"].shape[0]
+            input_ids[i, :L] = e["input_ids"]
+            attn[i, :L] = 1
+            labels[i, :L] = e["labels"]
+        return {"input_ids": input_ids, "attention_mask": attn, "labels": labels}
+
+    return DataLoader(
+        examples, batch_size=int(batch_size), shuffle=False, collate_fn=_collate,
+    )
 
 
 def build_calib_loader(
