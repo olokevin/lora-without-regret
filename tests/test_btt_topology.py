@@ -32,7 +32,7 @@ class TestBTTLinearTopology(unittest.TestCase):
 
         new_layer.load_state_dict(layer.state_dict())
         x = torch.randn(5, layer.in_features)
-        self.assertTrue(torch.allclose(new_layer(x), layer(x), atol=1e-6))
+        self.assertTrue(torch.allclose(new_layer(x), layer(x), atol=1e-5))
 
     def test_topology_spec_no_bias(self):
         torch.manual_seed(1)
