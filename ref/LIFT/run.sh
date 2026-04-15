@@ -13,6 +13,8 @@
 # CUDA_VISIBLE_DEVICES=3 lr=2e-4 decomp_mode=output_one_block s_merged_to=keep_trainable bash bash_scripts/finetune_commonsense_blocktt.sh
 # CUDA_VISIBLE_DEVICES=3 lr=2e-4 decomp_mode=input_one_block s_merged_to=keep_trainable bash bash_scripts/finetune_commonsense_blocktt.sh
 
+CUDA_VISIBLE_DEVICES=7 lr=2e-4 decomp_mode=output_one_block calib_mode=v2_bp bash bash_scripts/finetune_commonsense_blocktt.sh
+
 
 ### eval
 

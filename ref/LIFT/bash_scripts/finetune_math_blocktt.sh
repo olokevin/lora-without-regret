@@ -35,6 +35,12 @@ lr="${lr:-1e-4}"
 seed="${seed:-43}"
 model_tag="${MODEL##*/}"
 
+# --- calibrated BTT knobs (set calib_mode=v2_bp to enable) ---
+calib_mode="${calib_mode:-none}"
+calib_source="${calib_source:-training_data}"
+calib_num_seqs="${calib_num_seqs:-128}"
+calib_batch_size="${calib_batch_size:-4}"
+
 wandb_project="${wandb_project:-math-${model_tag}}"
 wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())')}"
 
@@ -43,7 +49,7 @@ export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 echo $MODEL
 
-OUTPUT=${OUTPUT_SRC_DIR}/math/${MODEL}/blocktt-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}-rank_${blocktt_rank}-smerge_${s_merged_to}-type_${trainable_type}-seed_${seed}
+OUTPUT=${OUTPUT_SRC_DIR}/math/${MODEL}/blocktt-calib_${calib_mode}-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}-rank_${blocktt_rank}-smerge_${s_merged_to}-type_${trainable_type}-seed_${seed}
 run_name="${run_name:-$(basename "$OUTPUT")}"
 
 mkdir -p $OUTPUT
@@ -75,6 +81,10 @@ accelerate launch \
     --blocktt_rank ${blocktt_rank} \
     --s_merged_to ${s_merged_to} \
     --trainable_type ${trainable_type} \
+    --calib_mode ${calib_mode} \
+    --calib_source ${calib_source} \
+    --calib_num_seqs ${calib_num_seqs} \
+    --calib_batch_size ${calib_batch_size} \
     --load_last_model \
     --data_path ${DATA_DIR}/ft-training_set/math_10k.json \
     --wandb_project "${wandb_project}" \

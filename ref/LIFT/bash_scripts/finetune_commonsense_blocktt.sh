@@ -35,6 +35,12 @@ lr="${lr:-2e-4}"
 seed="${seed:-43}"
 model_tag="${MODEL##*/}"
 
+# --- calibrated BTT knobs (set calib_mode=v2_bp to enable) ---
+calib_mode="${calib_mode:-none}"
+calib_source="${calib_source:-training_data}"
+calib_num_seqs="${calib_num_seqs:-128}"
+calib_batch_size="${calib_batch_size:-4}"
+
 wandb_project="${wandb_project:-commonsense-${model_tag}}"
 wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())')}"
 export WANDB_RUN_ID="${wandb_run_id}"
@@ -42,7 +48,7 @@ export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 echo $MODEL
 
-OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/blocktt-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}_smerge_${s_merged_to}-seed_${seed}
+OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/blocktt-calib_${calib_mode}-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}_smerge_${s_merged_to}-seed_${seed}
 run_name="${run_name:-$(basename "$OUTPUT")}"
 
 mkdir -p $OUTPUT
@@ -74,6 +80,10 @@ accelerate launch \
     --blocktt_rank ${blocktt_rank} \
     --s_merged_to ${s_merged_to} \
     --trainable_type ${trainable_type} \
+    --calib_mode ${calib_mode} \
+    --calib_source ${calib_source} \
+    --calib_num_seqs ${calib_num_seqs} \
+    --calib_batch_size ${calib_batch_size} \
     --save_interval 5000 \
     --val_set_size 120 \
     --eval_step 400 \
@@ -82,7 +92,7 @@ accelerate launch \
     --wandb_run_name "${run_name}" \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
-bash ./bash_scripts/eval_commonsense_blocktt.sh \
+bash ./bash_scripts/eval_commonsense.sh \
     CKPT="$OUTPUT" \
     base_model="${MODEL}" \
     wandb_project="${wandb_project}" \
