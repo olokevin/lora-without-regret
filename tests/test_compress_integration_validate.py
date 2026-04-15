@@ -75,6 +75,32 @@ class TestValidate(unittest.TestCase):
         args = p.parse_args(argv)
         ci.validate_calibrated_btt_args(args, argv=argv, hyphen_style=False)
 
+    def test_abbreviated_calib_flag_with_mode_none_rejected(self):
+        # argparse allows --calib-n as abbreviation of --calib-num-seqs.
+        # The validator must catch this even though argv doesn't contain the
+        # literal '--calib-num-seqs'.
+        p = _make_parser()
+        argv = ["--train-mode", "blocktt", "--calib-n", "64"]
+        args = p.parse_args(argv)
+        with self.assertRaisesRegex(ValueError, "calib-num-seqs"):
+            ci.validate_calibrated_btt_args(args, argv=argv)
+
+    def test_negative_float_rank_rejected(self):
+        p = _make_parser()
+        argv = ["--train-mode", "blocktt", "--calib-mode", "v2",
+                "--calib-source", "c4", "--blocktt-rank", "-0.5"]
+        args = p.parse_args(argv)
+        with self.assertRaisesRegex(ValueError, r"\(0, 1\]"):
+            ci.validate_calibrated_btt_args(args, argv=argv)
+
+    def test_out_of_range_float_rank_rejected(self):
+        p = _make_parser()
+        argv = ["--train-mode", "blocktt", "--calib-mode", "v2",
+                "--calib-source", "c4", "--blocktt-rank", "1.5"]
+        args = p.parse_args(argv)
+        with self.assertRaisesRegex(ValueError, r"\(0, 1\]"):
+            ci.validate_calibrated_btt_args(args, argv=argv)
+
 
 if __name__ == "__main__":
     unittest.main()

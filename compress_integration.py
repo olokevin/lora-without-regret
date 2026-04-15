@@ -93,25 +93,26 @@ def add_calibrated_btt_args(parser, *, hyphen_style: bool = True) -> None:
     )
 
 
-# ---- stubs below; filled in by subsequent tasks ----
+# ---- helpers below; most are stubs filled in by later tasks ----
 
-_CALIB_FLAG_NAMES_HYPHEN = (
-    "--calib-mode", "--calib-source", "--calib-traces-path",
-    "--calib-num-seqs", "--calib-max-length", "--calib-seed",
-    "--calib-batch-size",
-)
-_CALIB_FLAG_NAMES_UNDER = tuple(f.replace("-", "_") for f in _CALIB_FLAG_NAMES_HYPHEN)
-
-
-def _flag_was_passed(argv: Sequence[str], flag: str) -> bool:
-    for tok in argv:
-        if tok == flag or tok.startswith(flag + "="):
-            return True
-    return False
+_CALIB_FLAG_DEFAULTS = {
+    "calib_source": "c4",
+    "calib_traces_path": None,
+    "calib_num_seqs": 128,
+    "calib_max_length": 2048,
+    "calib_seed": 3,
+    "calib_batch_size": 8,
+}
 
 
 def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: bool = True) -> None:
-    """Raise ValueError if the calib-* args are inconsistent with train-mode / blocktt-rank."""
+    """Raise ValueError if the calib-* args are inconsistent with train-mode / blocktt-rank.
+
+    Note: ``argv`` is unused by the current rules but kept in the signature for
+    stability — Task 11 wires ``argv=argv`` from run_sft.py / run_rl.py, and
+    future rules may need it.
+    """
+    del argv  # currently unused; see docstring
     calib_mode = getattr(args, "calib_mode", "none")
     calib_source = getattr(args, "calib_source", "c4")
 
@@ -130,18 +131,24 @@ def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: boo
             flag = "--calib-traces-path" if hyphen_style else "--calib_traces_path"
             raise ValueError(f"{flag} must be set when --calib-source=traces")
 
-    # 3. --calib-mode=none forbids any --calib-* flag being passed explicitly
-    flags = _CALIB_FLAG_NAMES_HYPHEN if hyphen_style else _CALIB_FLAG_NAMES_UNDER
+    # 3. --calib-mode=none forbids any --calib-* flag differing from its default.
+    #    We compare parsed attr values against known defaults rather than
+    #    scanning argv for literal flag tokens, because argparse's default
+    #    allow_abbrev=True lets users pass e.g. --calib-n as an abbreviation
+    #    of --calib-num-seqs, which an argv-prefix scan would miss.
     if calib_mode == "none":
-        passed = [f for f in flags if f != ("--calib-mode" if hyphen_style else "--calib_mode")
-                  and _flag_was_passed(argv, f)]
-        if passed:
+        non_default_flags = []
+        for attr, default in _CALIB_FLAG_DEFAULTS.items():
+            if getattr(args, attr, default) != default:
+                flag = "--" + (attr.replace("_", "-") if hyphen_style else attr)
+                non_default_flags.append(flag)
+        if non_default_flags:
             raise ValueError(
-                f"{', '.join(passed)} requires --calib-mode!=none "
+                f"{', '.join(non_default_flags)} requires --calib-mode!=none "
                 "(got --calib-mode=none)"
             )
 
-    # 4. Integer --blocktt-rank rejected on calibrated path
+    # 4. Integer --blocktt-rank rejected on calibrated path; float must be in (0, 1]
     if calib_mode != "none":
         rank_raw = getattr(args, "blocktt_rank", "full")
         if isinstance(rank_raw, str):
@@ -156,6 +163,17 @@ def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: boo
                         "integer --blocktt-rank is only valid when --calib-mode=none; "
                         "for calibrated BTT pass 'full' or a float in (0, 1]"
                     )
+                # Float rank must be in (0, 1]
+                if "." in rank_raw or "e" in rank_raw.lower():
+                    try:
+                        val = float(rank_raw)
+                    except ValueError:
+                        val = None
+                    if val is not None and not (0.0 < val <= 1.0):
+                        raise ValueError(
+                            "float --blocktt-rank must be in (0, 1] for calibrated BTT "
+                            f"(got {rank_raw!r})"
+                        )
 
 
 def build_decomposition_config(args, *, hyphen_style: bool = True) -> DecompositionConfig:
