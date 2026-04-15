@@ -306,14 +306,58 @@ def build_calib_loader(
     args, *, tokenizer, training_dataset=None, training_collate_fn=None,
     rl_rollout_fn=None, hyphen_style: bool = True,
 ) -> Optional[DataLoader]:
-    raise NotImplementedError("filled in Task 10")
+    calib_mode = getattr(args, "calib_mode", "none")
+    if calib_mode == "none":
+        return None
+
+    source = getattr(args, "calib_source", "c4")
+    num_seqs = int(getattr(args, "calib_num_seqs", 128))
+    max_length = int(getattr(args, "calib_max_length", 2048))
+    seed = int(getattr(args, "calib_seed", 3))
+    batch_size = int(getattr(args, "calib_batch_size", 8))
+
+    if source == "c4":
+        return build_c4_calib_loader(
+            tokenizer, num_seqs=num_seqs, max_length=max_length,
+            batch_size=batch_size, seed=seed,
+        )
+    if source == "traces":
+        return build_traces_jsonl_calib_loader(
+            tokenizer,
+            jsonl_path=getattr(args, "calib_traces_path"),
+            num_seqs=num_seqs, max_length=max_length, batch_size=batch_size,
+        )
+    if source == "training_data":
+        if training_dataset is not None and training_collate_fn is not None:
+            return build_training_data_calib_loader(
+                training_dataset, training_collate_fn,
+                num_seqs=num_seqs, batch_size=batch_size, seed=seed,
+            )
+        if rl_rollout_fn is not None:
+            return build_rl_rollout_calib_loader(
+                rl_rollout_fn=rl_rollout_fn, tokenizer=tokenizer,
+                num_seqs=num_seqs, batch_size=batch_size,
+                max_length=max_length, seed=seed,
+            )
+        raise ValueError(
+            "--calib-source=training_data requires either "
+            "(training_dataset, training_collate_fn) or rl_rollout_fn"
+        )
+    raise ValueError(f"Unknown --calib-source {source!r}")
 
 
 def apply_calibrated_btt(
     model, args, *, calib_loader, device: Optional[str] = None,
     hyphen_style: bool = True,
 ) -> Tuple[nn.Module, dict]:
-    raise NotImplementedError("filled in Task 10")
+    cfg = build_decomposition_config(args, hyphen_style=hyphen_style, model=model)
+    model, stats = decompose_with_loader(
+        model, cfg, calib_loader=calib_loader, device=device,
+        return_trainability_stats=True,
+    )
+    if stats is None or stats.get("num_btt_layers", 0) == 0:
+        raise ValueError("No BTT layers were installed; check --trainable-type selection.")
+    return model, stats
 
 
 def materialize_calibrated_btt_weights(model) -> List[Tuple[str, torch.Tensor]]:
