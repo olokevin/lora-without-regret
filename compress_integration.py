@@ -176,8 +176,70 @@ def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: boo
                         )
 
 
-def build_decomposition_config(args, *, hyphen_style: bool = True) -> DecompositionConfig:
-    raise NotImplementedError("filled in Task 8")
+_BLOCKTT_TARGET_NAMES = {
+    "all": ("gate_proj", "up_proj", "down_proj", "q_proj", "k_proj", "v_proj", "o_proj"),
+    "mlp": ("gate_proj", "up_proj", "down_proj"),
+    "attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+}
+
+
+def _resolve_ratio_from_rank(rank_raw) -> float:
+    """--blocktt-rank on the calibrated path: 'full' -> 1.0; float in (0, 1] -> itself."""
+    if isinstance(rank_raw, str):
+        if rank_raw == "full":
+            return 1.0
+        try:
+            val = float(rank_raw)
+        except ValueError as exc:
+            raise ValueError(f"--blocktt-rank must be 'full' or a float; got {rank_raw!r}") from exc
+    elif isinstance(rank_raw, (int, float)):
+        val = float(rank_raw)
+    else:
+        raise ValueError(f"--blocktt-rank has unsupported type {type(rank_raw).__name__}")
+    if not (0.0 < val <= 1.0):
+        raise ValueError(f"--blocktt-rank float must be in (0, 1]; got {val}")
+    return val
+
+
+def _build_skip_layers(model: nn.Module, trainable_type: str) -> str:
+    """Return comma-separated leaf names to skip, i.e. every nn.Linear leaf whose
+    name is NOT in the trainable_type target set. 'lm_head' is always included."""
+    targets = set(_BLOCKTT_TARGET_NAMES.get(trainable_type, _BLOCKTT_TARGET_NAMES["all"]))
+    skip = {"lm_head"}
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf not in targets:
+            skip.add(leaf)
+    return ",".join(sorted(skip))
+
+
+def build_decomposition_config(args, *, hyphen_style: bool = True, model=None) -> DecompositionConfig:
+    """Translate CLI args to a DecompositionConfig. `model` is required so that
+    --trainable-type can be inverted into a skip_layers list."""
+    if model is None:
+        raise ValueError("build_decomposition_config requires model= for skip_layers inversion")
+
+    train_mode = CALIB_MODE_TO_TRAIN_MODE[getattr(args, "calib_mode")]
+    ratio = _resolve_ratio_from_rank(getattr(args, "blocktt_rank", "full"))
+    trainable_type = getattr(args, "trainable_type", "all")
+    skip_layers = _build_skip_layers(model, trainable_type)
+
+    return DecompositionConfig(
+        train_mode=train_mode,
+        compression_ratio=ratio,
+        calib_source=getattr(args, "calib_source", "c4"),
+        calib_traces_path=getattr(args, "calib_traces_path", None),
+        calib_num_seqs=getattr(args, "calib_num_seqs", 128),
+        calib_max_length=getattr(args, "calib_max_length", 2048),
+        calib_seed=getattr(args, "calib_seed", 3),
+        skip_layers=skip_layers,
+        decomp_mode=getattr(args, "decomp_mode", "square"),
+        train_position=getattr(args, "train_position", "both"),
+        s_merged_to=getattr(args, "s_merged_to", None),
+        factorize_by_head=bool(getattr(args, "blocktt_factorize_by_head", True)),
+    )
 
 
 def build_training_data_calib_loader(
