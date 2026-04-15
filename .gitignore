@@ -12,7 +12,9 @@ wheels/
 runs
 sft/
 wandb/
-tests/
+tests/*
+!tests/*.py
+!tests/__init__.py
 logs/
 analysis_results/
 *.pdf
