@@ -418,7 +418,7 @@ def configure_blocktt_trainability(
 def normalize_trainable_blocktt_cores_(model, eps=1e-12):
     try:
         from compress.btt.btt_linear import BTTLinear as _CompressBTTLinear
-    except Exception:
+    except ImportError:
         _CompressBTTLinear = None
 
     normalized_left = 0
