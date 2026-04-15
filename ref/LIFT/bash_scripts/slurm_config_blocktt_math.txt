@@ -1,0 +1,5 @@
+MODEL                             decomp_mode        train_position  blocktt_rank  s_merged_to  trainable_type  lr    seed
+meta-llama/Llama-3.2-1B           input_one_block    small           full          frozen       all             2e-4  43
+meta-llama/Llama-3.2-3B           input_one_block    small           full          frozen       all             2e-4  43
+meta-llama/Llama-2-7b-hf          input_one_block    small           full          frozen       all             2e-4  43
+meta-llama/Meta-Llama-3-8B        input_one_block    small           full          frozen       all             1e-4  43
