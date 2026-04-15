@@ -26,6 +26,24 @@ class ToyModel(nn.Module):
         return self.fc2(self.fc1(x))
 
 
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(8, 6)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class NestedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = Block()
+
+    def forward(self, x):
+        return self.block(x)
+
+
 class TestCompressTopology(unittest.TestCase):
     def test_export_walks_module_tree(self):
         torch.manual_seed(0)
@@ -52,6 +70,32 @@ class TestCompressTopology(unittest.TestCase):
         fresh.load_state_dict(state)
         x = torch.randn(3, 8)
         self.assertTrue(torch.allclose(fresh(x), model(x), atol=1e-5))
+
+
+    def test_rebuild_handles_dotted_paths(self):
+        torch.manual_seed(2)
+        model = NestedModel()
+        model.block.linear = _make_btt(m=2, a=3, n=2, b=4, rank=2)
+
+        topology = export_btt_topology(model)
+        self.assertIn("block.linear", topology)
+
+        state = {k: v.clone() for k, v in model.state_dict().items()}
+        fresh = NestedModel()
+        rebuild_btt_from_topology(fresh, topology)
+        self.assertIsInstance(fresh.block.linear, BTTLinear)
+        fresh.load_state_dict(state)
+        x = torch.randn(3, 8)
+        self.assertTrue(torch.allclose(fresh(x), model(x), atol=1e-5))
+
+    def test_rebuild_raises_on_missing_attr(self):
+        model = ToyModel()
+        bogus_topology = {"does_not_exist": {
+            "m": 2, "a": 3, "n": 2, "b": 4, "rank": 2,
+            "has_bias": False, "in_features": 8, "out_features": 6,
+        }}
+        with self.assertRaises(ValueError):
+            rebuild_btt_from_topology(model, bogus_topology)
 
 
 if __name__ == "__main__":
