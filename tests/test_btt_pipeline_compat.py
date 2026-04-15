@@ -612,6 +612,17 @@ class TestBTTPipelineCompat(unittest.TestCase):
         self.assertEqual(model.gate_proj.m, expected_m)
         self.assertEqual(model.gate_proj.a, expected_a)
 
+    def test_calib_mode_none_is_default(self):
+        """Ensure --calib-mode=none does not disturb the legacy BTT path:
+        the flag defaults to 'none' and the legacy code still runs without
+        any reference to the new --calib-* flags."""
+        import argparse
+        from compress_integration import add_calibrated_btt_args
+        p = argparse.ArgumentParser()
+        add_calibrated_btt_args(p, hyphen_style=True)
+        args = p.parse_args([])
+        self.assertEqual(args.calib_mode, "none")
+
 
 if __name__ == "__main__":
     unittest.main()

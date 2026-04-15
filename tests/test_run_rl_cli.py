@@ -418,6 +418,27 @@ class TestRunRLCli(unittest.TestCase):
         )
         self.assertTrue(args.stop_after_first_step)
 
+    def test_calib_mode_defaults_to_none(self):
+        import run_rl
+
+        args = run_rl.parse_args(["--train-mode", "blocktt"])
+        self.assertEqual(getattr(args, "calib_mode"), "none")
+
+    def test_calib_mode_v2_parses(self):
+        import run_rl
+
+        args = run_rl.parse_args(
+            [
+                "--train-mode",
+                "blocktt",
+                "--calib-mode",
+                "v2",
+                "--calib-source",
+                "c4",
+            ]
+        )
+        self.assertEqual(args.calib_mode, "v2")
+
 
 class TestRunRLCheckpointing(unittest.TestCase):
     def _run_main(self, base_dir, *, enable_save_ckpt):

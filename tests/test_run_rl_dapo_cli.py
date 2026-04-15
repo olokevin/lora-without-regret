@@ -44,6 +44,23 @@ class TestRunRLDapoCLI(unittest.TestCase):
         self.assertAlmostEqual(args.clip_ratio_low, 0.1)
         self.assertAlmostEqual(args.clip_ratio_high, 0.3)
 
+    def test_calib_mode_defaults_to_none(self):
+        args = run_rl_dapo.parse_args(["--train-mode", "blocktt"])
+        self.assertEqual(getattr(args, "calib_mode"), "none")
+
+    def test_calib_mode_v2_parses(self):
+        args = run_rl_dapo.parse_args(
+            [
+                "--train-mode",
+                "blocktt",
+                "--calib-mode",
+                "v2",
+                "--calib-source",
+                "c4",
+            ]
+        )
+        self.assertEqual(args.calib_mode, "v2")
+
 
 class TestLossMath(unittest.TestCase):
     def test_dapo_loss_uses_asymmetric_clip(self):
