@@ -50,8 +50,8 @@ def _arg_name(name: str, *, hyphen_style: bool) -> str:
     return "--" + (name if hyphen_style else name.replace("-", "_"))
 
 
-def _attr_name(name: str, *, hyphen_style: bool) -> str:
-    return (name if hyphen_style else name).replace("-", "_")
+def _attr_name(name: str) -> str:
+    return name.replace("-", "_")
 
 
 def add_calibrated_btt_args(parser, *, hyphen_style: bool = True) -> None:
@@ -74,18 +74,22 @@ def add_calibrated_btt_args(parser, *, hyphen_style: bool = True) -> None:
     parser.add_argument(
         _arg_name("calib-num-seqs", hyphen_style=hyphen_style),
         type=int, default=128,
+        help="Number of calibration sequences to sample.",
     )
     parser.add_argument(
         _arg_name("calib-max-length", hyphen_style=hyphen_style),
         type=int, default=2048,
+        help="Max token length per calibration sample.",
     )
     parser.add_argument(
         _arg_name("calib-seed", hyphen_style=hyphen_style),
         type=int, default=3,
+        help="RNG seed for calibration sampling.",
     )
     parser.add_argument(
         _arg_name("calib-batch-size", hyphen_style=hyphen_style),
         type=int, default=8,
+        help="Batch size used by the calibration DataLoader.",
     )
 
 
