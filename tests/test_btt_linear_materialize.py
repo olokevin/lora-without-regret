@@ -28,11 +28,15 @@ class TestBTTLinearMaterialize(unittest.TestCase):
             out = out + layer.bias
         self.assertTrue(torch.allclose(out, expected, atol=1e-5))
 
-    def test_materialize_shape_no_bias(self):
+    def test_materialize_matches_forward_no_bias(self):
         torch.manual_seed(1)
         layer = _make_btt(with_bias=False)
+        x = torch.randn(5, layer.in_features)
+        expected = layer(x)
         dense = layer.materialize_dense_weight()
         self.assertEqual(dense.shape, (layer.out_features, layer.in_features))
+        out = x @ dense.T
+        self.assertTrue(torch.allclose(out, expected, atol=1e-5))
 
 
 if __name__ == "__main__":
