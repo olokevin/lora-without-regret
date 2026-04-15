@@ -1,3 +1,4 @@
+import dataclasses
 import os, sys
 import unittest
 
@@ -20,6 +21,22 @@ class TestDecompositionConfigExtraFields(unittest.TestCase):
         )
         self.assertEqual(cfg.s_merged_to, "trainable")
         self.assertFalse(cfg.factorize_by_head)
+
+    def test_asdict_roundtrip(self):
+        cfg = DecompositionConfig(train_mode="btt_llm_v2")
+        d = dataclasses.asdict(cfg)
+        self.assertIn("s_merged_to", d)
+        self.assertIn("factorize_by_head", d)
+        self.assertIsNone(d["s_merged_to"])
+        self.assertTrue(d["factorize_by_head"])
+
+    def test_help_metadata_present(self):
+        cfg = DecompositionConfig(train_mode="btt_llm_v2")
+        fields_by_name = {f.name: f for f in dataclasses.fields(cfg)}
+        self.assertIn("help", fields_by_name["s_merged_to"].metadata)
+        self.assertIn("help", fields_by_name["factorize_by_head"].metadata)
+        self.assertTrue(fields_by_name["s_merged_to"].metadata["help"])
+        self.assertTrue(fields_by_name["factorize_by_head"].metadata["help"])
 
 
 if __name__ == "__main__":
