@@ -426,8 +426,34 @@ def restore_calibrated_btt_weights(model, saved_state) -> None:
 
 
 def save_calibrated_btt_checkpoint(model, out_dir: str) -> None:
-    raise NotImplementedError("filled in Task 17")
+    """Save model.safetensors + btt_topology.json into out_dir."""
+    from safetensors.torch import save_file
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    state = {n: p.detach().cpu().contiguous() for n, p in model.state_dict().items()}
+    save_file(state, os.path.join(out_dir, "model.safetensors"))
+
+    topology = export_btt_topology(model)
+    with open(os.path.join(out_dir, "btt_topology.json"), "w") as f:
+        json.dump(topology, f, indent=2, sort_keys=True)
 
 
 def load_calibrated_btt_for_eval(model, checkpoint_dir: str) -> nn.Module:
-    raise NotImplementedError("filled in Task 17")
+    """Read btt_topology.json, rebuild BTTLinear modules in `model`, load
+    model.safetensors. Returns the mutated model. No calibration pass."""
+    from safetensors.torch import load_file
+
+    topology_path = os.path.join(checkpoint_dir, "btt_topology.json")
+    with open(topology_path) as f:
+        topology = json.load(f)
+
+    rebuild_btt_from_topology(model, topology)
+
+    state = load_file(os.path.join(checkpoint_dir, "model.safetensors"))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected:
+        raise ValueError(f"Unexpected keys in checkpoint: {unexpected[:5]}")
+    # 'missing' is OK: topology only rebuilt BTT paths; other params may have
+    # been loaded from state directly.
+    return model
