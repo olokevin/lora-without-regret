@@ -96,16 +96,6 @@ def add_calibrated_btt_args(parser, *, hyphen_style: bool = True) -> None:
 
 # ---- helpers below; most are stubs filled in by later tasks ----
 
-_CALIB_FLAG_DEFAULTS = {
-    "calib_source": "c4",
-    "calib_traces_path": None,
-    "calib_num_seqs": 128,
-    "calib_max_length": 2048,
-    "calib_seed": 3,
-    "calib_batch_size": 8,
-}
-
-
 def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: bool = True) -> None:
     """Raise ValueError if the calib-* args are inconsistent with train-mode / blocktt-rank.
 
@@ -132,24 +122,7 @@ def validate_calibrated_btt_args(args, *, argv: Sequence[str], hyphen_style: boo
             flag = "--calib-traces-path" if hyphen_style else "--calib_traces_path"
             raise ValueError(f"{flag} must be set when --calib-source=traces")
 
-    # 3. --calib-mode=none forbids any --calib-* flag differing from its default.
-    #    We compare parsed attr values against known defaults rather than
-    #    scanning argv for literal flag tokens, because argparse's default
-    #    allow_abbrev=True lets users pass e.g. --calib-n as an abbreviation
-    #    of --calib-num-seqs, which an argv-prefix scan would miss.
-    if calib_mode == "none":
-        non_default_flags = []
-        for attr, default in _CALIB_FLAG_DEFAULTS.items():
-            if getattr(args, attr, default) != default:
-                flag = "--" + (attr.replace("_", "-") if hyphen_style else attr)
-                non_default_flags.append(flag)
-        if non_default_flags:
-            raise ValueError(
-                f"{', '.join(non_default_flags)} requires --calib-mode!=none "
-                "(got --calib-mode=none)"
-            )
-
-    # 4. Integer --blocktt-rank rejected on calibrated path; float must be in (0, 1]
+    # 3. Integer --blocktt-rank rejected on calibrated path; float must be in (0, 1]
     if calib_mode != "none":
         rank_raw = getattr(args, "blocktt_rank", "full")
         if isinstance(rank_raw, str):

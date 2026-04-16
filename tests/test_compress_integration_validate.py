@@ -53,12 +53,14 @@ class TestValidate(unittest.TestCase):
         args = p.parse_args(argv)
         ci.validate_calibrated_btt_args(args, argv=argv)
 
-    def test_calib_flag_passed_with_mode_none_rejected(self):
+    def test_calib_flag_passed_with_mode_none_accepted(self):
+        # Non-default calib-* flags with --calib-mode=none are ignored, not errored.
+        # Shell scripts pass these unconditionally and we don't want to force them
+        # to branch on calib_mode.
         p = _make_parser()
         argv = ["--train-mode", "blocktt", "--calib-num-seqs", "64"]
         args = p.parse_args(argv)
-        with self.assertRaisesRegex(ValueError, "--calib-mode=none"):
-            ci.validate_calibrated_btt_args(args, argv=argv)
+        ci.validate_calibrated_btt_args(args, argv=argv)
 
     def test_underscore_style_also_works(self):
         p = _make_parser(hyphen_style=False)
@@ -75,15 +77,13 @@ class TestValidate(unittest.TestCase):
         args = p.parse_args(argv)
         ci.validate_calibrated_btt_args(args, argv=argv, hyphen_style=False)
 
-    def test_abbreviated_calib_flag_with_mode_none_rejected(self):
-        # argparse allows --calib-n as abbreviation of --calib-num-seqs.
-        # The validator must catch this even though argv doesn't contain the
-        # literal '--calib-num-seqs'.
+    def test_abbreviated_calib_flag_with_mode_none_accepted(self):
+        # argparse allows --calib-n as abbreviation of --calib-num-seqs;
+        # like the full-spelling case, this is accepted when calib-mode=none.
         p = _make_parser()
         argv = ["--train-mode", "blocktt", "--calib-n", "64"]
         args = p.parse_args(argv)
-        with self.assertRaisesRegex(ValueError, "calib-num-seqs"):
-            ci.validate_calibrated_btt_args(args, argv=argv)
+        ci.validate_calibrated_btt_args(args, argv=argv)
 
     def test_negative_float_rank_rejected(self):
         p = _make_parser()
