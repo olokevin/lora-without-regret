@@ -303,6 +303,10 @@ fi
 
 
 ### shell scripts
+
+# CFG_SUFFIX=""
+# NAME_SUFFIX=""
+
 # DEVICE=4 LR=1e-5 TRAIN_MODE=full bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=0 LR=8e-5 TRAIN_MODE=lora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=0 LR=8e-5 TRAIN_MODE=lora_full LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
@@ -315,6 +319,9 @@ fi
 # CFG_SUFFIX="--enable-save-ckpt"
 
 # DEVICE=1 LR=2e-5 TRAIN_MODE=full CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
-# DEVICE=1 LR=1e-5 TRAIN_MODE=svd TRAIN_POSITION=input S_MERGED_TO=keep CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=1 LR=1e-5 TRAIN_MODE=svd TRAIN_POSITION=input S_MERGED_TO=keep_trainable CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=2 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=frozen CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
-# DEVICE=3 LR=1e-5 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=3 LR=1e-5 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=both S_MERGED_TO=keep_trainable CFG_SUFFIX="--enable-save-ckpt" bash run_rl.sh >/dev/null 2>&1 &
+
+
+# DEVICE=6 LR=1e-5 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=keep_trainable CFG_SUFFIX="--calib-mode=v2_bp --calib-source=training_data --calib-num-seqs=128 --calib-batch-size=4" NAME_SUFFIX="-calib_v2_bp" bash run_rl.sh >/dev/null 2>&1 &

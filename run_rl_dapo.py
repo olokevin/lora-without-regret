@@ -42,6 +42,15 @@ from svd_layer import (
     convert_linear_to_svd,
     get_svd_target_module_names,
 )
+from compress_integration import (
+    add_calibrated_btt_args,
+    validate_calibrated_btt_args,
+    apply_calibrated_btt,
+    build_calib_loader,
+    materialize_calibrated_btt_weights,
+    save_calibrated_btt_hf_pretrained,
+)
+from compress.btt.btt_linear import BTTLinear
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import transformers
@@ -484,6 +493,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 
+    add_calibrated_btt_args(parser, hyphen_style=True)
     return parser.parse_args(argv)
 
 
@@ -597,6 +607,8 @@ def validate_mode_specific_flags(args, argv):
             "use output, input, or split"
         )
 
+    validate_calibrated_btt_args(args, argv=argv, hyphen_style=True)
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -667,6 +679,12 @@ def export_weights_for_vllm(model: torch.nn.Module):
         elif isinstance(module, SVDLayer):
             factorized_module_names.append(module_name)
             dense_weight = materialize_svd_weight(module)
+            weight_tuples.append((f"{module_name}.weight", dense_weight))
+            if module.bias is not None:
+                weight_tuples.append((f"{module_name}.bias", module.bias))
+        elif isinstance(module, BTTLinear):
+            factorized_module_names.append(module_name)
+            dense_weight = module.materialize_dense_weight()
             weight_tuples.append((f"{module_name}.weight", dense_weight))
             if module.bias is not None:
                 weight_tuples.append((f"{module_name}.bias", module.bias))
@@ -969,11 +987,14 @@ def should_save_checkpoint(step_num: int, total_steps: int) -> bool:
     return step_num == 10 or step_num == 30 or step_num == total_steps
 
 
-def save_checkpoint(model, tokenizer, run_dir: str, step_num: int):
+def save_checkpoint(model, tokenizer, run_dir: str, step_num: int, args=None):
     ckpt_dir = os.path.join(run_dir, f"step={step_num}")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Saving checkpoint to {ckpt_dir}")
-    model.save_pretrained(ckpt_dir)
+    if args is not None and getattr(args, "calib_mode", "none") != "none":
+        save_calibrated_btt_hf_pretrained(model, ckpt_dir)
+    else:
+        model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
     print(f"Checkpoint saved to {ckpt_dir}")
 
@@ -1856,44 +1877,82 @@ def main(argv=None):
         model.print_trainable_parameters()
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     elif args.train_mode == "blocktt":
-        decomp_mode_for_convert = (
-            mode_info["decomp_mode_by_module"]
-            if mode_info["decomp_mode_by_module"] is not None
-            else mode_info["decomp_mode"]
-        )
-        converted_modules = convert_linear_to_btt(
-            model,
-            btt_rank=mode_info["blocktt_rank"],
-            decomp_mode=decomp_mode_for_convert,
-            init_mode="default",
-            include_names=mode_info["target_modules"],
-            skip_names=("lm_head",),
-            lr_act=False,
-            s_merged_to=mode_info["s_merged_to"],
-            train_position=mode_info["train_position"],
-            factorize_by_head=mode_info.get("blocktt_factorize_by_head", False),
-            model_config=model.config,
-        )
-        stats = configure_blocktt_trainability(
-            model,
-            train_bias=mode_info["train_bias"],
-            train_position=mode_info["train_position"],
-        )
-        if stats["num_btt_layers"] == 0:
-            raise ValueError(
-                "No layers were converted to BTT; check --trainable-type selection."
+        if getattr(args, "calib_mode", "none") != "none":
+            # Calibrated BTT branch: run rollout on dense base model, then decompose
+            def _rl_calib_rollout(n):
+                from random import Random
+                rng = Random(int(args.calib_seed))
+                indices = list(range(len(train_dataset)))
+                rng.shuffle(indices)
+                pairs = []
+                model.eval()
+                for idx in indices[:n]:
+                    prompt = train_dataset[idx]["prompt"]
+                    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                    with torch.no_grad():
+                        out = model.generate(
+                            **inputs,
+                            max_new_tokens=1024,
+                            temperature=1.0,
+                            do_sample=True,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+                    full = tokenizer.decode(out[0], skip_special_tokens=True)
+                    completion = full[len(prompt):] if full.startswith(prompt) else full
+                    pairs.append((prompt, completion))
+                model.train()
+                return pairs
+
+            calib_loader = build_calib_loader(
+                args,
+                tokenizer=tokenizer,
+                rl_rollout_fn=_rl_calib_rollout,
+                hyphen_style=True,
             )
-        trainable_params = stats["trainable_params"]
-        print(f"Converted modules: {len(converted_modules)}")
-        print(
-            f"Trainable params: {stats['trainable_param_count']:,} / "
-            f"{stats['total_param_count']:,} "
-            f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
-        )
-        print(
-            f"Tuned cores: left={stats['tuned_left_cores']}, "
-            f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
-        )
+            model, calib_stats = apply_calibrated_btt(
+                model, args, calib_loader=calib_loader, hyphen_style=True,
+            )
+            print(f"[calib-btt] installed {calib_stats.get('num_btt_layers', 0)} BTT layers")
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+        else:
+            decomp_mode_for_convert = (
+                mode_info["decomp_mode_by_module"]
+                if mode_info["decomp_mode_by_module"] is not None
+                else mode_info["decomp_mode"]
+            )
+            converted_modules = convert_linear_to_btt(
+                model,
+                btt_rank=mode_info["blocktt_rank"],
+                decomp_mode=decomp_mode_for_convert,
+                init_mode="default",
+                include_names=mode_info["target_modules"],
+                skip_names=("lm_head",),
+                lr_act=False,
+                s_merged_to=mode_info["s_merged_to"],
+                train_position=mode_info["train_position"],
+                factorize_by_head=mode_info.get("blocktt_factorize_by_head", False),
+                model_config=model.config,
+            )
+            stats = configure_blocktt_trainability(
+                model,
+                train_bias=mode_info["train_bias"],
+                train_position=mode_info["train_position"],
+            )
+            if stats["num_btt_layers"] == 0:
+                raise ValueError(
+                    "No layers were converted to BTT; check --trainable-type selection."
+                )
+            trainable_params = stats["trainable_params"]
+            print(f"Converted modules: {len(converted_modules)}")
+            print(
+                f"Trainable params: {stats['trainable_param_count']:,} / "
+                f"{stats['total_param_count']:,} "
+                f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
+            )
+            print(
+                f"Tuned cores: left={stats['tuned_left_cores']}, "
+                f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
+            )
     elif args.train_mode == "svd":
         converted_modules = convert_linear_to_svd(
             model,
@@ -2206,7 +2265,7 @@ def main(argv=None):
         if args.enable_save_ckpt:
             step_num = i + 1
             if should_save_checkpoint(step_num, args.n_grpo_steps):
-                save_checkpoint(model, tokenizer, run_dir, step_num)
+                save_checkpoint(model, tokenizer, run_dir, step_num, args=args)
         if stop_requested:
             break
 

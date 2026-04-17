@@ -3,7 +3,7 @@
 ## Our Runs (`/data/yequan/fura/lift`)
 
 - Source root:`/data/yequan/fura/lift/commonsense/meta-llama/Meta-Llama-3-8B`
-- Metric: task accuracy (`Result` from each`eval.log`), averaged across 8 tasks.
+- Metric: task accuracy (`Result` from each `eval.log`), averaged across 8 tasks.
 - Bold indicates the best value among our runs for that column.
 
 | Run                                              |           BoolQ |            PIQA |            SIQA |       HellaSwag |            Wino |           ARC-e |           ARC-c |            OBQA |             Avg |

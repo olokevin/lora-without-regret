@@ -416,10 +416,23 @@ def configure_blocktt_trainability(
 
 @torch.no_grad()
 def normalize_trainable_blocktt_cores_(model, eps=1e-12):
+    try:
+        from compress.btt.btt_linear import BTTLinear as _CompressBTTLinear
+    except ImportError:
+        _CompressBTTLinear = None
+
     normalized_left = 0
     normalized_right = 0
     for module in model.modules():
-        if not isinstance(module, BTTLayer):
+        if isinstance(module, BTTLayer):
+            matched = True
+        elif _CompressBTTLinear is not None and isinstance(module, _CompressBTTLinear):
+            matched = True
+        else:
+            matched = False
+        if not matched:
+            continue
+        if not (hasattr(module, "btt_l") and hasattr(module, "btt_r")):
             continue
 
         if module.btt_r.requires_grad:

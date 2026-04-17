@@ -27,6 +27,13 @@ from btt_layer import (
     normalize_trainable_blocktt_cores_,
     resolve_blocktt_decomp_modes,
 )
+from compress_integration import (
+    add_calibrated_btt_args,
+    apply_calibrated_btt,
+    build_calib_loader,
+    save_calibrated_btt_hf_pretrained,
+    validate_calibrated_btt_args,
+)
 from datasets import load_dataset
 from optim.muon import Muon
 from peft import LoraConfig, get_peft_model
@@ -278,6 +285,9 @@ def parse_args(argv=None):
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+
+    add_calibrated_btt_args(parser, hyphen_style=True)
+
     return parser.parse_args(argv)
 
 
@@ -383,6 +393,8 @@ def validate_mode_specific_flags(args, argv):
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
             "use output, input, or split"
         )
+
+    validate_calibrated_btt_args(args, argv=argv, hyphen_style=True)
 
 
 def get_lora_target_modules(trainable_type):
@@ -511,7 +523,7 @@ def build_collate_fn(tokenizer):
     return collate_fn
 
 
-def prepare_model(args):
+def prepare_model(args, *, train_dataset=None, collate_fn=None, tokenizer=None):
     require_cuda_for_structured_conversion(args.train_mode, entrypoint="run_sft.py")
 
     model_kwargs = dict(
@@ -526,6 +538,40 @@ def prepare_model(args):
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     mode_info = {}
+
+    if args.train_mode == "blocktt" and getattr(args, "calib_mode", "none") != "none":
+        calib_loader = build_calib_loader(
+            args,
+            tokenizer=tokenizer,
+            training_dataset=train_dataset,
+            training_collate_fn=collate_fn,
+            hyphen_style=True,
+        )
+        model, calib_stats = apply_calibrated_btt(
+            model, args, calib_loader=calib_loader,
+        )
+        print(
+            f"[calib-btt] installed {calib_stats['num_btt_layers']} BTT layers "
+            f"(trainable cores: L={calib_stats['tuned_left_cores']}, "
+            f"R={calib_stats['tuned_right_cores']})"
+        )
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        trainable_named_params = [
+            (n, p) for n, p in model.named_parameters() if p.requires_grad
+        ]
+        mode_info = {
+            "wandb_extra": {
+                "calib_mode": args.calib_mode,
+                "calib_source": args.calib_source,
+                "num_btt_layers": calib_stats["num_btt_layers"],
+            },
+            "print_lines": [
+                f"  Calib mode: {args.calib_mode}",
+                f"  Calib source: {args.calib_source}",
+                f"  BTT layers: {calib_stats['num_btt_layers']}",
+            ],
+        }
+        return model, trainable_params, trainable_named_params, mode_info
 
     if args.train_mode == "full":
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -739,12 +785,15 @@ def create_run_dir(base_dir: str, train_mode: str, run_name: str) -> str:
     return run_dir
 
 
-def save_sft_checkpoint(model, tokenizer, run_dir, step):
+def save_sft_checkpoint(model, tokenizer, run_dir, step, args=None):
     """Save model checkpoint to {run_dir}/step={step}/."""
     ckpt_dir = os.path.join(run_dir, f"step={step}")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Saving checkpoint to {ckpt_dir}")
-    model.save_pretrained(ckpt_dir)
+    if args is not None and getattr(args, "calib_mode", "none") != "none":
+        save_calibrated_btt_hf_pretrained(model, ckpt_dir)
+    else:
+        model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
     print(f"Checkpoint saved to {ckpt_dir}")
 
@@ -867,7 +916,27 @@ def main(argv=None):
     set_seed(args.seed)
 
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps
-    model, trainable_params, trainable_named_params, mode_info = prepare_model(args)
+
+    # Build tokenizer, tokenized training dataset, and collate_fn BEFORE prepare_model
+    # so that calibrated BTT (--calib-mode != none) can reuse the actual training
+    # batches as calibration data.
+    dataset = load_dataset("HuggingFaceH4/no_robots", split="train[:6400]")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    tokenize_function = build_tokenize_function(tokenizer)
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing dataset",
+    )
+    collate_fn = build_collate_fn(tokenizer)
+
+    model, trainable_params, trainable_named_params, mode_info = prepare_model(
+        args,
+        train_dataset=tokenized_dataset,
+        collate_fn=collate_fn,
+        tokenizer=tokenizer,
+    )
     validate_trainable_params(trainable_params)
 
     run_name = compute_run_name(args, mode_info)
@@ -932,19 +1001,7 @@ def main(argv=None):
     print(f"  W&B logging: {'enabled' if use_wandb else 'disabled'}")
     print()
 
-    dataset = load_dataset("HuggingFaceH4/no_robots", split="train[:6400]")
     val_dataset = load_dataset("HuggingFaceH4/no_robots", split="test[:100]")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-
-    tokenize_function = build_tokenize_function(tokenizer)
-
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing dataset",
-    )
-
     tokenized_val_dataset = val_dataset.map(
         tokenize_function,
         batched=True,
@@ -952,7 +1009,6 @@ def main(argv=None):
         desc="Tokenizing dataset",
     )
 
-    collate_fn = build_collate_fn(tokenizer)
     train_dataloader = DataLoader(
         tokenized_dataset,
         batch_size=args.batch_size,
@@ -1038,7 +1094,7 @@ def main(argv=None):
                 global_step += 1
 
                 if args.enable_save_ckpt and global_step in ckpt_save_steps:
-                    save_sft_checkpoint(model, tokenizer, run_dir, global_step)
+                    save_sft_checkpoint(model, tokenizer, run_dir, global_step, args=args)
 
                 if use_wandb:
                     wandb.log(

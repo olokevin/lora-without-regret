@@ -9,6 +9,11 @@ sys.path.insert(
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir))
 )
+# Ensure `compress` (src/compress) is importable alongside the existing repo-root path.
+_LIFT_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir))
+_LIFT_SRC = os.path.join(_LIFT_REPO_ROOT, "src")
+if os.path.isdir(_LIFT_SRC) and _LIFT_SRC not in sys.path:
+    sys.path.insert(0, _LIFT_SRC)
 
 import copy
 import torch
@@ -52,6 +57,14 @@ from btt_layer import (
     get_blocktt_target_module_names,
     normalize_trainable_blocktt_cores_,
     resolve_blocktt_decomp_modes,
+)
+
+from compress_integration import (
+    add_calibrated_btt_args,
+    validate_calibrated_btt_args,
+    apply_calibrated_btt,
+    build_calib_loader,
+    save_calibrated_btt_checkpoint,
 )
 
 
@@ -214,7 +227,10 @@ def parse_args():
         help="Disable Weights & Biases logging.",
     )
 
+    add_calibrated_btt_args(parser, hyphen_style=False)
+
     args = parser.parse_args()
+    validate_calibrated_btt_args(args, argv=sys.argv[1:], hyphen_style=False)
     return args
 
 
@@ -270,60 +286,8 @@ def main():
     model.resize_token_embeddings(int(8 * math.ceil(len(tokenizer) / 8.0)))
     model = model.to(accelerator.device)
 
-    # --- BlockTT conversion ---
-    blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
-    target_modules = get_blocktt_target_module_names(args.trainable_type)
-    train_bias = not args.no_train_bias
-
-    # Resolve decomp mode (may be scalar or per-module dict)
-    decomp_mode, module_decomp_modes = resolve_blocktt_decomp_modes(
-        args.decomp_mode,
-        include_names=target_modules,
-        default_mode="input_one_block",
-    )
-
-    converted_modules = convert_linear_to_btt(
-        model,
-        btt_rank=blocktt_rank,
-        decomp_mode=module_decomp_modes if module_decomp_modes is not None else decomp_mode,
-        init_mode="default",
-        include_names=target_modules,
-        skip_names=("lm_head",),
-        lr_act=False,
-        s_merged_to=args.s_merged_to,
-        train_position=args.train_position,
-        factorize_by_head=args.blocktt_factorize_by_head,
-        model_config=model.config,
-    )
-    stats = configure_blocktt_trainability(
-        model,
-        train_bias=train_bias,
-        train_position=args.train_position,
-        train_singular_values=(args.s_merged_to == "keep_trainable"),
-    )
-    if stats["num_btt_layers"] == 0:
-        raise ValueError("No layers were converted to BTT; check --trainable_type.")
-
-    print(f"Converted modules: {len(converted_modules)}")
-    print(
-        f"Trainable params: {stats['trainable_param_count']:,} / "
-        f"{stats['total_param_count']:,} "
-        f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
-    )
-    print(
-        f"Tuned cores: left={stats['tuned_left_cores']}, "
-        f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
-    )
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"param {name} is trainable")
-
-    if args.gradient_checkpointing:
-        model = make_model_gradient_checkpointing_compatible(model)
-        model.gradient_checkpointing_enable()
-
     # --- Dataset ---
+    # Hoisted above decomposition so calibration can reuse train_dataset/collator.
     if len(args.data_path) == 1 and ".json" in args.data_path[0]:
         train_dataset = SupervisedDataset(
             data_path=args.data_path[0],
@@ -339,19 +303,87 @@ def main():
     else:
         raise ValueError("Only json format is supported for now.")
 
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.per_device_train_batch_size,
         shuffle=True,
-        collate_fn=DataCollatorForSupervisedDataset(tokenizer=tokenizer),
+        collate_fn=data_collator,
     )
     if args.val_set_size > 0:
         eval_dataloader = DataLoader(
             eval_dataset,
             batch_size=args.per_device_eval_batch_size,
             shuffle=False,
-            collate_fn=DataCollatorForSupervisedDataset(tokenizer=tokenizer),
+            collate_fn=data_collator,
         )
+
+    # --- BlockTT conversion ---
+    if getattr(args, "calib_mode", "none") != "none":
+        calib_loader = build_calib_loader(
+            args,
+            tokenizer=tokenizer,
+            training_dataset=train_dataset,
+            training_collate_fn=data_collator,
+            hyphen_style=False,
+        )
+        model, calib_stats = apply_calibrated_btt(
+            model, args, calib_loader=calib_loader, hyphen_style=False,
+        )
+        print(f"[calib-btt] installed {calib_stats['num_btt_layers']} BTT layers")
+    else:
+        blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
+        target_modules = get_blocktt_target_module_names(args.trainable_type)
+        train_bias = not args.no_train_bias
+
+        # Resolve decomp mode (may be scalar or per-module dict)
+        decomp_mode, module_decomp_modes = resolve_blocktt_decomp_modes(
+            args.decomp_mode,
+            include_names=target_modules,
+            default_mode="input_one_block",
+        )
+
+        converted_modules = convert_linear_to_btt(
+            model,
+            btt_rank=blocktt_rank,
+            decomp_mode=module_decomp_modes if module_decomp_modes is not None else decomp_mode,
+            init_mode="default",
+            include_names=target_modules,
+            skip_names=("lm_head",),
+            lr_act=False,
+            s_merged_to=args.s_merged_to,
+            train_position=args.train_position,
+            factorize_by_head=args.blocktt_factorize_by_head,
+            model_config=model.config,
+        )
+        stats = configure_blocktt_trainability(
+            model,
+            train_bias=train_bias,
+            train_position=args.train_position,
+            train_singular_values=(args.s_merged_to == "keep_trainable"),
+        )
+        if stats["num_btt_layers"] == 0:
+            raise ValueError("No layers were converted to BTT; check --trainable_type.")
+
+        print(f"Converted modules: {len(converted_modules)}")
+        print(
+            f"Trainable params: {stats['trainable_param_count']:,} / "
+            f"{stats['total_param_count']:,} "
+            f"({100 * stats['trainable_param_count'] / stats['total_param_count']:.4f}%)"
+        )
+        print(
+            f"Tuned cores: left={stats['tuned_left_cores']}, "
+            f"right={stats['tuned_right_cores']}, biases={stats['tuned_biases']}"
+        )
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"param {name} is trainable")
+
+    if args.gradient_checkpointing:
+        model = make_model_gradient_checkpointing_compatible(model)
+        model.gradient_checkpointing_enable()
 
     # --- Optimizer: standard AdamW on trainable TT cores ---
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -499,8 +531,11 @@ def main():
     if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
-        materialize_btt_to_linear(unwrapped_model)
-        save_hf_format(unwrapped_model, tokenizer, args)
+        if getattr(args, "calib_mode", "none") != "none":
+            save_calibrated_btt_checkpoint(unwrapped_model, args.output_dir, tokenizer)
+        else:
+            materialize_btt_to_linear(unwrapped_model)
+            save_hf_format(unwrapped_model, tokenizer, args)
 
     if args.output_dir is not None:
         # Evaluate last model
@@ -516,8 +551,11 @@ def main():
                     best_model = copy.deepcopy(model.module).to("cpu")
 
         model = best_model if best_model is not None else model
-        materialize_btt_to_linear(model)
-        save_hf_format(model, tokenizer, args)
+        if getattr(args, "calib_mode", "none") != "none":
+            save_calibrated_btt_checkpoint(model, args.output_dir, tokenizer)
+        else:
+            materialize_btt_to_linear(model)
+            save_hf_format(model, tokenizer, args)
 
     if use_wandb:
         accelerator.end_training()

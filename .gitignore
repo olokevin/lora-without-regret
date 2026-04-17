@@ -12,7 +12,9 @@ wheels/
 runs
 sft/
 wandb/
-tests/
+tests/*
+!tests/*.py
+!tests/__init__.py
 logs/
 analysis_results/
 *.pdf
@@ -22,6 +24,10 @@ deberta_tune/
 mistral_tune/
 adapter_efficiency/
 
+docs/26_nips_fura_paper
+docs/26_neurips_fura_paper
+
+ref/spectral_adapter/llama3_tune/lm-evaluation-harness/tests/*
 ref/LIFT/LLM-Adapters/
 
 *.safetensors
