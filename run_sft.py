@@ -31,7 +31,7 @@ from compress_integration import (
     add_calibrated_btt_args,
     apply_calibrated_btt,
     build_calib_loader,
-    save_calibrated_btt_checkpoint,
+    save_calibrated_btt_hf_pretrained,
     validate_calibrated_btt_args,
 )
 from datasets import load_dataset
@@ -791,7 +791,7 @@ def save_sft_checkpoint(model, tokenizer, run_dir, step, args=None):
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Saving checkpoint to {ckpt_dir}")
     if args is not None and getattr(args, "calib_mode", "none") != "none":
-        save_calibrated_btt_checkpoint(model, ckpt_dir)
+        save_calibrated_btt_hf_pretrained(model, ckpt_dir)
     else:
         model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)

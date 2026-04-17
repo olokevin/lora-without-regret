@@ -532,7 +532,7 @@ def main():
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         if getattr(args, "calib_mode", "none") != "none":
-            save_calibrated_btt_checkpoint(unwrapped_model, args.output_dir)
+            save_calibrated_btt_checkpoint(unwrapped_model, args.output_dir, tokenizer)
         else:
             materialize_btt_to_linear(unwrapped_model)
             save_hf_format(unwrapped_model, tokenizer, args)
@@ -552,7 +552,7 @@ def main():
 
         model = best_model if best_model is not None else model
         if getattr(args, "calib_mode", "none") != "none":
-            save_calibrated_btt_checkpoint(model, args.output_dir)
+            save_calibrated_btt_checkpoint(model, args.output_dir, tokenizer)
         else:
             materialize_btt_to_linear(model)
             save_hf_format(model, tokenizer, args)

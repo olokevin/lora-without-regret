@@ -47,7 +47,7 @@ from compress_integration import (
     apply_calibrated_btt,
     build_calib_loader,
     materialize_calibrated_btt_weights,
-    save_calibrated_btt_checkpoint,
+    save_calibrated_btt_hf_pretrained,
 )
 from compress.btt.btt_linear import BTTLinear
 from torch.optim.lr_scheduler import LambdaLR
@@ -683,11 +683,9 @@ def save_checkpoint(model, tokenizer, run_dir: str, step_num: int, args=None):
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Saving checkpoint to {ckpt_dir}")
     if args is not None and getattr(args, "calib_mode", "none") != "none":
-        save_calibrated_btt_checkpoint(model, ckpt_dir)
-        tokenizer.save_pretrained(ckpt_dir)
-        print(f"Checkpoint saved to {ckpt_dir}")
-        return
-    model.save_pretrained(ckpt_dir)
+        save_calibrated_btt_hf_pretrained(model, ckpt_dir)
+    else:
+        model.save_pretrained(ckpt_dir)
     tokenizer.save_pretrained(ckpt_dir)
     print(f"Checkpoint saved to {ckpt_dir}")
 

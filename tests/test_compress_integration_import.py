@@ -23,7 +23,9 @@ class TestCompressIntegrationImport(unittest.TestCase):
             "materialize_calibrated_btt_weights",
             "restore_calibrated_btt_weights",
             "save_calibrated_btt_checkpoint",
+            "save_calibrated_btt_hf_pretrained",
             "load_calibrated_btt_for_eval",
+            "materialize_calibrated_btt_to_linear",
         ]
         for n in names:
             self.assertTrue(hasattr(ci, n), f"missing {n}")

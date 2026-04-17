@@ -398,18 +398,63 @@ def restore_calibrated_btt_weights(model, saved_state) -> None:
     return None
 
 
-def save_calibrated_btt_checkpoint(model, out_dir: str) -> None:
-    """Save model.safetensors + btt_topology.json into out_dir."""
-    from safetensors.torch import save_file
+@torch.no_grad()
+def materialize_calibrated_btt_to_linear(model: nn.Module) -> nn.Module:
+    """In-place: replace every BTTLinear in `model` with an nn.Linear whose
+    weight is the materialized dense equivalent. Mirrors the legacy
+    `materialize_btt_to_linear` in ref/LIFT/src/finetune_blocktt.py but for
+    the `compress` package's BTTLinear."""
+    replacements = [(n, m) for n, m in model.named_modules() if isinstance(m, BTTLinear)]
+    for name, btt in replacements:
+        dense = btt.materialize_dense_weight()
+        linear = nn.Linear(
+            btt.in_features,
+            btt.out_features,
+            bias=btt.bias is not None,
+            device=dense.device,
+            dtype=dense.dtype,
+        )
+        linear.weight.data.copy_(dense)
+        if btt.bias is not None:
+            linear.bias.data.copy_(btt.bias.data)
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], linear)
+    return model
 
+
+def save_calibrated_btt_checkpoint(model, out_dir: str, tokenizer=None) -> None:
+    """LIFT legacy HF format: materialize BTTLinear -> nn.Linear, then write
+    exactly `pytorch_model.bin` + `config.json`. Byte-for-byte identical
+    to `ref/LIFT/src/utils/model_utils.py:save_hf_format`, so a converted
+    calib checkpoint is indistinguishable from a non-calib blocktt one.
+
+    `tokenizer` is accepted for signature symmetry with non-calib callers
+    but intentionally not written — `save_hf_format` does not save the
+    tokenizer either, and LIFT eval loads it from `base_model`.
+    """
+    del tokenizer  # unused; signature kept for symmetry
     os.makedirs(out_dir, exist_ok=True)
+    materialize_calibrated_btt_to_linear(model)
+    torch.save(model.state_dict(), os.path.join(out_dir, "pytorch_model.bin"))
+    model.config.to_json_file(os.path.join(out_dir, "config.json"))
 
-    state = {n: p.detach().cpu().contiguous() for n, p in model.state_dict().items()}
-    save_file(state, os.path.join(out_dir, "model.safetensors"))
 
-    topology = export_btt_topology(model)
-    with open(os.path.join(out_dir, "btt_topology.json"), "w") as f:
-        json.dump(topology, f, indent=2, sort_keys=True)
+def save_calibrated_btt_hf_pretrained(model, out_dir: str) -> None:
+    """run_sft / run_rl / run_rl_dapo format: materialize BTTLinear ->
+    nn.Linear, then `model.save_pretrained(out_dir)`. Byte-for-byte
+    identical to the non-calib branch of those scripts, which also just
+    call `model.save_pretrained(ckpt_dir)`.
+
+    Does NOT save the tokenizer; callers in run_* already invoke
+    `tokenizer.save_pretrained(ckpt_dir)` once, outside the calib/non-calib
+    branch, so both branches produce the same on-disk file set.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    materialize_calibrated_btt_to_linear(model)
+    model.save_pretrained(out_dir)
 
 
 def load_calibrated_btt_for_eval(model, checkpoint_dir: str) -> nn.Module:
