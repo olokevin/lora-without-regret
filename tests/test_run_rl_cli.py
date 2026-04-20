@@ -118,7 +118,9 @@ class TestRunRLCli(unittest.TestCase):
     def test_accept_lora_flags_for_lora_full_mode(self):
         import run_rl
 
-        argv = ["--train-mode", "lora_full", "--lora-rank", "4", "--vllm-url", "http://localhost:8000"]
+        # Note: --vllm-url is NOT passed because lora_full always uses
+        # local_inproc rollout and the validator now correctly rejects it.
+        argv = ["--train-mode", "lora_full", "--lora-rank", "4"]
         args = run_rl.parse_args(argv)
         run_rl.validate_mode_specific_flags(args, argv)
 
