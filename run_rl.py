@@ -962,7 +962,8 @@ def build_lora_http_generators(args, model, run_dir):
         loaded_loras.append(lora_name)
 
     def save_lora(step):
-        lora_name = f"{run_dir}/step={step}"
+        lora_name = f"{run_dir}/lora_adapters/step={step}"
+        os.makedirs(os.path.dirname(lora_name), exist_ok=True)
         if not os.path.exists(lora_name):
             model.save_pretrained(lora_name)
         return lora_name
