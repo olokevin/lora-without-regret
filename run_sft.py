@@ -523,6 +523,47 @@ def build_collate_fn(tokenizer):
     return collate_fn
 
 
+@torch.no_grad()
+def apply_milora_init_(peft_model, *, rank: int) -> None:
+    """In-place MiLoRA initialization.
+
+    For each LoRA-targeted nn.Linear, performs SVD on the base weight,
+    uses the BOTTOM-r singular components to populate lora_A and lora_B,
+    and replaces the base weight with the top-(n-r) residual.
+    """
+    from peft.tuners.lora import LoraLayer
+    first_check = True
+    for _name, module in peft_model.named_modules():
+        if not isinstance(module, LoraLayer):
+            continue
+        base = module.get_base_layer()
+        W = base.weight.data.detach().clone().float()
+        dtype, device = base.weight.data.dtype, base.weight.data.device
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        r = rank
+        U_r, S_r, Vh_r = U[:, -r:], S[-r:], Vh[-r:, :]
+        sqrt_S = S_r.sqrt()
+        adapter_name = list(module.lora_A.keys())[0]
+        alpha = module.lora_alpha[adapter_name]
+        scale_correction = (r / alpha) ** 0.5
+        lora_A = (sqrt_S.unsqueeze(1) * Vh_r) * scale_correction      # (r, in)
+        lora_B = (U_r * sqrt_S.unsqueeze(0)) * scale_correction       # (out, r)
+        residual = W - U_r @ torch.diag(S_r) @ Vh_r
+        module.lora_A[adapter_name].weight.data.copy_(lora_A.to(dtype=dtype, device=device))
+        module.lora_B[adapter_name].weight.data.copy_(lora_B.to(dtype=dtype, device=device))
+        base.weight.data.copy_(residual.to(dtype=dtype, device=device))
+        if first_check:
+            reconstructed = (alpha / r) * lora_B @ lora_A + residual
+            rel_err = (
+                torch.linalg.norm(reconstructed - W)
+                / torch.linalg.norm(W)
+            )
+            assert rel_err < 1e-3, (
+                f"MiLoRA init reconstruction error too high: {rel_err:.2e}"
+            )
+            first_check = False
+
+
 def prepare_model(args, *, train_dataset=None, collate_fn=None, tokenizer=None):
     require_cuda_for_structured_conversion(args.train_mode, entrypoint="run_sft.py")
 
