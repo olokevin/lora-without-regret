@@ -602,7 +602,8 @@ def validate_mode_specific_flags(args, argv):
             f"--math-verify-max-tokens must be > 0, got {args.math_verify_max_tokens}"
         )
 
-    if args.enable_math_verify and not args.enable_merged_ckpt and args.train_mode != "full":
+    if (args.enable_math_verify and not args.enable_merged_ckpt
+            and args.train_mode not in {"full", "lift"}):
         import sys as _sys
 
         print(
@@ -972,7 +973,12 @@ def is_vllm_http_available(vllm_url: str, timeout_sec: float = 2.0) -> bool:
 def resolve_lora_rollout_backend(train_mode: str, vllm_url: str) -> str | None:
     if train_mode == "lora_full":
         return "local_inproc"
-    if train_mode == "lora":
+    if train_mode in {"pissa", "milora"}:
+        # PiSSA/MiLoRA modify the base weight at init; the running vLLM HTTP
+        # server is out of sync. Force local in-process rollout so we
+        # merge_adapter() and push the materialized dense weights into vLLM.
+        return "local_inproc"
+    if train_mode in {"lora", "dora", "randlora"}:
         return "http" if is_vllm_http_available(vllm_url) else "local_inproc"
     return None
 
@@ -985,6 +991,9 @@ def normalize_lora_merged_weight_name(name: str) -> str | None:
         ".lora_embedding_A.",
         ".lora_embedding_B.",
         ".lora_magnitude_vector",
+        ".randlora_lambda",
+        ".randlora_gamma",
+        ".randlora_m",
     )
     if any(marker in name for marker in lora_markers):
         return None
