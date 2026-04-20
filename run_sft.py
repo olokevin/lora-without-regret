@@ -710,6 +710,119 @@ def prepare_model(args, *, train_dataset=None, collate_fn=None, tokenizer=None):
             f"  Target modules: {target_modules}",
         ]
 
+    elif args.train_mode == "dora":
+        target_modules = get_lora_target_modules(args.trainable_type)
+        peft_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=32,
+            target_modules=target_modules,
+            use_dora=True,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        mode_info["wandb_extra"] = {
+            "lora_rank": args.lora_rank, "lora_alpha": 32,
+            "trainable_type": args.trainable_type, "target_modules": target_modules,
+            "use_dora": True,
+        }
+        mode_info["print_lines"] = [
+            f"  DoRA rank: {args.lora_rank}",
+            f"  Trainable type: {args.trainable_type}",
+            f"  Target modules: {target_modules}",
+        ]
+
+    elif args.train_mode == "pissa":
+        target_modules = get_lora_target_modules(args.trainable_type)
+        peft_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=32,
+            target_modules=target_modules,
+            init_lora_weights="pissa_niter_4",
+            lora_dropout=0,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        mode_info["wandb_extra"] = {
+            "lora_rank": args.lora_rank, "lora_alpha": 32,
+            "trainable_type": args.trainable_type, "target_modules": target_modules,
+            "init_lora_weights": "pissa_niter_4",
+        }
+        mode_info["print_lines"] = [
+            f"  PiSSA rank: {args.lora_rank}",
+            f"  Trainable type: {args.trainable_type}",
+            f"  Target modules: {target_modules}",
+        ]
+
+    elif args.train_mode == "milora":
+        target_modules = get_lora_target_modules(args.trainable_type)
+        peft_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=32,
+            target_modules=target_modules,
+            lora_dropout=0,
+        )
+        model = get_peft_model(model, peft_config)
+        apply_milora_init_(model, rank=args.lora_rank)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        mode_info["wandb_extra"] = {
+            "lora_rank": args.lora_rank, "lora_alpha": 32,
+            "trainable_type": args.trainable_type, "target_modules": target_modules,
+            "init_lora_weights": "milora",
+        }
+        mode_info["print_lines"] = [
+            f"  MiLoRA rank: {args.lora_rank}",
+            f"  Trainable type: {args.trainable_type}",
+            f"  Target modules: {target_modules}",
+        ]
+
+    elif args.train_mode == "randlora":
+        from peft import RandLoraConfig
+        target_modules = get_lora_target_modules(args.trainable_type)
+        peft_config = RandLoraConfig(
+            r=args.lora_rank,
+            randlora_alpha=32,
+            target_modules=target_modules,
+            projection_prng_key=args.randlora_projection_prng_key,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        mode_info["wandb_extra"] = {
+            "randlora_rank": args.lora_rank, "randlora_alpha": 32,
+            "trainable_type": args.trainable_type, "target_modules": target_modules,
+            "projection_prng_key": args.randlora_projection_prng_key,
+        }
+        mode_info["print_lines"] = [
+            f"  RandLoRA rank: {args.lora_rank}",
+            f"  RandLoRA prng key: {args.randlora_projection_prng_key}",
+            f"  Trainable type: {args.trainable_type}",
+            f"  Target modules: {target_modules}",
+        ]
+
+    elif args.train_mode == "lift":
+        # Dense model, no PEFT wrapping. All params trainable.
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        trainable_count = sum(p.numel() for p in trainable_params)
+        total_count = sum(p.numel() for p in model.parameters())
+        print(
+            f"Trainable params: {trainable_count:,} || All params: {total_count:,} || "
+            f"Trainable%: {100 * trainable_count / total_count:.2f}"
+        )
+        mode_info["wandb_extra"] = {
+            "lift_lora_rank": args.lift_lora_rank,
+            "lift_filter_rank": args.lift_filter_rank,
+            "lift_update_interval": args.lift_update_interval,
+        }
+        mode_info["print_lines"] = [
+            f"  LIFT lora_rank: {args.lift_lora_rank}",
+            f"  LIFT filter_rank: {args.lift_filter_rank}",
+            f"  LIFT update_interval: {args.lift_update_interval}",
+        ]
+        args._lift_model = model
+
     elif args.train_mode == "blocktt":
         blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
         target_modules = get_blocktt_target_module_names(args.trainable_type)
@@ -875,6 +988,19 @@ def compute_run_name(args, mode_info: dict) -> str:
         return f"{args.model_id}_{args.lr:.1e}_full"
     if args.train_mode == "lora":
         return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
+    if args.train_mode == "dora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_dora"
+    if args.train_mode == "pissa":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_pissa"
+    if args.train_mode == "milora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_milora"
+    if args.train_mode == "randlora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_randlora"
+    if args.train_mode == "lift":
+        return (
+            f"{args.model_id}_{args.lr:.1e}_r{args.lift_lora_rank}"
+            f"_int{args.lift_update_interval}_lift"
+        )
     if args.train_mode == "blocktt":
         decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
         return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
