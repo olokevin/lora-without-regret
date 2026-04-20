@@ -988,7 +988,7 @@ def build_lora_http_generators(args, model, run_dir):
             responses_per_prompt=1,
         )
 
-    return generate_for_train, generate_for_eval
+    return generate_for_train, generate_for_eval, None
 
 
 def build_lora_local_generators(args, model):
@@ -1054,7 +1054,7 @@ def build_lora_local_generators(args, model):
     def generate_for_eval(prompts: list[str], _step: int):
         return generate(prompts, temperature=0, responses_per_prompt=1)
 
-    return generate_for_train, generate_for_eval
+    return generate_for_train, generate_for_eval, vllm_model
 
 
 def build_local_vllm_generators(args, model):
@@ -1099,7 +1099,7 @@ def build_local_vllm_generators(args, model):
     def generate_for_eval(prompts: list[str], _step: int):
         return generate(prompts, temperature=0, responses_per_prompt=1)
 
-    return generate_for_train, generate_for_eval
+    return generate_for_train, generate_for_eval, vllm_model
 
 
 def validate_trainable_params(trainable_params):
@@ -1583,18 +1583,20 @@ def main(argv=None):
 
     if args.train_mode in {"lora", "lora_full"}:
         if lora_rollout_backend == "http":
-            generate_for_train, generate_for_eval = build_lora_http_generators(
+            generate_for_train, generate_for_eval, in_process_llm = build_lora_http_generators(
                 args,
                 model,
                 run_dir,
             )
         else:
-            generate_for_train, generate_for_eval = build_lora_local_generators(
+            generate_for_train, generate_for_eval, in_process_llm = build_lora_local_generators(
                 args,
                 model,
             )
     else:
-        generate_for_train, generate_for_eval = build_local_vllm_generators(args, model)
+        generate_for_train, generate_for_eval, in_process_llm = build_local_vllm_generators(
+            args, model,
+        )
 
     optimizer = build_optimizer(args, trainable_params, trainable_named_params)
     if args.optimizer == "muon":
@@ -1848,6 +1850,114 @@ def main(argv=None):
 
     if not args.enable_save_ckpt:
         print("Checkpoint saving disabled (--enable-save-ckpt not set).")
+
+    # ─── Final merged-checkpoint save ──────────────────────────────────────
+    final_step = args.n_grpo_steps
+    final_ckpt_dir = None
+    if args.enable_merged_ckpt or args.enable_math_verify:
+        final_ckpt_dir = os.path.join(run_dir, f"step={final_step}")
+        os.makedirs(final_ckpt_dir, exist_ok=True)
+        if args.enable_merged_ckpt:
+            print(f"Saving final merged checkpoint to {final_ckpt_dir}")
+            save_merged_checkpoint(
+                model, tokenizer, final_ckpt_dir, args.train_mode, args
+            )
+
+    # ─── Post-training math-verify eval ────────────────────────────────────
+    if args.enable_math_verify:
+        import json as _json
+        from math_verify_eval import math_verify_eval as _math_verify_eval
+
+        try:
+            if in_process_llm is not None:
+                # Reuse the in-memory model + existing vLLM via hot-swap.
+                if args.train_mode in {"blocktt", "svd"}:
+                    weight_tuples = export_weights_for_vllm(model)
+                elif args.train_mode in {"lora", "lora_full"}:
+                    model.merge_adapter()
+                    try:
+                        base = model.get_base_model()
+                        weight_tuples = []
+                        seen = set()
+                        for name, p in base.named_parameters():
+                            normalized = normalize_lora_merged_weight_name(name)
+                            if normalized is None or normalized in seen:
+                                continue
+                            seen.add(normalized)
+                            weight_tuples.append((normalized, p))
+                        in_process_llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
+                            weight_tuples
+                        )
+                    finally:
+                        model.unmerge_adapter()
+                    weight_tuples = None  # already loaded
+                else:
+                    weight_tuples = [(n, p) for n, p in model.named_parameters()]
+
+                if weight_tuples is not None:
+                    in_process_llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
+                        weight_tuples
+                    )
+
+                results = _math_verify_eval(
+                    model=None,
+                    tokenizer=tokenizer,
+                    datasets=args.math_verify_datasets,
+                    n_samples_override=args.math_verify_n_samples,
+                    temperature_override=args.math_verify_temperature,
+                    max_tokens=args.math_verify_max_tokens,
+                    prompt_template_path=args.prompt_template,
+                    vllm_kwargs={"llm": in_process_llm},
+                )
+            else:
+                # HTTP-lora training: spin up a fresh in-process LLM from disk.
+                if final_ckpt_dir is None:
+                    raise RuntimeError(
+                        "math-verify eval requires either an in-process LLM "
+                        "or --enable-merged-ckpt for a saved checkpoint to load."
+                    )
+                results = _math_verify_eval(
+                    model=None,
+                    tokenizer=tokenizer,
+                    datasets=args.math_verify_datasets,
+                    n_samples_override=args.math_verify_n_samples,
+                    temperature_override=args.math_verify_temperature,
+                    max_tokens=args.math_verify_max_tokens,
+                    prompt_template_path=args.prompt_template,
+                    vllm_kwargs={
+                        "model": final_ckpt_dir,
+                        "tensor_parallel_size": 1,
+                        "gpu_memory_utilization": args.gpu_memory_utilization,
+                        "max_model_len": args.max_model_len,
+                        "max_num_batched_tokens": 4096,
+                    },
+                )
+
+            results["checkpoint"] = final_ckpt_dir or "<in-memory>"
+            results["model_id_at_train_time"] = args.model_id
+
+            if final_ckpt_dir is not None:
+                results_path = os.path.join(final_ckpt_dir, "eval_results.json")
+                with open(results_path, "w", encoding="utf-8") as f:
+                    _json.dump(results, f, indent=2)
+                print(f"Wrote {results_path}")
+
+            if not args.no_wandb:
+                for ds_name, ds_result in results["datasets"].items():
+                    wandb.log({f"eval/{ds_name}/accuracy": ds_result["accuracy"]})
+                for ds_name, reason in results.get("errors", {}).items():
+                    wandb.log({f"eval/{ds_name}/error": reason})
+
+            print("Math-verify results:")
+            for ds_name, ds_result in results["datasets"].items():
+                print(
+                    f"  {ds_name}: {ds_result['accuracy']:.2%} "
+                    f"({ds_result['n_correct']}/{ds_result['n_total']})"
+                )
+        except Exception as exc:
+            print(f"ERROR: math-verify eval failed: {exc!r}")
+            if not args.no_wandb:
+                wandb.log({"eval/error": repr(exc)})
 
     if not args.no_wandb:
         wandb.finish()

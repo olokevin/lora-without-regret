@@ -75,7 +75,7 @@ def _build_fake_generators(args, _model):
     def generate_for_eval(prompts, _step):
         return [r"\boxed{1}"] * len(prompts)
 
-    return generate_for_train, generate_for_eval
+    return generate_for_train, generate_for_eval, None
 
 
 class TestRunRLCli(unittest.TestCase):
@@ -470,6 +470,8 @@ class TestRunRLCheckpointing(unittest.TestCase):
             "1",
             "--gradient-accumulation-steps",
             "1",
+            "--no-enable-math-verify",
+            "--no-enable-merged-ckpt",
         ]
         if enable_save_ckpt:
             argv.append("--enable-save-ckpt")
