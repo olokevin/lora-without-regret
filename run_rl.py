@@ -516,26 +516,61 @@ def _flag_was_passed(argv, flag_name):
 
 
 def validate_mode_specific_flags(args, argv):
+    LORA_FAMILY = {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}
+    LORA_HTTP_OK = {"lora", "dora", "randlora"}  # vllm-url valid for these only
+
     mode_to_flag_sets = {
-        "lora": ["--lora-rank", "--vllm-url"],
+        "lora_family_shared":   ["--lora-rank"],
+        "lora_http":            ["--vllm-url"],
+        "randlora":             ["--randlora-projection-prng-key"],
+        "lift":                 ["--lift-lora-rank", "--lift-filter-rank",
+                                 "--lift-update-interval"],
         "blocktt": [
-            "--decomp-mode",
-            "--blocktt-rank",
-            "--no-train-bias",
+            "--decomp-mode", "--blocktt-rank", "--no-train-bias",
             "--blocktt-normalize-after-update",
-            "--blocktt-factorize-by-head",
-            "--no-blocktt-factorize-by-head",
+            "--blocktt-factorize-by-head", "--no-blocktt-factorize-by-head",
         ],
         "svd": [],
     }
 
-    if args.train_mode not in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
-        passed = [f for f in mode_to_flag_sets["lora"] if _flag_was_passed(argv, f)]
+    # --lora-rank is only valid for the lora family
+    if args.train_mode not in LORA_FAMILY:
+        passed = [f for f in mode_to_flag_sets["lora_family_shared"] if _flag_was_passed(argv, f)]
         if passed:
             raise ValueError(
-                f"{', '.join(passed)} is only valid when --train-mode lora or lora_full"
+                f"{', '.join(passed)} is only valid when --train-mode is one of: "
+                f"{sorted(LORA_FAMILY)}"
             )
 
+    # --vllm-url is only valid for lora/dora/randlora
+    if args.train_mode not in LORA_HTTP_OK:
+        passed = [f for f in mode_to_flag_sets["lora_http"] if _flag_was_passed(argv, f)]
+        if passed:
+            raise ValueError(
+                f"{', '.join(passed)} is only valid when --train-mode is one of: "
+                f"{sorted(LORA_HTTP_OK)}"
+            )
+
+    # --randlora-projection-prng-key is randlora-only
+    if args.train_mode != "randlora":
+        passed = [f for f in mode_to_flag_sets["randlora"] if _flag_was_passed(argv, f)]
+        if passed:
+            raise ValueError(f"{', '.join(passed)} is only valid when --train-mode randlora")
+
+    # --lift-* is lift-only
+    if args.train_mode != "lift":
+        passed = [f for f in mode_to_flag_sets["lift"] if _flag_was_passed(argv, f)]
+        if passed:
+            raise ValueError(f"{', '.join(passed)} is only valid when --train-mode lift")
+
+    # --optimizer muon is incompatible with lift
+    if args.train_mode == "lift" and args.optimizer == "muon":
+        raise ValueError(
+            "--optimizer muon is incompatible with --train-mode lift. "
+            "LIFT supplies its own SparseAdamW optimizer."
+        )
+
+    # --- existing blocktt/svd/full guards below ---
     if args.train_mode != "blocktt":
         passed = [f for f in mode_to_flag_sets["blocktt"] if _flag_was_passed(argv, f)]
         if passed:
@@ -556,11 +591,11 @@ def validate_mode_specific_flags(args, argv):
     if args.train_mode == "full" and _flag_was_passed(argv, "--trainable-type"):
         raise ValueError(
             "--trainable-type is only valid when --train-mode "
-            "lora, lora_full, blocktt, or svd"
+            "lora, lora_full, dora, pissa, milora, randlora, blocktt, or svd"
         )
 
     train_position_passed = _flag_was_passed(argv, "--train-position")
-    if args.train_mode in {"full", "lora", "lora_full"} and train_position_passed:
+    if args.train_mode in ({"full", "lift"} | LORA_FAMILY) and train_position_passed:
         raise ValueError("--train-position is only valid when --train-mode blocktt or svd")
     if args.train_mode == "blocktt" and train_position_passed:
         if args.train_position not in {"small", "large", "both"}:
@@ -570,7 +605,7 @@ def validate_mode_specific_flags(args, argv):
             raise ValueError("--train-position for svd must be one of: output, input, both")
 
     s_merged_to_passed = _flag_was_passed(argv, "--s-merged-to")
-    if args.train_mode in {"full", "lora", "lora_full"} and s_merged_to_passed:
+    if args.train_mode in ({"full", "lift"} | LORA_FAMILY) and s_merged_to_passed:
         raise ValueError("--s-merged-to is only valid when --train-mode blocktt or svd")
     if (
         args.train_mode == "blocktt"
@@ -580,7 +615,7 @@ def validate_mode_specific_flags(args, argv):
     ):
         raise ValueError(
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
-            "use output, input, or split"
+            "use 'split' or 'keep_trainable'"
         )
 
     # Math-verify validation
