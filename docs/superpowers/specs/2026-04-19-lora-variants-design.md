@@ -222,11 +222,61 @@ Each new mode gets a name template:
 - `randlora`: `f"{model_id}_{lr:.1e}_r{lora_rank}_a{lora_alpha}_randlora"`
 - `lift`: `f"{model_id}_{lr:.1e}_r{lift_lora_rank}_int{lift_update_interval}_lift"`
 
-### Checkpointing
+### Checkpointing — integration with `save_merged_checkpoint`
 
-- `dora`, `randlora`: `model.save_pretrained(ckpt_dir)` saves the standard PEFT adapter.
-- `pissa`, `milora`: same call saves the adapter, but the **modified base** must also be saved for downstream inference. We add `peft_model.get_base_model().save_pretrained(ckpt_dir + "/base")` for these two modes. (During training, the in-memory model is the source of truth — local rollout uses it directly.)
-- `lift`: `model.save_pretrained(ckpt_dir)` saves the dense model in HF format. Optimizer mask state is **not** saved; restart reinitializes the mask on the first `update_interval` step. Documented limitation.
+Recent commits added `save_merged_checkpoint` (run_rl.py:799) which produces a **plain HuggingFace checkpoint** (no LoRA adapters, no factored cores) so `eval_rl.py` and `math_verify_eval` can load it via vanilla `AutoModelForCausalLM.from_pretrained`. The function currently dispatches on `train_mode` with branches for `full`, `{lora, lora_full}`, `{blocktt, svd}`, and raises on anything else. The new modes must be added:
+
+- `dora`, `pissa`, `milora`, `randlora` → reuse the existing `{lora, lora_full}` branch (`merge_adapter()` → `get_base_model().save_pretrained()`). This is correct for **all four**: PEFT's `merge_adapter` produces the right effective dense weight in every case (DoRA folds in the magnitude vector; PiSSA/MiLoRA's `merge_adapter` adds the adapter delta to the residual base, recovering the full effective `W`; RandLoRA's `merge` materializes its delta via `get_delta_weight`). The on-disk result is a vanilla HF model, so no separate "save base + adapter" wart is needed for PiSSA/MiLoRA. **This supersedes the earlier draft of this section.**
+- `lift` → reuse the `full` branch (`model.save_pretrained(ckpt_dir)`). LIFT trains the dense model; no adapters to merge.
+
+Concretely:
+
+```python
+def save_merged_checkpoint(model, tokenizer, ckpt_dir, train_mode, args):
+    os.makedirs(ckpt_dir, exist_ok=True)
+    if train_mode in {"full", "lift"}:
+        model.save_pretrained(ckpt_dir)
+    elif train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
+        model.merge_adapter()
+        try:
+            base = model.get_base_model()
+            base.save_pretrained(ckpt_dir)
+        finally:
+            model.unmerge_adapter()
+    elif train_mode in {"blocktt", "svd"}:
+        # unchanged
+        ...
+    else:
+        raise ValueError(f"Unknown train_mode for save_merged_checkpoint: {train_mode}")
+    tokenizer.save_pretrained(ckpt_dir)
+```
+
+`save_checkpoint` (the wrapper) already routes through `save_merged_checkpoint` when `--enable-merged-ckpt` is set (default true), so no change needed there.
+
+LIFT optimizer mask state is **not** saved; restart reinitializes the mask on the first `update_interval` step. Documented limitation.
+
+### Math-verify post-training eval — in-memory weight export
+
+The `--enable-math-verify` block (run_rl.py:1867) currently has explicit `train_mode` branches for in-memory hot-swap into the existing vLLM:
+
+- `{blocktt, svd}` → `export_weights_for_vllm(model)`
+- `{lora, lora_full}` → `merge_adapter()` + iterate `get_base_model().named_parameters()` with `normalize_lora_merged_weight_name`
+- else → raw `named_parameters()`
+
+Updated dispatch:
+
+- `{dora, pissa, milora, randlora}` → reuse the `{lora, lora_full}` branch (same `merge_adapter` + `normalize_lora_merged_weight_name` logic). For RandLoRA, the `normalize_lora_merged_weight_name` skip-list is extended (see Rollout backend section) so its trainable buffers/params are not pushed as base-model weights.
+- `lift` → reuse the `else` branch (raw `named_parameters()` — dense model).
+
+The HTTP-trained fallback (line 1912, "spin up a fresh in-process LLM from disk") works for all new modes as long as `save_merged_checkpoint` produced a valid HF checkpoint. The check on line 559 (`--enable-math-verify` without `--enable-merged-ckpt` warns for `train_mode != "full"`) is updated to allow `lift` too: `train_mode not in {"full", "lift"}`. PiSSA/MiLoRA stay flagged because their HTTP path is forbidden anyway, but the warning is still accurate (without merged ckpt, there's no loadable on-disk model).
+
+### `eval_rl.py` (standalone post-training eval)
+
+`eval_rl.py` (added in commit 5d8632e) loads a checkpoint dir via `AutoModelForCausalLM.from_pretrained` and runs `math_verify_eval`. It is **mode-agnostic** — it never inspects `train_mode`, only the on-disk checkpoint. Once `save_merged_checkpoint` correctly handles the five new modes, `eval_rl.py` works for all of them with no code change.
+
+### HTTP-lora adapter save directory
+
+`build_lora_http_generators` (run_rl.py:935) writes adapters to `{run_dir}/lora_adapters/step={step}` (commit f240721). DoRA and RandLoRA save standard PEFT adapter directories that vLLM's `/v1/load_lora_adapter` accepts, so they reuse this path unchanged. PiSSA and MiLoRA never reach this code (forced to local rollout).
 
 ## `ref/LIFT/src/finetune_lora.py` changes
 
@@ -315,8 +365,11 @@ PiSSA-like defaults for MiLoRA (shared structure). RandLoRA uses PEFT's publishe
 ### Smoke runs (manual, not CI)
 
 - `uv run run_sft.py --train-mode dora --lora-rank 8 --no-wandb` (5 steps), repeat for `pissa`, `milora`, `randlora`, `lift`.
-- `uv run run_rl.py --train-mode milora --lora-rank 8 --no-wandb` (1 GRPO step) — verifies forced local rollout works.
-- `uv run run_rl.py --train-mode dora --lora-rank 8 --no-wandb` against a running vLLM server — verifies HTTP path works for DoRA.
+- `uv run run_rl.py --train-mode milora --lora-rank 8 --no-wandb --enable-save-ckpt --enable-merged-ckpt --enable-math-verify --n-grpo-steps 2` — verifies (a) forced local rollout, (b) `save_merged_checkpoint` produces a loadable HF checkpoint, (c) in-memory math-verify hot-swap works after `merge_adapter`.
+- Same for `dora`, `pissa`, `randlora` (each must produce a vanilla HF checkpoint loadable by `eval_rl.py`).
+- `uv run run_rl.py --train-mode lift --no-wandb --enable-save-ckpt --enable-merged-ckpt --enable-math-verify --n-grpo-steps 2` — verifies LIFT routes through the dense `full`-style branches in both `save_merged_checkpoint` and the math-verify hot-swap.
+- `uv run run_rl.py --train-mode dora --lora-rank 8 --no-wandb` against a running vLLM server — verifies HTTP path works for DoRA, including the `lora_adapters/step=*` save directory.
+- `uv run eval_rl.py --checkpoint <run-dir>/step=2` for one checkpoint per mode — verifies mode-agnostic eval works end-to-end.
 - `bash ref/LIFT/bash_scripts/finetune_math_milora.sh` with reduced epochs — verifies LIFT-side init.
 
 ## Open risks
