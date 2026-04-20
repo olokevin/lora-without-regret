@@ -366,8 +366,65 @@ def parse_args(argv=None):
     )
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 
+    # Merged-checkpoint and post-training math-verify eval flags
+    parser.add_argument(
+        "--enable-merged-ckpt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save checkpoints in plain HF format (LoRA merged into base, "
+            "BlockTT/SVD materialized to nn.Linear). Default: enabled."
+        ),
+    )
+    parser.add_argument(
+        "--enable-math-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After training, evaluate the final checkpoint on math reasoning "
+            "benchmarks via the math-verify library. Default: enabled."
+        ),
+    )
+    parser.add_argument(
+        "--math-verify-datasets",
+        type=str,
+        default="MATH-500,AIME-24,AIME-25,AMC23,Minerva",
+        help=(
+            "Comma-separated list of eval dataset names. "
+            "Default: MATH-500,AIME-24,AIME-25,AMC23,Minerva."
+        ),
+    )
+    parser.add_argument(
+        "--math-verify-n-samples",
+        type=int,
+        default=None,
+        help=(
+            "Override per-dataset n_samples. Default: registry per-dataset "
+            "(8 for AIME-24/25, 1 for the rest)."
+        ),
+    )
+    parser.add_argument(
+        "--math-verify-temperature",
+        type=float,
+        default=None,
+        help=(
+            "Override per-dataset sampling temperature. Default: registry "
+            "per-dataset (0.6 for AIME-24/25, 0.0 for the rest)."
+        ),
+    )
+    parser.add_argument(
+        "--math-verify-max-tokens",
+        type=int,
+        default=2048,
+        help="Max tokens per eval generation. Default: 2048.",
+    )
+
     add_calibrated_btt_args(parser, hyphen_style=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.math_verify_datasets = [
+        s.strip() for s in args.math_verify_datasets.split(",") if s.strip()
+    ]
+    return args
 
 
 def apply_mode_defaults(args):
@@ -478,6 +535,35 @@ def validate_mode_specific_flags(args, argv):
         raise ValueError(
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
             "use output, input, or split"
+        )
+
+    # Math-verify validation
+    from eval_datasets import REGISTRY as _MV_REGISTRY
+
+    unknown = [d for d in args.math_verify_datasets if d not in _MV_REGISTRY]
+    if unknown:
+        known = sorted(_MV_REGISTRY.keys())
+        raise ValueError(
+            f"Unknown --math-verify-datasets entries: {unknown}. "
+            f"Known names: {known}"
+        )
+    if args.math_verify_n_samples is not None and args.math_verify_n_samples <= 0:
+        raise ValueError(
+            f"--math-verify-n-samples must be > 0, got {args.math_verify_n_samples}"
+        )
+    if args.math_verify_max_tokens <= 0:
+        raise ValueError(
+            f"--math-verify-max-tokens must be > 0, got {args.math_verify_max_tokens}"
+        )
+
+    if args.enable_math_verify and not args.enable_merged_ckpt and args.train_mode != "full":
+        import sys as _sys
+
+        print(
+            "WARNING: --enable-math-verify with --no-enable-merged-ckpt may fail at "
+            "eval time for non-full modes (the saved checkpoint isn't loadable by "
+            "vanilla AutoModelForCausalLM.from_pretrained).",
+            file=_sys.stderr,
         )
 
     validate_calibrated_btt_args(args, argv=argv, hyphen_style=True)
