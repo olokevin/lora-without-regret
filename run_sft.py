@@ -1029,6 +1029,48 @@ def save_sft_checkpoint(model, tokenizer, run_dir, step, args=None):
 
 
 def build_optimizer(args, trainable_params, trainable_named_params):
+    if args.train_mode == "lift":
+        if args.optimizer == "muon":
+            raise ValueError(
+                "--train-mode lift is incompatible with --optimizer muon. "
+                "LIFT supplies its own SparseAdamW optimizer."
+            )
+        from optim.sparse_adam import SparseAdamW
+        import torch.nn as nn
+        model = getattr(args, "_lift_model", None)
+        if model is None:
+            raise RuntimeError(
+                "LIFT optimizer requires args._lift_model to be set by prepare_model."
+            )
+
+        weights_with_mask, decay_ids = [], []
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear) and "lm_head" not in name and mod.weight.requires_grad:
+                weights_with_mask.append(mod.weight)
+                decay_ids.append(id(mod.weight))
+        decay_id_set = set(decay_ids)
+        other_decay, other_nodecay = [], []
+        no_decay_names: tuple[str, ...] = ()  # match LIFT default
+        for name, p in model.named_parameters():
+            if not p.requires_grad or id(p) in decay_id_set:
+                continue
+            if any(nd in name for nd in no_decay_names):
+                other_nodecay.append(p)
+            else:
+                other_decay.append(p)
+
+        param_groups = [
+            {
+                "params": weights_with_mask, "weight_decay": 0.0,
+                "rank": args.lift_lora_rank, "filter_rank": args.lift_filter_rank,
+                "update_proj_gap": args.lift_update_interval,
+                "group_name": "weights_with_mask",
+            },
+            {"params": other_decay,    "weight_decay": 0.0, "group_name": "other_params_w_decay"},
+            {"params": other_nodecay,  "weight_decay": 0.0, "group_name": "other_params"},
+        ]
+        return SparseAdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+
     if args.optimizer == "adamw":
         return torch.optim.AdamW(
             trainable_params,
