@@ -66,6 +66,36 @@ MODE_DEFAULTS = {
         "lr": 1e-4,
         "wandb_project": "svd-finetuning",
     },
+    "dora": {
+        "lr": 9e-5,
+        "wandb_project": "math-sft-dora",
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
+    },
+    "pissa": {
+        "lr": 9e-5,
+        "wandb_project": "math-sft-pissa",
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
+    },
+    "milora": {
+        "lr": 9e-5,
+        "wandb_project": "math-sft-milora",
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
+    },
+    "randlora": {
+        "lr": 9e-5,
+        "wandb_project": "math-sft-randlora",
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 128,
+    },
+    "lift": {
+        "lr": 1e-4,
+        "wandb_project": "math-sft-lift",
+        "micro_batch_size": 4,
+        "gradient_accumulation_steps": 64,
+    },
 }
 
 
@@ -85,8 +115,9 @@ def parse_args(argv=None):
         "--train-mode",
         type=str,
         required=True,
-        choices=["full", "lora", "blocktt", "svd"],
-        help="Training mode: full, lora, blocktt, or svd",
+        choices=["full", "lora", "blocktt", "svd",
+                 "dora", "pissa", "milora", "randlora", "lift"],
+        help="Training mode: full, lora, blocktt, svd, dora, pissa, milora, randlora, or lift",
     )
     parser.add_argument(
         "--model-id",
@@ -161,6 +192,38 @@ def parse_args(argv=None):
     # LoRA-only args
     parser.add_argument(
         "--lora-rank", type=int, default=128, help="LoRA rank (default: 128)"
+    )
+
+    # RandLoRA-only args
+    parser.add_argument(
+        "--randlora-projection-prng-key",
+        type=int,
+        default=0,
+        help="Seed for RandLoRA's shared random bases (default: 0). "
+             "Only valid when --train-mode randlora.",
+    )
+
+    # LIFT-only args
+    parser.add_argument(
+        "--lift-lora-rank",
+        type=int,
+        default=128,
+        help="LIFT: rank used for the low-rank approximation that drives "
+             "mask selection (default: 128). Only valid when --train-mode lift.",
+    )
+    parser.add_argument(
+        "--lift-filter-rank",
+        type=int,
+        default=128,
+        help="LIFT: filter rank for mask selection (default: 128). "
+             "Only valid when --train-mode lift.",
+    )
+    parser.add_argument(
+        "--lift-update-interval",
+        type=int,
+        default=400,
+        help="LIFT: optimizer steps between mask recomputations (default: 400). "
+             "Only valid when --train-mode lift.",
     )
 
     # BlockTT-only args
