@@ -764,15 +764,78 @@ def should_save_checkpoint(step_num: int, total_steps: int) -> bool:
     return step_num == 10 or step_num == 30 or step_num == total_steps
 
 
+def _build_factored_dense_state_dict(model):
+    """Return a state_dict where every BTTLayer / SVDLayer is replaced by a
+    dense `{prefix}.weight` (and `{prefix}.bias` if present) materialized from
+    the factored cores. Other parameters are kept verbatim. The model object
+    is never mutated.
+    """
+    factored_prefixes = []
+    extra = {}
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, BTTLayer):
+            factored_prefixes.append(module_name + ".")
+            dense = module.materialize_dense_weight().detach().clone()
+            extra[f"{module_name}.weight"] = dense
+            if module.bias is not None:
+                extra[f"{module_name}.bias"] = module.bias.detach().clone()
+        elif isinstance(module, SVDLayer):
+            factored_prefixes.append(module_name + ".")
+            dense = module.materialize_dense_weight().detach().clone()
+            extra[f"{module_name}.weight"] = dense
+            if module.bias is not None:
+                extra[f"{module_name}.bias"] = module.bias.detach().clone()
+
+    new_sd = {}
+    for name, tensor in model.state_dict().items():
+        if any(name.startswith(p) for p in factored_prefixes):
+            continue
+        new_sd[name] = tensor
+    new_sd.update(extra)
+    return new_sd
+
+
+def save_merged_checkpoint(model, tokenizer, ckpt_dir: str, train_mode: str, args):
+    """Save model in plain HuggingFace format. The on-disk result contains
+    only nn.Linear layers (no LoRA adapters, no BTT/SVD factored cores).
+    The in-memory model object is never mutated; training can resume.
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    if train_mode == "full":
+        model.save_pretrained(ckpt_dir)
+    elif train_mode in {"lora", "lora_full"}:
+        model.merge_adapter()
+        try:
+            base = model.get_base_model()
+            base.save_pretrained(ckpt_dir)
+        finally:
+            model.unmerge_adapter()
+    elif train_mode in {"blocktt", "svd"}:
+        if train_mode == "blocktt" and getattr(args, "calib_mode", "none") != "none":
+            save_calibrated_btt_hf_pretrained(model, ckpt_dir)
+        else:
+            state_dict = _build_factored_dense_state_dict(model)
+            model.save_pretrained(ckpt_dir, state_dict=state_dict)
+    else:
+        raise ValueError(f"Unknown train_mode for save_merged_checkpoint: {train_mode}")
+
+    tokenizer.save_pretrained(ckpt_dir)
+
+
 def save_checkpoint(model, tokenizer, run_dir: str, step_num: int, args=None):
     ckpt_dir = os.path.join(run_dir, f"step={step_num}")
     os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Saving checkpoint to {ckpt_dir}")
-    if args is not None and getattr(args, "calib_mode", "none") != "none":
+    if args is not None and getattr(args, "enable_merged_ckpt", True):
+        save_merged_checkpoint(model, tokenizer, ckpt_dir, args.train_mode, args)
+    elif args is not None and getattr(args, "calib_mode", "none") != "none":
         save_calibrated_btt_hf_pretrained(model, ckpt_dir)
+        tokenizer.save_pretrained(ckpt_dir)
     else:
         model.save_pretrained(ckpt_dir)
-    tokenizer.save_pretrained(ckpt_dir)
+        tokenizer.save_pretrained(ckpt_dir)
     print(f"Checkpoint saved to {ckpt_dir}")
 
 
