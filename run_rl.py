@@ -54,6 +54,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from transformers.utils import is_flash_attn_2_available
 
 MODE_DEFAULTS = {
     "full": {
@@ -86,7 +87,23 @@ MODE_DEFAULTS = {
         "micro_batch_size": 2,
         "gradient_accumulation_steps": 128,
     },
+    "dora":     {"lr": 9e-5, "wandb_project": "math-grpo-dora",
+                 "micro_batch_size": 2, "gradient_accumulation_steps": 128},
+    "pissa":    {"lr": 9e-5, "wandb_project": "math-grpo-pissa",
+                 "micro_batch_size": 2, "gradient_accumulation_steps": 128},
+    "milora":   {"lr": 9e-5, "wandb_project": "math-grpo-milora",
+                 "micro_batch_size": 2, "gradient_accumulation_steps": 128},
+    "randlora": {"lr": 9e-5, "wandb_project": "math-grpo-randlora",
+                 "micro_batch_size": 2, "gradient_accumulation_steps": 128},
+    "lift":     {"lr": 1e-4, "wandb_project": "math-grpo-lift",
+                 "micro_batch_size": 4, "gradient_accumulation_steps": 64},
 }
+
+
+def resolve_attn_implementation():
+    if torch.cuda.is_available() and is_flash_attn_2_available():
+        return "flash_attention_2"
+    return "sdpa"
 
 
 def parse_args(argv=None):
@@ -95,8 +112,9 @@ def parse_args(argv=None):
         "--train-mode",
         type=str,
         required=True,
-        choices=["full", "lora", "lora_full", "blocktt", "svd"],
-        help="Training mode: full, lora, lora_full, blocktt, or svd",
+        choices=["full", "lora", "lora_full", "dora", "pissa", "milora", "randlora",
+                 "lift", "blocktt", "svd"],
+        help="Training mode: full, lora, lora_full, dora, pissa, milora, randlora, lift, blocktt, or svd",
     )
 
     # Shared configuration
@@ -282,6 +300,34 @@ def parse_args(argv=None):
         type=str,
         default="http://localhost:8000",
         help="URL for vLLM API server (lora mode only; lora_full uses local in-process rollout)",
+    )
+    parser.add_argument(
+        "--randlora-projection-prng-key",
+        type=int,
+        default=0,
+        help="Seed for RandLoRA's shared random bases (default: 0). "
+             "Only valid when --train-mode randlora.",
+    )
+    parser.add_argument(
+        "--lift-lora-rank",
+        type=int,
+        default=128,
+        help="LIFT: rank used for the low-rank approximation that drives "
+             "mask selection (default: 128). Only valid when --train-mode lift.",
+    )
+    parser.add_argument(
+        "--lift-filter-rank",
+        type=int,
+        default=128,
+        help="LIFT: filter rank for mask selection (default: 128). "
+             "Only valid when --train-mode lift.",
+    )
+    parser.add_argument(
+        "--lift-update-interval",
+        type=int,
+        default=400,
+        help="LIFT: optimizer steps between mask recomputations (default: 400). "
+             "Only valid when --train-mode lift.",
     )
 
     # BlockTT-only args
@@ -483,7 +529,7 @@ def validate_mode_specific_flags(args, argv):
         "svd": [],
     }
 
-    if args.train_mode not in {"lora", "lora_full"}:
+    if args.train_mode not in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         passed = [f for f in mode_to_flag_sets["lora"] if _flag_was_passed(argv, f)]
         if passed:
             raise ValueError(
@@ -746,6 +792,19 @@ def compute_run_name(args, mode_info: dict) -> str:
         return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}"
     if args.train_mode == "lora_full":
         return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_lora_full"
+    if args.train_mode == "dora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_dora"
+    if args.train_mode == "pissa":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_pissa"
+    if args.train_mode == "milora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_milora"
+    if args.train_mode == "randlora":
+        return f"{args.model_id}_{args.lr:.1e}_r{args.lora_rank}_randlora"
+    if args.train_mode == "lift":
+        return (
+            f"{args.model_id}_{args.lr:.1e}_r{args.lift_lora_rank}"
+            f"_int{args.lift_update_interval}_lift"
+        )
     if args.train_mode == "blocktt":
         decomp_mode_name = mode_info.get("decomp_mode_display", args.decomp_mode)
         return f"{args.model_id}_{args.lr:.1e}_{decomp_mode_name}_{args.train_position}_{args.trainable_type}"
@@ -803,9 +862,9 @@ def save_merged_checkpoint(model, tokenizer, ckpt_dir: str, train_mode: str, arg
     """
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    if train_mode == "full":
+    if train_mode in {"full", "lift"}:
         model.save_pretrained(ckpt_dir)
-    elif train_mode in {"lora", "lora_full"}:
+    elif train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         model.merge_adapter()
         try:
             base = model.get_base_model()
@@ -1162,7 +1221,7 @@ def assert_muon_routing(train_mode, trainable_named_params, optimizer):
             )
         return
 
-    if train_mode in {"lora", "lora_full"}:
+    if train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         lora_ids = _param_ids_by_suffix(("lora_A", "lora_B"))
         if len(lora_ids) == 0:
             raise ValueError(
@@ -1183,6 +1242,48 @@ def assert_muon_routing(train_mode, trainable_named_params, optimizer):
 
 
 def build_optimizer(args, trainable_params, trainable_named_params):
+    if args.train_mode == "lift":
+        if args.optimizer == "muon":
+            raise ValueError(
+                "--train-mode lift is incompatible with --optimizer muon. "
+                "LIFT supplies its own SparseAdamW optimizer."
+            )
+        from optim.sparse_adam import SparseAdamW
+        import torch.nn as nn
+        model = getattr(args, "_lift_model", None)
+        if model is None:
+            raise RuntimeError(
+                "LIFT optimizer requires args._lift_model to be set by prepare_model."
+            )
+
+        weights_with_mask, decay_ids = [], []
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear) and "lm_head" not in name and mod.weight.requires_grad:
+                weights_with_mask.append(mod.weight)
+                decay_ids.append(id(mod.weight))
+        decay_id_set = set(decay_ids)
+        other_decay, other_nodecay = [], []
+        no_decay_names: tuple[str, ...] = ()
+        for name, p in model.named_parameters():
+            if not p.requires_grad or id(p) in decay_id_set:
+                continue
+            if any(nd in name for nd in no_decay_names):
+                other_nodecay.append(p)
+            else:
+                other_decay.append(p)
+
+        param_groups = [
+            {
+                "params": weights_with_mask, "weight_decay": 0.0,
+                "rank": args.lift_lora_rank, "filter_rank": args.lift_filter_rank,
+                "update_proj_gap": args.lift_update_interval,
+                "group_name": "weights_with_mask",
+            },
+            {"params": other_decay,    "weight_decay": 0.0, "group_name": "other_params_w_decay"},
+            {"params": other_nodecay,  "weight_decay": 0.0, "group_name": "other_params"},
+        ]
+        return SparseAdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+
     if args.optimizer == "adamw":
         return torch.optim.AdamW(
             trainable_params,
@@ -1321,7 +1422,7 @@ def main(argv=None):
     lora_rollout_backend = resolve_lora_rollout_backend(args.train_mode, args.vllm_url)
 
     mode_info = {}
-    if args.train_mode in {"lora", "lora_full"}:
+    if args.train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         lora_target_modules = get_lora_target_modules(args.trainable_type)
         mode_info.update(
             {
@@ -1333,6 +1434,14 @@ def main(argv=None):
                 "rollout_backend": lora_rollout_backend,
             }
         )
+        if args.train_mode == "randlora":
+            mode_info["randlora_projection_prng_key"] = args.randlora_projection_prng_key
+    elif args.train_mode == "lift":
+        mode_info.update({
+            "lift_lora_rank": args.lift_lora_rank,
+            "lift_filter_rank": args.lift_filter_rank,
+            "lift_update_interval": args.lift_update_interval,
+        })
     elif args.train_mode == "blocktt":
         blocktt_rank = resolve_blocktt_rank(args.blocktt_rank)
         blocktt_targets = get_blocktt_target_module_names(args.trainable_type)
@@ -1394,7 +1503,7 @@ def main(argv=None):
     print(f"  Epochs per step: {args.epochs_per_step}")
     print(f"  Micro batch size: {args.micro_batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-    if args.train_mode in {"lora", "lora_full"}:
+    if args.train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         print(f"  LoRA rank: {args.lora_rank}")
         print(f"  Trainable type: {args.trainable_type}")
         print(
@@ -1404,6 +1513,10 @@ def main(argv=None):
         print(f"  Target modules: {mode_info['target_modules']}")
         print(f"  Rollout backend: {lora_rollout_backend}")
         print(f"  vLLM URL: {args.vllm_url}")
+    if args.train_mode == "lift":
+        print(f"  LIFT lora_rank: {args.lift_lora_rank}")
+        print(f"  LIFT filter_rank: {args.lift_filter_rank}")
+        print(f"  LIFT update_interval: {args.lift_update_interval}")
     if args.train_mode == "blocktt":
         print(f"  BlockTT rank: {mode_info['blocktt_rank']}")
         print(f"  Trainable type: {args.trainable_type}")
@@ -1444,8 +1557,10 @@ def main(argv=None):
 
     device_id = get_local_cuda_device_id()
     device = f"cuda:{device_id}"
+    attn_implementation = resolve_attn_implementation()
+    print(f"  Attention backend: {attn_implementation}")
     model_kwargs = dict(
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
         torch_dtype=torch.bfloat16,
         use_cache=False,
         device_map={"": device_id},
@@ -1466,6 +1581,52 @@ def main(argv=None):
                 p.requires_grad = True
         model.print_trainable_parameters()
         trainable_params = [p for p in model.parameters() if p.requires_grad]
+    elif args.train_mode == "dora":
+        from peft import LoraConfig, get_peft_model
+        peft_config = LoraConfig(
+            r=args.lora_rank, lora_alpha=32,
+            target_modules=mode_info["target_modules"],
+            use_dora=True,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+    elif args.train_mode == "pissa":
+        from peft import LoraConfig, get_peft_model
+        peft_config = LoraConfig(
+            r=args.lora_rank, lora_alpha=32,
+            target_modules=mode_info["target_modules"],
+            init_lora_weights="pissa_niter_4", lora_dropout=0,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+    elif args.train_mode == "milora":
+        from peft import LoraConfig, get_peft_model
+        from run_sft import apply_milora_init_
+        peft_config = LoraConfig(
+            r=args.lora_rank, lora_alpha=32,
+            target_modules=mode_info["target_modules"],
+            lora_dropout=0,
+        )
+        model = get_peft_model(model, peft_config)
+        apply_milora_init_(model, rank=args.lora_rank)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+    elif args.train_mode == "randlora":
+        from peft import RandLoraConfig, get_peft_model
+        peft_config = RandLoraConfig(
+            r=args.lora_rank, randlora_alpha=32,
+            target_modules=mode_info["target_modules"],
+            projection_prng_key=args.randlora_projection_prng_key,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+    elif args.train_mode == "lift":
+        # Dense model; no PEFT wrapping. trainable = everything.
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        args._lift_model = model
     elif args.train_mode == "blocktt":
         if getattr(args, "calib_mode", "none") != "none":
             # Calibrated BTT branch: run rollout on dense base model, then decompose
@@ -1581,7 +1742,7 @@ def main(argv=None):
     trainable_params = [p for _, p in trainable_named_params]
     validate_trainable_params(trainable_params)
 
-    if args.train_mode in {"lora", "lora_full"}:
+    if args.train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
         if lora_rollout_backend == "http":
             generate_for_train, generate_for_eval, in_process_llm = build_lora_http_generators(
                 args,
@@ -1873,7 +2034,7 @@ def main(argv=None):
                 # Reuse the in-memory model + existing vLLM via hot-swap.
                 if args.train_mode in {"blocktt", "svd"}:
                     weight_tuples = export_weights_for_vllm(model)
-                elif args.train_mode in {"lora", "lora_full"}:
+                elif args.train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
                     model.merge_adapter()
                     try:
                         base = model.get_base_model()
