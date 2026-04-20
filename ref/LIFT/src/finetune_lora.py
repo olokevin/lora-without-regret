@@ -77,6 +77,42 @@ from utils.model_utils import (
 
 from utils.data_utils import SupervisedDataset, DataCollatorForSupervisedDataset
 
+@torch.no_grad()
+def apply_milora_init_(peft_model, *, rank: int) -> None:
+    """In-place MiLoRA initialization (vendored locally to keep LIFT
+    independent from the main repo's run_sft.py helper)."""
+    from peft.tuners.lora import LoraLayer
+    first_check = True
+    for _name, module in peft_model.named_modules():
+        if not isinstance(module, LoraLayer):
+            continue
+        base = module.get_base_layer()
+        W = base.weight.data.detach().clone().float()
+        dtype, device = base.weight.data.dtype, base.weight.data.device
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        r = rank
+        U_r, S_r, Vh_r = U[:, -r:], S[-r:], Vh[-r:, :]
+        sqrt_S = S_r.sqrt()
+        adapter_name = list(module.lora_A.keys())[0]
+        alpha = module.lora_alpha[adapter_name]
+        scale_correction = (r / alpha) ** 0.5
+        lora_A = (sqrt_S.unsqueeze(1) * Vh_r) * scale_correction
+        lora_B = (U_r * sqrt_S.unsqueeze(0)) * scale_correction
+        residual = W - U_r @ torch.diag(S_r) @ Vh_r
+        module.lora_A[adapter_name].weight.data.copy_(lora_A.to(dtype=dtype, device=device))
+        module.lora_B[adapter_name].weight.data.copy_(lora_B.to(dtype=dtype, device=device))
+        base.weight.data.copy_(residual.to(dtype=dtype, device=device))
+        if first_check:
+            reconstructed = (alpha / r) * lora_B @ lora_A + residual
+            rel_err = (
+                torch.linalg.norm(reconstructed - W)
+                / torch.linalg.norm(W)
+            )
+            assert rel_err < 1e-3, (
+                f"MiLoRA init reconstruction error too high: {rel_err:.2e}"
+            )
+            first_check = False
+
 def parse_args():
     parser = argparse.ArgumentParser(description="S2FT Training")
     parser.add_argument(
@@ -297,6 +333,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--randlora_projection_prng_key",
+        type=int,
+        default=0,
+        help="Seed for RandLoRA's shared random bases (default: 0).",
+    )
+
+    parser.add_argument(
         "--logging_steps",
         type=int,
         default=10,
@@ -422,13 +465,30 @@ def main():
             )
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
-    elif args.adapter_name == "hira":
-        print(f"HiRA Init")
-        model = convert_layer_to_hira(args, model, args.target_modules)
-        for name, param in model.named_parameters():
-            # check if param belongs to HiraLayer
-            if "hira" not in name:
-                param.requires_grad = False
+    elif args.adapter_name == "milora":
+        print("MiLoRA Init")
+        config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=0,
+            target_modules=args.target_modules,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        apply_milora_init_(model, rank=args.lora_r)
+        model.print_trainable_parameters()
+    elif args.adapter_name == "randlora":
+        print("RandLoRA Init")
+        from peft import RandLoraConfig
+        config = RandLoraConfig(
+            r=args.lora_r,
+            randlora_alpha=args.lora_alpha,
+            target_modules=args.target_modules,
+            projection_prng_key=args.randlora_projection_prng_key,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
 
     print(model)
     print(model.dtype)
@@ -622,10 +682,6 @@ def main():
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
 
-        if args.adapter_name == "hira":
-            unwrapped_model = convert_hira_to_original(args, unwrapped_model)
-            print(model)
-        
         save_hf_format(unwrapped_model, tokenizer, args)
 
     if args.output_dir is not None:
@@ -648,11 +704,8 @@ def main():
         # if args.peft_tuner == 'lora':
         #     model.save_pretrained(args.output_dir)
 
-        if args.adapter_name in ["lora", "dora", "pissa"]:
+        if args.adapter_name in ["lora", "dora", "pissa", "milora", "randlora"]:
             model = model.merge_and_unload()
-        elif args.adapter_name == "hira":
-            model = convert_hira_to_original(args, model)
-            print(model)
         save_hf_format(model, tokenizer, args)
         # save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
 
