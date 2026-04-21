@@ -49,32 +49,43 @@ def main():
     results = []
     for name, d_in, d_out in SHAPES:
         for B in BATCHES:
-            rank = int(d_in ** 0.5)  # default FuRA corner: rank = sqrt(d_in)
-            mod = BTTLayer(d_in, d_out, rank=rank).to("cuda").to(torch.bfloat16)
-            x = torch.randn(B, d_in, device="cuda", dtype=torch.bfloat16)
+            try:
+                rank = int(d_in ** 0.5)  # default FuRA corner: rank = sqrt(d_in)
+                mod = BTTLayer(d_in, d_out, rank=rank).to("cuda").to(torch.bfloat16)
+                x = torch.randn(B, d_in, device="cuda", dtype=torch.bfloat16)
 
-            BTTLayer.use_fused_step2 = False
-            torch.cuda.reset_peak_memory_stats()
-            t_base = _time(lambda: mod(x), args.iters, args.warmup)
-            mem_base = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                BTTLayer.use_fused_step2 = False
+                torch.cuda.reset_peak_memory_stats()
+                t_base = _time(lambda: mod(x), args.iters, args.warmup)
+                mem_base = torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-            BTTLayer.use_fused_step2 = True
-            torch.cuda.reset_peak_memory_stats()
-            t_fus = _time(lambda: mod(x), args.iters, args.warmup)
-            mem_fus = torch.cuda.max_memory_allocated() / (1024 ** 2)
-            BTTLayer.use_fused_step2 = False
+                BTTLayer.use_fused_step2 = True
+                torch.cuda.reset_peak_memory_stats()
+                t_fus = _time(lambda: mod(x), args.iters, args.warmup)
+                mem_fus = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                BTTLayer.use_fused_step2 = False
 
-            results.append({
-                "shape": name,
-                "d_in": d_in,
-                "d_out": d_out,
-                "B": B,
-                "t_base_us": t_base * 1e6,
-                "t_fus_us": t_fus * 1e6,
-                "speedup": t_base / t_fus if t_fus > 0 else 0.0,
-                "mem_base_mb": mem_base,
-                "mem_fus_mb": mem_fus,
-            })
+                results.append({
+                    "shape": name,
+                    "d_in": d_in,
+                    "d_out": d_out,
+                    "B": B,
+                    "t_base_us": t_base * 1e6,
+                    "t_fus_us": t_fus * 1e6,
+                    "speedup": t_base / t_fus if t_fus > 0 else 0.0,
+                    "mem_base_mb": mem_base,
+                    "mem_fus_mb": mem_fus,
+                })
+            except Exception as e:
+                print(f"[skip] {name} B={B}: {e}")
+                # Clean up GPU state after error
+                BTTLayer.use_fused_step2 = False
+                torch.cuda.empty_cache()
+                continue
+            finally:
+                # Free per-iteration GPU memory
+                del mod, x
+                torch.cuda.empty_cache()
             print(results[-1])
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
