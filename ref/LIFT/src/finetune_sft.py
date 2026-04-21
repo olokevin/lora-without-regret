@@ -4,6 +4,10 @@ import os
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 )
+# Add repo root to path for tools.system_metrics
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir))
+)
 
 import copy
 import torch
@@ -46,6 +50,8 @@ from utils.model_utils import (
 )
 
 from utils.data_utils import SupervisedDataset, DataCollatorForSupervisedDataset
+
+from tools.system_metrics import SysMon
 
 def parse_args():
     parser = argparse.ArgumentParser(description="S2FT Training")
@@ -116,6 +122,12 @@ def parse_args():
         type=int,
         default=1,
         help="Total number of training epochs to perform.",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=0,
+        help="If > 0, cap total optimizer steps at this value (for short-horizon system-eval runs).",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -461,6 +473,8 @@ def main():
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    if args.max_steps > 0:
+        max_train_steps = min(max_train_steps, args.max_steps)
 
     if args.num_warmup_steps < 1:
         args.num_warmup_steps = int(args.num_warmup_steps * max_train_steps)
@@ -499,7 +513,16 @@ def main():
         eval_dataloader = accelerator.prepare(eval_dataloader)
 
     best_model = None
-    
+
+    _method = "full" if getattr(args, "peft_tuner", None) in (None, "", "none") else args.peft_tuner
+    _rank = int(args.lora_rank) if hasattr(args, "lora_rank") and args.lora_rank else None
+    sysmon = SysMon(
+        out_dir=args.output_dir or ".",
+        method=_method,
+        rank=_rank,
+        base_params=sum(p.numel() for p in model.parameters()),
+    )
+
     # Training function
     def train_epoch(epoch):
         nonlocal best_model, best_eval_loss
@@ -510,17 +533,21 @@ def main():
                 outputs = model(**batch)
                 loss = outputs.loss
                 accelerator.backward(loss)
+                _t0 = time.time()
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                sysmon.record_step(time.time() - _t0)
+
                 total_loss += loss.detach().float()
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 args.completed_steps += 1
-                # if accelerator.is_main_process and step % 100 == 0:
-                #     print(f"Epoch {epoch}: Step {step}: Loss {loss.item():.4f}")
+                if args.max_steps > 0 and args.completed_steps >= args.max_steps:
+                    return
                 if args.logging_steps and args.completed_steps % args.logging_steps == 0:
                     divisor = args.gradient_accumulation_steps * args.logging_steps
                     avg_loss = accelerator.gather(total_loss).mean().item() / divisor
@@ -587,7 +614,23 @@ def main():
     best_eval_loss = float('inf')
     for epoch in range(args.num_train_epochs):
         train_loss = train_epoch(epoch)
-        accelerator.print(f"Epoch {epoch+1}: Average loss = {train_loss:.4f}")
+        if train_loss is not None:
+            accelerator.print(f"Epoch {epoch+1}: Average loss = {train_loss:.4f}")
+        if args.max_steps > 0 and args.completed_steps >= args.max_steps:
+            break
+
+    effective_tokens = (
+        args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * args.max_seq_len
+    )
+    sysmon.dump(
+        model,
+        extra={
+            "effective_tokens_per_step": effective_tokens,
+            "learning_rate": args.learning_rate,
+        },
+    )
 
     # Save the final model if no validation was done
     if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
