@@ -8,7 +8,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-export HF_HOME=/your/path/to/huggingface/cache      # MODIFY THIS LINE
+export HF_HOME="${HF_HOME:-/data/yequan/huggingface}"
 
 SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT      # MODIFY THIS LINE
 DATA_DIR=LLM-Adapters      # MODIFY THIS LINE
@@ -32,7 +32,7 @@ echo $MODEL
 peft_tuner=sparse
 
 
-OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/lift-lr_${lr}-rank_${lora_rank}-seed_${seed}
+OUTPUT="${OUTPUT:-${OUTPUT_SRC_DIR}/commonsense/${MODEL}/lift-lr_${lr}-rank_${lora_rank}-seed_${seed}}"
 run_name="${run_name:-lift-lr_${lr}-rank_${lora_rank}-seed_${seed}}"
 if [ "$OUTPUT" == "" ]; then
     OUTPUT=./outs/math/s2_llama3

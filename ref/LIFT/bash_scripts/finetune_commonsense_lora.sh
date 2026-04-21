@@ -8,7 +8,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-export HF_HOME=/your/path/to/huggingface/cache      # MODIFY THIS LINE
+export HF_HOME="${HF_HOME:-/data/yequan/huggingface}"
 
 SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT      # MODIFY THIS LINE
 DATA_DIR=LLM-Adapters      # MODIFY THIS LINE
@@ -39,7 +39,7 @@ wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.genera
 export WANDB_RUN_ID="${wandb_run_id}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
-OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/${adapter_name}-lr_${lr}-rank_${lora_r}-seed_${seed}
+OUTPUT="${OUTPUT:-${OUTPUT_SRC_DIR}/commonsense/${MODEL}/${adapter_name}-lr_${lr}-rank_${lora_r}-seed_${seed}}"
 mkdir -p $OUTPUT
 
 cd $SRC_DIR

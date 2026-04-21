@@ -8,7 +8,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-export HF_HOME=/data/yequan/huggingface/cache      # MODIFY THIS LINE
+export HF_HOME="${HF_HOME:-/data/yequan/huggingface}"
 
 SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT      # MODIFY THIS LINE
 DATA_DIR=LLM-Adapters      # MODIFY THIS LINE
@@ -49,7 +49,7 @@ export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 echo $MODEL
 
-OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/blocktt-calib_${calib_mode}-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}_smerge_${s_merged_to}-seed_${seed}
+OUTPUT="${OUTPUT:-${OUTPUT_SRC_DIR}/commonsense/${MODEL}/blocktt-calib_${calib_mode}-lr_${lr}-decomp_${decomp_mode}_pos_${train_position}_smerge_${s_merged_to}-seed_${seed}}"
 run_name="${run_name:-$(basename "$OUTPUT")}"
 
 mkdir -p $OUTPUT
