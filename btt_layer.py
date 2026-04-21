@@ -467,6 +467,9 @@ class BTTLayer(nn.Module):
       btt_l: (m, rank * n, a)
     """
 
+    # Opt-in fused-Step-2 Triton kernel. Default OFF so baseline runs are unchanged.
+    use_fused_step2: bool = False
+
     def __init__(
         self,
         in_features,
@@ -810,16 +813,24 @@ class BTTLayer(nn.Module):
                 inner = self.act_fn(inner)
 
         # Step 2: (m, B, n*r) @ (m, n*r, a) -> (m, B, a)
-        btt_l = self.btt_l
-        if self.btt_s is not None:
-            btt_l = (
-                self.btt_l.reshape(self.m, self.n, self.rank, self.a)
-                * self.btt_s.unsqueeze(-1)
-            ).reshape(self.m, self.rank * self.n, self.a)
-        out = torch.bmm(
-            inner.reshape(self.m, batch_n, self.rank * self.n),
-            btt_l,
-        )
+        if BTTLayer.use_fused_step2 and inner.is_cuda:
+            from fura_kernels import step2_s_scaled_bmm
+            out = step2_s_scaled_bmm(
+                inner.reshape(self.m, batch_n, self.rank * self.n),
+                self.btt_l,
+                self.btt_s,
+            )
+        else:
+            btt_l = self.btt_l
+            if self.btt_s is not None:
+                btt_l = (
+                    self.btt_l.reshape(self.m, self.n, self.rank, self.a)
+                    * self.btt_s.unsqueeze(-1)
+                ).reshape(self.m, self.rank * self.n, self.a)
+            out = torch.bmm(
+                inner.reshape(self.m, batch_n, self.rank * self.n),
+                btt_l,
+            )
         out = out.permute(1, 0, 2).contiguous().reshape(
             *orig_shape[:-1], self.out_features
         )
@@ -828,3 +839,8 @@ class BTTLayer(nn.Module):
             out += self.bias
 
         return out
+
+
+import os as _os
+if _os.environ.get("FURA_FUSED_STEP2") == "1":
+    BTTLayer.use_fused_step2 = True
