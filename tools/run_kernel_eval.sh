@@ -23,6 +23,7 @@ export CUDA_VISIBLE_DEVICES="${GPU}"
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${GPU}" 2>/dev/null || echo unknown)"
 
 cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # 1. correctness
 echo "== correctness tests =="

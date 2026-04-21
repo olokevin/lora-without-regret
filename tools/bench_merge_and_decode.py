@@ -7,9 +7,13 @@ generate() at batch=1 and batch=8, and report merged checkpoint size.
 For methods that don't merge cleanly (lift, randlora), we skip merge and
 measure generate() with the adapter still attached.
 """
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+
 import argparse
 import json
-import os
 import shutil
 import tempfile
 import time

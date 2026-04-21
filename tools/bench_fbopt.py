@@ -4,6 +4,11 @@ Method-agnostic: you give it a Linear-replacement callable via --method, and
 it constructs a single-layer model of the given shape. Used to isolate
 adapter overhead from full-model / data-loader noise.
 """
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+
 import argparse
 import json
 import statistics
