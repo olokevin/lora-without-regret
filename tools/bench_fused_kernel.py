@@ -49,7 +49,8 @@ def main():
     results = []
     for name, d_in, d_out in SHAPES:
         for B in BATCHES:
-            mod = BTTLayer(d_in, d_out).to("cuda").to(torch.bfloat16)
+            rank = int(d_in ** 0.5)  # default FuRA corner: rank = sqrt(d_in)
+            mod = BTTLayer(d_in, d_out, rank=rank).to("cuda").to(torch.bfloat16)
             x = torch.randn(B, d_in, device="cuda", dtype=torch.bfloat16)
 
             BTTLayer.use_fused_step2 = False
