@@ -33,6 +33,7 @@ blocktt_rank="${blocktt_rank:-full}"
 trainable_type="${trainable_type:-all}"
 lr="${lr:-2e-4}"
 seed="${seed:-43}"
+MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 
 # --- calibrated BTT knobs (set calib_mode=v2_bp to enable) ---
@@ -84,17 +85,20 @@ accelerate launch \
     --calib_source ${calib_source} \
     --calib_num_seqs ${calib_num_seqs} \
     --calib_batch_size ${calib_batch_size} \
-    --save_interval 5000 \
+    --save_interval 100000 \
     --val_set_size 120 \
     --eval_step 400 \
     --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
+    --max_steps ${MAX_STEPS} \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
-bash ./bash_scripts/eval_commonsense.sh \
-    CKPT="$OUTPUT" \
-    base_model="${MODEL}" \
-    wandb_project="${wandb_project}" \
-    wandb_run_name="${run_name}" \
-    wandb_run_id="${wandb_run_id}"
+if [ "${MAX_STEPS}" = "0" ]; then
+    bash ./bash_scripts/eval_commonsense.sh \
+        CKPT="$OUTPUT" \
+        base_model="${MODEL}" \
+        wandb_project="${wandb_project}" \
+        wandb_run_name="${run_name}" \
+        wandb_run_id="${wandb_run_id}"
+fi

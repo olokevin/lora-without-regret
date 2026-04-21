@@ -29,6 +29,7 @@ lr="${lr:-2e-4}"
 lora_r="${lora_r:-128}"
 lora_alpha="${lora_alpha:-256}"
 seed="${seed:-43}"
+MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 
 wandb_project="${wandb_project:-commonsense-${model_tag}}"
@@ -71,12 +72,16 @@ accelerate launch \
     --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
+    --max_steps ${MAX_STEPS} \
+    --save_interval 100000 \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
-bash bash_scripts/eval_commonsense_lora.sh \
-    CKPT="$OUTPUT" \
-    adapter_name="${adapter_name}" \
-    base_model="${MODEL}" \
-    wandb_project="${wandb_project}" \
-    wandb_run_name="${run_name}" \
-    wandb_run_id="${wandb_run_id}"
+if [ "${MAX_STEPS}" = "0" ]; then
+    bash bash_scripts/eval_commonsense_lora.sh \
+        CKPT="$OUTPUT" \
+        adapter_name="${adapter_name}" \
+        base_model="${MODEL}" \
+        wandb_project="${wandb_project}" \
+        wandb_run_name="${run_name}" \
+        wandb_run_id="${wandb_run_id}"
+fi

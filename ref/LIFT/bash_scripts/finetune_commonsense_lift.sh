@@ -4,27 +4,25 @@ pwd
 hostname
 date
 echo starting job...
-conda activate lift
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 export HF_HOME=/your/path/to/huggingface/cache      # MODIFY THIS LINE
 
-SRC_DIR=/enter/your/path/to/the/repo      # MODIFY THIS LINE
-DATA_DIR=/enter/your/data/dir      # MODIFY THIS LINE
-OUTPUT_SRC_DIR=/enter/your/output/dir      # MODIFY THIS LINE
+SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT      # MODIFY THIS LINE
+DATA_DIR=LLM-Adapters      # MODIFY THIS LINE
+OUTPUT_SRC_DIR=/data/yequan/fura/lift    # MODIFY THIS LINE
 
-SLURM_ARRAY_TASK_ID=$1
-cfg=$(sed -n "$SLURM_ARRAY_TASK_ID"p ${SRC_DIR}/bash_scripts/slurm_config_lift_commonsense.txt)
-MODEL=$(echo $cfg | cut -f 1 -d ' ')
-no_grad=$(echo $cfg | cut -f 2 -d ' ')
-mask=$(echo $cfg | cut -f 3 -d ' ')
-lr=$(echo $cfg | cut -f 4 -d ' ')
-lora_rank=$(echo $cfg | cut -f 5 -d ' ')
-filter_rank=$(echo $cfg | cut -f 6 -d ' ')
-update_interval=$(echo $cfg | cut -f 7 -d ' ')
-seed=$(echo $cfg | cut -f 8 -d ' ')
+MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B}"
+no_grad="${no_grad:-0.1}"
+mask="${mask:-topk}"
+lr="${lr:-2e-4}"
+lora_rank="${lora_rank:-32}"
+filter_rank="${filter_rank:-${lora_rank}}"
+update_interval="${update_interval:-500}"
+seed="${seed:-43}"
+MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 wandb_project="${wandb_project:-commonsense-${model_tag}}"
 
@@ -34,8 +32,8 @@ echo $MODEL
 peft_tuner=sparse
 
 
-OUTPUT=${OUTPUT_SRC_DIR}/${MODEL}/lift/commonsense/${peft_tuner}_no_${no_grad}_mask_${mask}_rank_${lora_rank}_filter_${filter_rank}_interval_${update_interval}/lr_${lr}/seed_${seed}
-run_name="${run_name:-$(basename "$OUTPUT")}"
+OUTPUT=${OUTPUT_SRC_DIR}/commonsense/${MODEL}/lift-lr_${lr}-rank_${lora_rank}-seed_${seed}
+run_name="${run_name:-lift-lr_${lr}-rank_${lora_rank}-seed_${seed}}"
 if [ "$OUTPUT" == "" ]; then
     OUTPUT=./outs/math/s2_llama3
 fi
@@ -67,18 +65,21 @@ accelerate launch \
     --lora_rank ${lora_rank} \
     --filter_rank ${filter_rank} \
     --update_interval ${update_interval} \
-    --save_interval 5000 \
+    --save_interval 100000 \
     --instruction_type single \
     --val_set_size 120 \
     --eval_step 400 \
     --no_grad ${no_grad} \
-    --data_path ${DATA_DIR}/LLM-Adapters/ft-training_set/commonsense_170k.json \
+    --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
+    --max_steps ${MAX_STEPS} \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
-bash ./bash_scripts/eval_commonsense.sh \
-    CKPT="$OUTPUT" \
-    base_model="${MODEL}" \
-    wandb_project="${wandb_project}" \
-    wandb_run_name="${run_name}"
+if [ "${MAX_STEPS}" = "0" ]; then
+    bash ./bash_scripts/eval_commonsense.sh \
+        CKPT="$OUTPUT" \
+        base_model="${MODEL}" \
+        wandb_project="${wandb_project}" \
+        wandb_run_name="${run_name}"
+fi
