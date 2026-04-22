@@ -164,8 +164,8 @@ def plot_sweep(runs: list[dict], out_pdf: Path) -> None:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--runs_root", required=True)
-    p.add_argument("--out_dir", default="docs/26_nips_fura_paper/tables")
-    p.add_argument("--plot_dir", default="docs/26_nips_fura_paper/figs")
+    p.add_argument("--out_dir", default="docs/reports/tables")
+    p.add_argument("--plot_dir", default="docs/reports/figs")
     args = p.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

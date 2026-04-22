@@ -8,7 +8,7 @@ set -euo pipefail
 GPU="${GPU:-0}"
 OUT_ROOT="${OUT_ROOT:-/data/yequan/fura/sys_eval/kernel}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT="${REPORT:-docs/26_nips_fura_paper/kernel_eval_report.md}"
+REPORT="${REPORT:-docs/reports/kernel_eval_report.md}"
 
 mkdir -p "${OUT_ROOT}"
 
