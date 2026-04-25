@@ -41,6 +41,9 @@ class TestQBTTConversionFlat(unittest.TestCase):
         self.assertTrue(trainable.requires_grad)
         self.assertTrue(hasattr(trainable, "btt_layout"))
         self.assertEqual(trainable.btt_layout, "new")
+        # Flat frozen core must be registered as a parameter so model.to() and
+        # state_dict() work correctly.
+        self.assertIn("_qfura_frozen_flat", dict(qbtt.named_parameters()))
 
     def test_flat_layout_dequant_roundtrip_within_tolerance(self):
         btt = self._make_btt()

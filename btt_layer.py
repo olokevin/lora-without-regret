@@ -861,6 +861,7 @@ class QBTTLayer(BTTLayer):
       _qfura_frozen_side: "btt_l" or "btt_r".
       _qfura_frozen_shape: tuple, original 3D shape of the frozen core.
       _qfura_frozen_dtype: torch.dtype, dtype pre-quantization.
+      _qfura_compute_dtype: torch.dtype, dtype to use when dequanting back for forward pass.
     """
 
     def __init__(self, *args, **kwargs):
@@ -869,6 +870,7 @@ class QBTTLayer(BTTLayer):
         self._qfura_frozen_side = None
         self._qfura_frozen_shape = None
         self._qfura_frozen_dtype = None
+        self._qfura_compute_dtype = None
 
     def _dequantize_frozen_core(self):
         """Dequant the frozen NF4 core back to its original 3D bf16 layout."""
@@ -879,7 +881,7 @@ class QBTTLayer(BTTLayer):
                 quant_state=self._qfura_frozen_flat.quant_state,
             )
             return dequanted.reshape(self._qfura_frozen_shape).to(
-                self._qfura_frozen_dtype
+                self._qfura_compute_dtype
             )
         elif self._qfura_layout == "per_core_block":
             blocks = []
@@ -890,7 +892,7 @@ class QBTTLayer(BTTLayer):
                 blocks.append(deq)
             stacked = torch.stack(blocks, dim=0)
             return stacked.reshape(self._qfura_frozen_shape).to(
-                self._qfura_frozen_dtype
+                self._qfura_compute_dtype
             )
         else:
             raise RuntimeError(
@@ -933,6 +935,10 @@ def quantize_frozen_core_(
         raise ValueError("layout must be 'flat' or 'per_core_block'")
     if not isinstance(btt_layer, BTTLayer):
         raise TypeError(f"expected BTTLayer, got {type(btt_layer).__name__}")
+    if isinstance(btt_layer, QBTTLayer):
+        raise ValueError(
+            "quantize_frozen_core_ called on a QBTTLayer that is already quantized."
+        )
 
     frozen_side = _pick_frozen_side(btt_layer)
     frozen_param = getattr(btt_layer, frozen_side)
@@ -945,6 +951,7 @@ def quantize_frozen_core_(
     btt_layer._qfura_frozen_side = frozen_side
     btt_layer._qfura_frozen_shape = frozen_shape
     btt_layer._qfura_frozen_dtype = frozen_dtype
+    btt_layer._qfura_compute_dtype = compute_dtype
 
     if layout == "flat":
         flat = frozen_param.detach().reshape(-1, 1).contiguous()
@@ -957,7 +964,7 @@ def quantize_frozen_core_(
         )
         # Params4bit triggers NF4 quantization on .to(device). Must land on CUDA.
         p4 = p4.to(device=frozen_param.device)
-        btt_layer._qfura_frozen_flat = p4
+        btt_layer.register_parameter("_qfura_frozen_flat", p4)
     else:  # per_core_block
         # btt_l shape (m, rank*n, a): one block per m axis.
         # btt_r shape (n, b, m*rank): one block per n axis.
@@ -973,10 +980,11 @@ def quantize_frozen_core_(
                 quant_storage=torch.uint8,
             )
             p4 = p4.to(device=frozen_param.device)
+            btt_layer.register_parameter(f"_qfura_frozen_block_{i}", p4)
             block_list.append(p4)
-        # Store as a ParameterList substitute via regular list (not registered as
-        # nn.Parameter; Params4bit handles its own state).
-        btt_layer._qfura_frozen_blocks = block_list
+        # Keep convenience list for _dequantize_frozen_core iteration.
+        # Use object.__setattr__ to bypass nn.Module's __setattr__ magic on lists.
+        object.__setattr__(btt_layer, "_qfura_frozen_blocks", block_list)
 
     # Remove the frozen core from the module's parameter list.
     delattr(btt_layer, frozen_side)
