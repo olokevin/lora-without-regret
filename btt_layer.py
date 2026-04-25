@@ -874,6 +874,10 @@ class QBTTLayer(BTTLayer):
 
     def _dequantize_frozen_core(self):
         """Dequant the frozen NF4 core back to its original 3D bf16 layout."""
+        assert self._qfura_compute_dtype is not None, (
+            "_dequantize_frozen_core called on a QBTTLayer without "
+            "_qfura_compute_dtype set; use quantize_frozen_core_() to initialize."
+        )
         if self._qfura_layout == "flat":
             # _qfura_frozen_flat is a Params4bit of shape (numel, 1).
             dequanted = _bnb.functional.dequantize_4bit(
@@ -927,7 +931,25 @@ def quantize_frozen_core_(
 ):
     """Mutate `btt_layer` in place: replace its frozen BTT core with an NF4 blob.
 
-    Returns a QBTTLayer (same Python object, reclassed via __class__ assignment).
+    Args:
+        btt_layer: A BTTLayer (not yet a QBTTLayer) with trainability already
+            configured via configure_blocktt_trainability so exactly one of
+            btt_l / btt_r has requires_grad=False.
+        layout: "flat" — pack the entire frozen core into one Params4bit;
+                "per_core_block" — pack each outermost-dim block into its own
+                Params4bit (one per m for btt_l, one per n for btt_r).
+        compute_dtype: dtype the dequanted tensor is cast to inside
+            _dequantize_frozen_core. The forward pass and downstream bmm/einsum
+            run in this dtype. Default torch.bfloat16.
+        double_quant: pass-through to bnb's compress_statistics. Quantizes the
+            quantization absmax values for ~0.4 extra bits saved per param.
+        quant_type: "nf4" (default) or "fp4". Forwarded to Params4bit.
+
+    Returns:
+        The same Python object, reclassed to QBTTLayer via __class__
+        assignment. The frozen-side btt_l / btt_r attribute is removed; the
+        Params4bit blob(s) are registered as parameter(s) under
+        _qfura_frozen_flat (flat layout) or _qfura_frozen_block_{i} (per-block).
     """
     if not _HAS_BNB:
         raise ImportError("bitsandbytes is not installed; required for qfura")
