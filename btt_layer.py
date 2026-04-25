@@ -841,6 +841,180 @@ class BTTLayer(nn.Module):
         return out
 
 
+try:
+    import bitsandbytes as _bnb
+    _HAS_BNB = True
+except ImportError:
+    _bnb = None
+    _HAS_BNB = False
+
+
+class QBTTLayer(BTTLayer):
+    """BTTLayer with the frozen core stored as NF4 via bitsandbytes.
+
+    The frozen side is determined by which BTTLayer core has requires_grad=False
+    after configure_blocktt_trainability. The trainable core and btt_s remain as
+    regular bf16 nn.Parameters.
+
+    Attributes:
+      _qfura_layout: "flat" or "per_core_block".
+      _qfura_frozen_side: "btt_l" or "btt_r".
+      _qfura_frozen_shape: tuple, original 3D shape of the frozen core.
+      _qfura_frozen_dtype: torch.dtype, dtype pre-quantization.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._qfura_layout = None
+        self._qfura_frozen_side = None
+        self._qfura_frozen_shape = None
+        self._qfura_frozen_dtype = None
+
+    def _dequantize_frozen_core(self):
+        """Dequant the frozen NF4 core back to its original 3D bf16 layout."""
+        if self._qfura_layout == "flat":
+            # _qfura_frozen_flat is a Params4bit of shape (numel, 1).
+            dequanted = _bnb.functional.dequantize_4bit(
+                self._qfura_frozen_flat.data,
+                quant_state=self._qfura_frozen_flat.quant_state,
+            )
+            return dequanted.reshape(self._qfura_frozen_shape).to(
+                self._qfura_frozen_dtype
+            )
+        elif self._qfura_layout == "per_core_block":
+            blocks = []
+            for params_4bit in self._qfura_frozen_blocks:
+                deq = _bnb.functional.dequantize_4bit(
+                    params_4bit.data, quant_state=params_4bit.quant_state
+                )
+                blocks.append(deq)
+            stacked = torch.stack(blocks, dim=0)
+            return stacked.reshape(self._qfura_frozen_shape).to(
+                self._qfura_frozen_dtype
+            )
+        else:
+            raise RuntimeError(
+                f"QBTTLayer has invalid _qfura_layout: {self._qfura_layout}"
+            )
+
+
+def _pick_frozen_side(btt_layer):
+    """Return 'btt_l' or 'btt_r' depending on which side is frozen after
+    configure_blocktt_trainability."""
+    l_trainable = btt_layer.btt_l.requires_grad
+    r_trainable = btt_layer.btt_r.requires_grad
+    if l_trainable and r_trainable:
+        raise ValueError(
+            "quantize_frozen_core_ requires exactly one frozen BTT core. "
+            "Both btt_l and btt_r have requires_grad=True; this is train_position='both'."
+        )
+    if not l_trainable and not r_trainable:
+        raise ValueError(
+            "quantize_frozen_core_ requires exactly one frozen BTT core. "
+            "Neither btt_l nor btt_r has requires_grad=True; trainability was not configured."
+        )
+    return "btt_r" if l_trainable else "btt_l"
+
+
+def quantize_frozen_core_(
+    btt_layer,
+    layout,
+    compute_dtype=torch.bfloat16,
+    double_quant=True,
+    quant_type="nf4",
+):
+    """Mutate `btt_layer` in place: replace its frozen BTT core with an NF4 blob.
+
+    Returns a QBTTLayer (same Python object, reclassed via __class__ assignment).
+    """
+    if not _HAS_BNB:
+        raise ImportError("bitsandbytes is not installed; required for qfura")
+    if layout not in {"flat", "per_core_block"}:
+        raise ValueError("layout must be 'flat' or 'per_core_block'")
+    if not isinstance(btt_layer, BTTLayer):
+        raise TypeError(f"expected BTTLayer, got {type(btt_layer).__name__}")
+
+    frozen_side = _pick_frozen_side(btt_layer)
+    frozen_param = getattr(btt_layer, frozen_side)
+    frozen_shape = tuple(frozen_param.shape)
+    frozen_dtype = frozen_param.dtype
+
+    # Reclass to QBTTLayer without re-running __init__.
+    btt_layer.__class__ = QBTTLayer
+    btt_layer._qfura_layout = layout
+    btt_layer._qfura_frozen_side = frozen_side
+    btt_layer._qfura_frozen_shape = frozen_shape
+    btt_layer._qfura_frozen_dtype = frozen_dtype
+
+    if layout == "flat":
+        flat = frozen_param.detach().reshape(-1, 1).contiguous()
+        p4 = _bnb.nn.Params4bit(
+            flat,
+            requires_grad=False,
+            quant_type=quant_type,
+            compress_statistics=double_quant,
+            quant_storage=torch.uint8,
+        )
+        # Params4bit triggers NF4 quantization on .to(device). Must land on CUDA.
+        p4 = p4.to(device=frozen_param.device)
+        btt_layer._qfura_frozen_flat = p4
+    else:  # per_core_block
+        # btt_l shape (m, rank*n, a): one block per m axis.
+        # btt_r shape (n, b, m*rank): one block per n axis.
+        block_list = []
+        outer = frozen_shape[0]
+        for i in range(outer):
+            block = frozen_param[i].detach().contiguous()
+            p4 = _bnb.nn.Params4bit(
+                block,
+                requires_grad=False,
+                quant_type=quant_type,
+                compress_statistics=double_quant,
+                quant_storage=torch.uint8,
+            )
+            p4 = p4.to(device=frozen_param.device)
+            block_list.append(p4)
+        # Store as a ParameterList substitute via regular list (not registered as
+        # nn.Parameter; Params4bit handles its own state).
+        btt_layer._qfura_frozen_blocks = block_list
+
+    # Remove the frozen core from the module's parameter list.
+    delattr(btt_layer, frozen_side)
+
+    return btt_layer
+
+
+def convert_btt_to_qbtt_(model, layout):
+    """Walk `model` and replace every BTTLayer (with trainability configured)
+    with a QBTTLayer. Returns stats dict."""
+    num_converted = 0
+    bytes_saved = 0
+    names = []
+    for name, module in model.named_modules():
+        if not isinstance(module, BTTLayer):
+            continue
+        if isinstance(module, QBTTLayer):
+            continue  # already converted
+        # Only convert if exactly one core is frozen.
+        l_train = module.btt_l.requires_grad
+        r_train = module.btt_r.requires_grad
+        if l_train == r_train:
+            continue
+        frozen_param = module.btt_r if l_train else module.btt_l
+        bf16_bytes = frozen_param.numel() * 2  # bf16 is 2 bytes/elem
+        nf4_bytes = frozen_param.numel() // 2  # nf4 is 0.5 bytes/elem
+        bytes_saved += bf16_bytes - nf4_bytes
+        quantize_frozen_core_(module, layout=layout)
+        num_converted += 1
+        names.append(name)
+    return {
+        "num_converted": num_converted,
+        "bytes_saved": bytes_saved,
+        "layout": layout,
+        "names": names,
+    }
+
+
 import os as _os
 if _os.environ.get("FURA_FUSED_STEP2") == "1":
     BTTLayer.use_fused_step2 = True
