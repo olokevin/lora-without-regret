@@ -903,6 +903,68 @@ class QBTTLayer(BTTLayer):
                 f"QBTTLayer has invalid _qfura_layout: {self._qfura_layout}"
             )
 
+    def forward(self, x):
+        if x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"QBTTLayer expected last dim {self.in_features}, got {x.shape[-1]}"
+            )
+
+        # Dequant the frozen core to its original 3D bf16 layout.
+        frozen_dequanted = self._dequantize_frozen_core()
+        if self._qfura_frozen_side == "btt_l":
+            btt_l = frozen_dequanted
+            btt_r = self.btt_r
+        else:
+            btt_l = self.btt_l
+            btt_r = frozen_dequanted
+
+        orig_shape = x.shape
+        x = x.reshape(-1, self.n, self.b)
+        batch_n = x.shape[0]
+        x_t = x.transpose(0, 1).contiguous()
+
+        # Step 1: (n, B, b) @ (n, b, m*r) -> (n, B, m*r)
+        inner_up = torch.bmm(x_t, btt_r)
+        inner_up = inner_up.reshape(self.n, batch_n, self.m, self.rank)
+        inner_up = inner_up.permute(2, 1, 0, 3).contiguous()
+
+        if self.use_gate_proj:
+            inner_gate = torch.bmm(x_t, self.btt_g)
+            inner_gate = inner_gate.reshape(self.n, batch_n, self.m, self.rank)
+            inner_gate = inner_gate.permute(2, 1, 0, 3).contiguous()
+            inner = torch.nn.functional.silu(inner_gate) * inner_up
+        else:
+            inner = inner_up
+            if hasattr(self, "act_fn"):
+                inner = self.act_fn(inner)
+
+        # Step 2: (m, B, n*r) @ (m, n*r, a) -> (m, B, a)
+        if BTTLayer.use_fused_step2 and inner.is_cuda:
+            from fura_kernels import step2_s_scaled_bmm
+            out = step2_s_scaled_bmm(
+                inner.reshape(self.m, batch_n, self.rank * self.n),
+                btt_l,
+                self.btt_s,
+            )
+        else:
+            if self.btt_s is not None:
+                btt_l = (
+                    btt_l.reshape(self.m, self.n, self.rank, self.a)
+                    * self.btt_s.unsqueeze(-1)
+                ).reshape(self.m, self.rank * self.n, self.a)
+            out = torch.bmm(
+                inner.reshape(self.m, batch_n, self.rank * self.n),
+                btt_l,
+            )
+        out = out.permute(1, 0, 2).contiguous().reshape(
+            *orig_shape[:-1], self.out_features
+        )
+
+        if self.bias is not None:
+            out += self.bias
+
+        return out
+
 
 def _pick_frozen_side(btt_layer):
     """Return 'btt_l' or 'btt_r' depending on which side is frozen after
