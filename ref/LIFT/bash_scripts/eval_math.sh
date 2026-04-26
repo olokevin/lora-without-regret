@@ -46,8 +46,9 @@ fi
 MODEL="$CKPT"
 OUTPUT_DIR="${MODEL}/math"
 
-SRC_DIR="${SRC_DIR:-/home/yequan/Project/lora/lora-without-regret/ref/LIFT}"
-DATA_DIR="${DATA_DIR:-LLM-Adapters/dataset}"
+PROJECT_DIR="${PROJECT_DIR:-/home/yequan/Project/lora/lora-without-regret/.worktrees/qfura}"
+SRC_DIR="${SRC_DIR:-${PROJECT_DIR}/ref/LIFT}"
+DATA_DIR="${DATA_DIR:-/data/ruijiezhang/llm-adapter_bp/LLM-Adapters/dataset}"
 
 # datasets=(gsm8k)
 datasets=(MultiArith gsm8k AddSub AQuA SingleEq SVAMP mawps)
@@ -65,7 +66,7 @@ for dataset in "${datasets[@]}"; do
     mkdir -p $OUTPUT
     BATCH_SIZE=32
     cmd=(
-        accelerate launch --main_process_port "$master_port" ./src/eval/run_math_parallel.py
+        uv run --project "$PROJECT_DIR" accelerate launch --main_process_port "$master_port" ./src/eval/run_math_parallel.py
         --data_path "${DATA_DIR}/$dataset/test.json"
         --model_name_or_path "$MODEL"
         --base_model "$base_model"
