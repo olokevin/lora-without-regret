@@ -8,6 +8,7 @@ dependencies = [
     "bitsandbytes>=0.43",
     "datasets>=4.2.0",
     "kernels>=0.10.4",
+    "loguru>=0.7.3",
     "math-verify>=0.5",
     "numpy>=2.2.6",
     "peft>=0.17.1",
