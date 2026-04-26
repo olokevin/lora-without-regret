@@ -25,7 +25,11 @@ MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 
 wandb_project="${wandb_project:-qlora-math-${model_tag}}"
-wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())')}"
+wandb_run_id="${wandb_run_id:-$(uv run --project ${PROJECT_DIR} python -c 'import wandb; print(wandb.util.generate_id())' 2>/dev/null)}"
+no_wandb_flag=""
+if [ "${no_wandb:-0}" = "1" ]; then
+    no_wandb_flag="--no_wandb"
+fi
 
 export WANDB_RUN_ID="${wandb_run_id}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
@@ -67,6 +71,7 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --data_path ${DATA_DIR}/ft-training_set/math_10k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
+    ${no_wandb_flag} \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
 if [ "${MAX_STEPS}" = "0" ]; then
