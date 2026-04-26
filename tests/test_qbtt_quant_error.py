@@ -12,8 +12,8 @@ from btt_layer import (
 )
 
 
-FORWARD_THRESHOLDS = {"flat": 0.11, "per_core_block": 0.11}  # calibrated 2026-04-21
-BACKWARD_THRESHOLD = 0.13  # calibrated 2026-04-21
+FORWARD_THRESHOLDS = {"flat": 0.11, "per_core_block": 0.11}  # calibrated 2026-04-26
+BACKWARD_THRESHOLD = 0.13  # calibrated 2026-04-26
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for bnb NF4")
