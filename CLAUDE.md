@@ -81,6 +81,17 @@ python -m unittest tests/test_analyze_weights.py       # Weight analysis
 - RL rollout in BlockTT/SVD mode: materializes dense weights from factored layers, patches them into the model, runs local vLLM generation, then restores factored layers.
 - Checkpoints saved as `step={N}/model.safetensors` under the run output directory.
 
+## Default training settings for fura / qfura
+
+When running BlockTT (`fura`) or quantized BlockTT (`qfura`) experiments, these are the project-wide defaults unless an experiment explicitly overrides them:
+
+- `--blocktt_rank full`
+- `--decomp_mode output_one_block`
+- `--train_position small` (small core trainable, large core frozen — qfura quantizes the frozen large core to NF4)
+- `--s_merged_to keep_trainable` (singular values held in a separate trainable `btt_s` parameter; keeps the frozen core's weight magnitudes uniform, which matters for NF4 conditioning in qfura)
+
+Rationale for qfura specifically: the quant-error benchmark (`docs/reports/qfura-quant-error.md`) shows `output_one_block` achieves ~3× lower model-level KL than `input_one_block` on Llama-3-8B post-conversion, and `keep_trainable` (vs `frozen`) gives the NF4-quantized core a flat singular spectrum to encode.
+
 ## Hardware Assumptions
 
 Experiments designed for H100 (94GB). SFT uses Qwen3-4B, RL uses Qwen3-1.7B. Adjust batch size or add gradient checkpointing for smaller GPUs.
