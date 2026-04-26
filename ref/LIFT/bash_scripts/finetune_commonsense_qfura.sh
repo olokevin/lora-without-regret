@@ -10,9 +10,10 @@ export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 export HF_HOME="${HF_HOME:-/data/yequan/huggingface}"
 
-SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT      # MODIFY THIS LINE
-DATA_DIR=LLM-Adapters      # MODIFY THIS LINE
-OUTPUT_SRC_DIR=/data/yequan/fura/lift    # MODIFY THIS LINE
+PROJECT_DIR="${PROJECT_DIR:-/home/yequan/Project/lora/lora-without-regret/.worktrees/qfura}"
+SRC_DIR="${SRC_DIR:-${PROJECT_DIR}/ref/LIFT}"
+DATA_DIR="${DATA_DIR:-/data/ruijiezhang/llm-adapter_bp/LLM-Adapters}"
+OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"
 
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B}"
 decomp_mode="${decomp_mode:-output_one_block}"
@@ -40,7 +41,7 @@ mkdir -p $OUTPUT
 
 cd ${SRC_DIR}
 
-accelerate launch \
+uv run --project ${PROJECT_DIR} accelerate launch \
     --num_machines 1 \
     --num_processes 1 \
     --mixed_precision="bf16" \

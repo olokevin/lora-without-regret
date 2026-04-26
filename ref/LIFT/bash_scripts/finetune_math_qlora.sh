@@ -10,9 +10,10 @@ export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 export HF_HOME="${HF_HOME:-/data/yequan/huggingface/cache}"      # MODIFY THIS LINE
 
-SRC_DIR="${SRC_DIR:-/home/yequan/Project/lora/lora-without-regret/ref/LIFT}"      # MODIFY THIS LINE
-DATA_DIR="${DATA_DIR:-LLM-Adapters}"      # MODIFY THIS LINE
-OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"    # MODIFY THIS LINE
+PROJECT_DIR="${PROJECT_DIR:-/home/yequan/Project/lora/lora-without-regret/.worktrees/qfura}"
+SRC_DIR="${SRC_DIR:-${PROJECT_DIR}/ref/LIFT}"
+DATA_DIR="${DATA_DIR:-/data/ruijiezhang/llm-adapter_bp/LLM-Adapters}"
+OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"
 
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B}"
 lora_r="${lora_r:-64}"
@@ -20,6 +21,7 @@ lora_alpha="${lora_alpha:-128}"
 lora_dropout="${lora_dropout:-0.05}"
 lr="${lr:-1e-4}"
 seed="${seed:-43}"
+MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 
 wandb_project="${wandb_project:-qlora-math-${model_tag}}"
@@ -37,7 +39,7 @@ mkdir -p $OUTPUT
 
 cd ${SRC_DIR}
 
-accelerate launch \
+uv run --project ${PROJECT_DIR} accelerate launch \
     --num_machines 1 \
     --num_processes 1 \
     --mixed_precision="bf16" \
@@ -61,14 +63,17 @@ accelerate launch \
     --lora_alpha ${lora_alpha} \
     --lora_dropout ${lora_dropout} \
     --load_last_model \
+    --max_steps ${MAX_STEPS} \
     --data_path ${DATA_DIR}/ft-training_set/math_10k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
-bash ./bash_scripts/eval_math.sh \
-    CKPT="$OUTPUT" \
-    base_model="${MODEL}" \
-    wandb_project="${wandb_project}" \
-    wandb_run_name="${run_name}" \
-    wandb_run_id="${wandb_run_id}"
+if [ "${MAX_STEPS}" = "0" ]; then
+    bash ./bash_scripts/eval_math.sh \
+        CKPT="$OUTPUT" \
+        base_model="${MODEL}" \
+        wandb_project="${wandb_project}" \
+        wandb_run_name="${run_name}" \
+        wandb_run_id="${wandb_run_id}"
+fi
