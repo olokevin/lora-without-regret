@@ -965,6 +965,32 @@ class QBTTLayer(BTTLayer):
 
         return out
 
+    @torch.no_grad()
+    def materialize_dense_weight(self):
+        """Dequant the frozen core and materialize the dense bf16 weight.
+
+        Used at checkpoint save time: the saved HF-format weight is the dequanted
+        BTT factorization, which introduces a one-shot quantization round-trip
+        error (documented in the design spec).
+        """
+        if self.lr_act:
+            raise ValueError("Dense materialization only supports lr_act=False")
+        frozen_dequanted = self._dequantize_frozen_core()
+        if self._qfura_frozen_side == "btt_l":
+            btt_l = frozen_dequanted
+            btt_r = self.btt_r
+        else:
+            btt_l = self.btt_l
+            btt_r = frozen_dequanted
+        r = btt_r.reshape(self.n, self.b, self.m, self.rank).permute(2, 0, 3, 1)
+        l = btt_l.reshape(self.m, self.n, self.rank, self.a)
+        if self.btt_s is not None:
+            l = l * self.btt_s.unsqueeze(-1)
+        w_blocks = torch.einsum("mnra,mnrb->mnab", l, r)
+        return w_blocks.permute(0, 2, 1, 3).reshape(
+            self.out_features, self.in_features
+        )
+
 
 def _pick_frozen_side(btt_layer):
     """Return 'btt_l' or 'btt_r' depending on which side is frozen after

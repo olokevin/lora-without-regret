@@ -138,5 +138,37 @@ class TestQBTTConversionModelWide(unittest.TestCase):
         self.assertIsInstance(model.k_proj, QBTTLayer)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for bnb NF4")
+class TestQBTTMaterialize(unittest.TestCase):
+    def test_materialize_dense_weight_close_to_btt(self):
+        import copy as _copy
+
+        torch.manual_seed(0)
+        linear = nn.Linear(64, 64, bias=True).cuda().to(torch.bfloat16)
+        model = nn.Module()
+        model.add_module("q_proj", linear)
+        convert_linear_to_btt(
+            model,
+            btt_rank="full",
+            decomp_mode="square",
+            include_names=("q_proj",),
+            train_position="small",
+            s_merged_to="frozen",
+        )
+        configure_blocktt_trainability(model, train_position="small")
+        btt_ref = _copy.deepcopy(model.q_proj)
+        qbtt = quantize_frozen_core_(model.q_proj, layout="flat")
+
+        w_ref = btt_ref.materialize_dense_weight()
+        w_q = qbtt.materialize_dense_weight()
+
+        self.assertEqual(w_q.shape, w_ref.shape)
+        rel_err = (
+            (w_ref.float() - w_q.float()).norm()
+            / w_ref.float().norm().clamp_min(1e-12)
+        )
+        self.assertLess(rel_err.item(), 0.15)
+
+
 if __name__ == "__main__":
     unittest.main()
