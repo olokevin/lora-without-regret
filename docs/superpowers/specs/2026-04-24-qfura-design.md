@@ -165,6 +165,8 @@ Everything else — data loading, collator, eval loop, `save_hf_format`, calib-m
 
 - `--train_position` — must equal `small`.
 - `--gradient_checkpointing` — must be set.
+- `--decomp_mode` — default `output_one_block`. The benchmark in `docs/reports/qfura-quant-error.md` measured KL=0.31 for `output_one_block` vs KL=0.98 for `input_one_block` on Llama-3-8B with `s_merged_to=keep_trainable`. `output_one_block` may still be overridden per-experiment.
+- `--s_merged_to` — default `keep_trainable`. Holds singular values in a separate trainable `btt_s` so the frozen quantized core has near-uniform magnitude (better-conditioned for NF4 than `frozen` which absorbs the full singular spectrum).
 
 **Hardcoded (not exposed):** NF4 quant type, double quantization enabled, bf16 compute dtype, `PagedAdamW8bit`, gradient checkpointing required.
 
