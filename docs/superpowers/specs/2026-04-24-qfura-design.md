@@ -138,7 +138,7 @@ The committed report `docs/reports/qfura-quant-error.md` contains:
 - Model-level summary row.
 - A concluding paragraph stating the default layout chosen and the rationale (lower model-level KL wins; ties broken in favor of `flat` for simplicity).
 
-**Default for `--quant_block_layout`:** placeholder `flat` until the benchmark report is committed. After the report lands, this spec and `finetune_commonsense_qfura.sh`'s default are updated to match.
+**Default for `--quant_block_layout`:** `flat`, confirmed by the benchmark report (`docs/reports/qfura-quant-error.md`). With `decomp_mode=output_one_block` and `s_merged_to=keep_trainable`, `flat` and `per_core_block` produce identical model-level KL (0.3057) because `output_one_block` yields a frozen `btt_r` whose outer dim is 1, making per-block and flat packing equivalent; `flat` is therefore the default for simplicity.
 
 ### 4.7 Training entrypoint
 
@@ -159,7 +159,7 @@ Everything else — data loading, collator, eval loop, `save_hf_format`, calib-m
 
 **New flag on `finetune_qfura.py`:**
 
-- `--quant_block_layout {flat, per_core_block}` — required. Default set post-benchmark (placeholder `flat`).
+- `--quant_block_layout {flat, per_core_block}` — required. Default: `flat` (confirmed by the quant-error benchmark; see `docs/reports/qfura-quant-error.md`).
 
 **Flags inherited and constrained:**
 
@@ -174,7 +174,7 @@ Copy of `finetune_commonsense_blocktt.sh`, changing:
 
 - The `accelerate launch` target to `src/finetune_qfura.py`.
 - Default `MODEL="${MODEL:-meta-llama/Meta-Llama-3-70B}"` (qfura's headline is 70B; blocktt's is 8B).
-- New env var `quant_block_layout="${quant_block_layout:-flat}"` forwarded as `--quant_block_layout`.
+- New env var `quant_block_layout="${quant_block_layout:-flat}"` forwarded as `--quant_block_layout` (default `flat` confirmed by benchmark).
 - `train_position` forced to `small` regardless of env var.
 - `per_device_train_batch_size=1`, `gradient_accumulation_steps=16` (match blocktt's effective batch size while fitting 70B activations).
 - Output dir template: `commonsense/${MODEL}/qfura-layout_${quant_block_layout}-lr_${lr}-decomp_${decomp_mode}-seed_${seed}`.
