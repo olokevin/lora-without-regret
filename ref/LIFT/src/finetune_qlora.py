@@ -467,7 +467,10 @@ def main():
 
     # Save final model if no validation
     # PEFT's save_pretrained saves only the adapter weights; the frozen 4-bit base
-    # is not saved (it is reloaded from the original checkpoint at eval time).
+    # is not saved here. To get a full HF-format checkpoint usable by
+    # bash_scripts/eval_math.sh / eval_commonsense.sh, run
+    # tools/merge_qlora_for_eval.py after training to merge the adapter into
+    # the (bf16) base and save as a full model.
     if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
