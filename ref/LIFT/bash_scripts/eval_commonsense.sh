@@ -46,8 +46,9 @@ fi
 MODEL="$CKPT"
 OUTPUT_DIR="${MODEL}/commonsense"
 
-SRC_DIR=/home/yequan/Project/lora/lora-without-regret/ref/LIFT
-DATA_DIR=LLM-Adapters/dataset
+PROJECT_DIR="${PROJECT_DIR:-/home/yequan/Project/lora/lora-without-regret/.worktrees/qfura}"
+SRC_DIR="${SRC_DIR:-${PROJECT_DIR}/ref/LIFT}"
+DATA_DIR="${DATA_DIR:-/data/ruijiezhang/llm-adapter_bp/LLM-Adapters/dataset}"
 
 # datasets=(boolq)
 datasets=(boolq piqa social_i_qa ARC-Challenge ARC-Easy openbookqa hellaswag winogrande)
@@ -65,7 +66,7 @@ for dataset in "${datasets[@]}"; do
     mkdir -p $OUTPUT
     BATCH_SIZE=32
     cmd=(
-        accelerate launch --main_process_port "$master_port" ./src/eval/run_commonsense_parallel.py
+        uv run --project "$PROJECT_DIR" accelerate launch --main_process_port "$master_port" ./src/eval/run_commonsense_parallel.py
         --data_path "${DATA_DIR}/$dataset/test.json"
         --model_name_or_path "$MODEL"
         --base_model "$base_model"
