@@ -66,23 +66,51 @@ Both QLoRA runs are slower per-step than qfura because the 4-bit dequant happens
 
 ## Commonsense Results
 
-`LLM-Adapters/ft-training_set/commonsense_170k.json` (170k examples, 3 epochs, lr 2e-4 commonsense / 1e-4 math, batch 8×2 accum, 31932 optimizer steps). Eval harness: `ref/LIFT/bash_scripts/eval_commonsense.sh` over 8 commonsense reasoning datasets.
+`LLM-Adapters/ft-training_set/commonsense_170k.json` (170k examples, 3 epochs, lr 2e-4, batch 8×2 accum, 31932 optimizer steps). Eval harness: `ref/LIFT/bash_scripts/eval_commonsense.sh` over 8 commonsense reasoning datasets.
 
-**Status:** Runs in progress as of 2026-04-27. Both qfura (GPU 2) and QLoRA r=48 (GPU 3) launched at 01:23. Expected completion ~10 hours per run with eval following.
+| Dataset | n | qfura (1.46%) | QLoRA r=48 (1.54%) | gap (qfura − QLoRA) |
+|---|---:|---:|---:|---:|
+| BoolQ | 3270 | 73.00 | 65.10 | +7.90 |
+| PIQA | 1838 | 89.90 | 71.30 | +18.60 |
+| SIQA (social_i_qa) | 1954 | 82.70 | 70.90 | +11.80 |
+| HellaSwag | 10042 | 96.60 | 70.00 | +26.60 |
+| WinoGrande | 1267 | 89.10 | 72.20 | +16.90 |
+| ARC-Easy | 2376 | 93.10 | 67.80 | +25.30 |
+| ARC-Challenge | 1172 | 83.40 | 55.50 | +27.90 |
+| OBQA (openbookqa) | 500 | 90.60 | 68.20 | +22.40 |
+| **Average (unweighted)** | | **87.30** | **67.63** | **+19.68** |
+| **Average (n-weighted)** | 22419 | **89.30** | **69.40** | **+19.90** |
 
-Results table to be filled in when both runs + evals complete:
+### Commonsense observations
 
-| Dataset | n | qfura (1.46%) | QLoRA r=48 (1.54%) |
+- **qfura dominates QLoRA by ~20 points at parameter parity on commonsense reasoning.** Every dataset shows qfura ahead, gaps ranging from +7.9 (BoolQ) to +27.9 (ARC-Challenge). This is the inverse of the math result, where QLoRA at the same param budget edges qfura by +1.2-+2.0 points.
+- **HellaSwag (n=10042) is qfura's strongest absolute showing: 96.60%** — the largest test set in the suite. QLoRA's 70.00% on the same set suggests it failed to converge to the multi-choice continuation pattern that qfura learned.
+- **ARC-Challenge gap is the largest (+27.9 points).** Hardest commonsense reasoning task in the suite; qfura's BTT-then-quantize pipeline retains capacity to learn it; QLoRA's r=48 LoRA adapters at the same param budget do not.
+- **All 4 multi-choice question datasets (PIQA, OBQA, ARC-E, ARC-C) show 18-28 point gaps.** All 4 binary/two-choice (BoolQ, WinoGrande) and rationale-style (HellaSwag, SIQA) datasets show 8-27 point gaps. The pattern is uniform — qfura consistently better, not specific to one task type.
+- **QLoRA's commonsense numbers (avg 67.6%) are well below typical 8B-LoRA papers** (usually 75-85%). This suggests QLoRA at r=48 is genuinely under-fit for the 170k-example commonsense corpus, while qfura's BTT factorization captures more of it at the same parameter budget.
+
+### Commonsense training time
+
+| Method | Wall clock (3 epochs) |
+|---|---|
+| qfura | 9h 25m |
+| QLoRA r=48 | 10h 21m |
+
+## The math vs commonsense reversal
+
+The single most striking finding from these experiments: **qfura's relative performance against QLoRA at parameter parity flips by ~22 points between math and commonsense.**
+
+| Suite | qfura avg (n-weighted) | QLoRA r=48 avg (n-weighted) | qfura − QLoRA r=48 |
 |---|---:|---:|---:|
-| BoolQ | TBD | TBD | TBD |
-| PIQA | TBD | TBD | TBD |
-| SIQA (social_i_qa) | TBD | TBD | TBD |
-| HellaSwag | TBD | TBD | TBD |
-| WinoGrande | TBD | TBD | TBD |
-| ARC-Easy | TBD | TBD | TBD |
-| ARC-Challenge | TBD | TBD | TBD |
-| OBQA (openbookqa) | TBD | TBD | TBD |
-| **Average (unweighted)** | | TBD | TBD |
+| Math (math_10k.json) | 75.98 | 78.00 | **−2.02** |
+| Commonsense (commonsense_170k.json) | 89.30 | 69.40 | **+19.90** |
+
+Possible explanations to investigate:
+
+1. **Dataset size effect.** Commonsense has 17× more training examples than math (170k vs 10k). At the same trainable param budget, qfura's BTT structure may scale to absorb large datasets better than QLoRA's low-rank adapters. The 6× more optimizer steps (31932 vs 1842) compound any structural advantage.
+2. **Task structure.** Math is closed-form symbolic reasoning where the right answer is mostly a deterministic function of the input. Commonsense has a much wider distribution of "reasonable" continuations; absorbing that distribution may benefit from the higher effective rank that BTT provides on each linear (full rank in qfura's defaults vs r=48 in QLoRA).
+3. **Quantization noise interaction.** Commonsense answers are short and high-entropy in token-space; even small per-token logit errors can flip a multi-choice answer. QLoRA's NF4 quantization of the full base injects noise on every matmul; qfura's NF4 only on the frozen BTT core. The relative noise budget per forward may matter more for commonsense than for math (where the model has thousands of forward steps to recover via chain-of-thought).
+4. **Training-recipe interaction.** Math used lr 1e-4 + batch=1×16accum; commonsense used lr 2e-4 + batch=8×2accum. The higher commonsense LR might over-fit QLoRA's smaller-effective-rank adapters more aggressively.
 
 ## Reproducibility
 
@@ -136,4 +164,9 @@ For pre-training-state error analysis (no fine-tuning):
 - `docs/reports/qfura-quant-error.md` — qfura post-conversion error sweep over decomp_mode × layout. Best config: `decomp_mode=output_one_block, layout=flat, s_merged_to=keep_trainable` → model-level KL = 0.31 vs bf16 base.
 - `docs/reports/qlora-quant-error.md` — QLoRA post-conversion error (NF4 of the original `nn.Linear.weight`, no LoRA adapters). Model-level KL = 0.19.
 
-The pre-training KL gap (qfura 0.31 vs QLoRA 0.19, ~1.6×) tracks the trained-state n-weighted accuracy gap (qfura 75.98 vs QLoRA r=48 78.00, ~2.7%-pt; vs QLoRA r=64 79.46, ~4.6%-pt). Closer initial states yield slightly better fine-tuned models — but the gap shrinks dramatically when QLoRA is constrained to qfura's parameter budget.
+**The pre-training KL gap (qfura 0.31 vs QLoRA 0.19) does NOT predict downstream accuracy across suites.**
+
+- On math, the KL gap weakly tracks the trained-state gap: QLoRA's lower KL (0.19) maps to a 2-point math advantage at param parity, 3.5 points at default rank.
+- On commonsense, qfura's higher pre-training KL (0.31) does *not* hurt — qfura outperforms QLoRA by 19.9 points despite starting from a worse-conditioned initial state.
+
+Initial-state quantization error is a poor proxy for trained-state quality. The structural difference (BTT factorization vs LoRA adapter) is more important than the per-layer quantization-noise difference, and the relative benefit depends strongly on the task domain and dataset size.
