@@ -1,4 +1,6 @@
 #!/bin/bash
+# Full-FT math launcher with bs=2, grad_accum=8, no gradient checkpointing.
+# Mirrors finetune_math_full.sh; differs only in batch/accum/ckpt.
 
 pwd
 hostname
@@ -8,31 +10,25 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export LIBRARY_PATH="/usr/local/cuda/lib64:$LIBRARY_PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-export HF_HOME="${HF_HOME:-/data/yequan/huggingface/cache}"      # MODIFY THIS LINE
+export HF_HOME="${HF_HOME:-/data/yequan/huggingface/cache}"
 
-SRC_DIR="${SRC_DIR:-/home/yequan/Project/lora/lora-without-regret/ref/LIFT}"      # MODIFY THIS LINE
-DATA_DIR="${DATA_DIR:-LLM-Adapters}"      # MODIFY THIS LINE
-OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"    # MODIFY THIS LINE
-
-# SLURM_ARRAY_TASK_ID=$1
-# cfg=$(sed -n "$SLURM_ARRAY_TASK_ID"p ${SRC_DIR}/bash_scripts/slurm_config_full_math.txt)
-# MODEL=$(echo $cfg | cut -f 1 -d ' ')
-# lr=$(echo $cfg | cut -f 2 -d ' ')
-# seed=$(echo $cfg | cut -f 3 -d ' ')
+SRC_DIR="${SRC_DIR:-/home/yequan/Project/lora/lora-without-regret/ref/LIFT}"
+DATA_DIR="${DATA_DIR:-LLM-Adapters}"
+OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"
 
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B}"
 lr="${lr:-5e-5}"
 seed="${seed:-43}"
 model_tag="${MODEL##*/}"
 wandb_project="${wandb_project:-math-${model_tag}}"
-wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())')}"
+wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())' 2>/dev/null || echo "")}"
 
 export WANDB_RUN_ID="${wandb_run_id}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 echo $MODEL
 
-OUTPUT=${OUTPUT_SRC_DIR}/math/${MODEL}/full-lr_${lr}-seed_${seed}
+OUTPUT=${OUTPUT_SRC_DIR}/math/${MODEL}/full-bs2gacc8-noctk-lr_${lr}-seed_${seed}
 run_name="${run_name:-$(basename "$OUTPUT")}"
 mkdir -p $OUTPUT
 

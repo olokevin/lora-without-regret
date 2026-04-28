@@ -2,7 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
@@ -29,7 +29,14 @@ class TestSaveMergedCheckpointPeftFamily(unittest.TestCase):
             args.enable_merged_ckpt = True
             run_rl.save_merged_checkpoint(model, _Tokenizer(), ckpt, train_mode, args)
             model.merge_adapter.assert_called_once()
-            base.save_pretrained.assert_called_once_with(ckpt)
+            if train_mode == "randlora":
+                # randlora_A is shared across layers; safetensors refuses shared
+                # storages, so we must save via torch.save.
+                base.save_pretrained.assert_called_once_with(
+                    ckpt, safe_serialization=False
+                )
+            else:
+                base.save_pretrained.assert_called_once_with(ckpt)
             model.unmerge_adapter.assert_called_once()
             model.save_pretrained.assert_not_called()
             self.assertTrue(os.path.exists(os.path.join(ckpt, "tokenizer.json")))
@@ -95,6 +102,22 @@ class TestResolveLoraRolloutBackend(unittest.TestCase):
             "local_inproc",
         )
 
+    def test_dora_can_use_local_fallback(self):
+        import run_rl
+        with patch.object(run_rl, "is_vllm_http_available", return_value=False):
+            self.assertEqual(
+                run_rl.resolve_lora_rollout_backend("dora", "http://localhost:8000"),
+                "local_inproc",
+            )
+
+    def test_randlora_can_use_local_fallback(self):
+        import run_rl
+        with patch.object(run_rl, "is_vllm_http_available", return_value=False):
+            self.assertEqual(
+                run_rl.resolve_lora_rollout_backend("randlora", "http://localhost:8000"),
+                "local_inproc",
+            )
+
     def test_lift_returns_none(self):
         import run_rl
         self.assertIsNone(
@@ -119,6 +142,14 @@ class TestNormalizeLoraMergedWeightName(unittest.TestCase):
         import run_rl
         self.assertIsNone(
             run_rl.normalize_lora_merged_weight_name("foo.randlora_m")
+        )
+
+    def test_skips_dora_magnitude_vector(self):
+        import run_rl
+        self.assertIsNone(
+            run_rl.normalize_lora_merged_weight_name(
+                "foo.lora_magnitude_vector.default.weight"
+            )
         )
 
     def test_passes_normal_param_through(self):

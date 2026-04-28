@@ -95,6 +95,23 @@ class SVDLayer(nn.Module):
         u, s, vh = torch.linalg.svd(weight.to(dtype=compute_dtype), full_matrices=False)
         s = torch.clamp(s, min=0)
 
+        # MOTIVATION-STUDY HOOK (F1): replace the pretrained left basis u with a
+        # random orthogonal matrix of the same shape. V is recomputed so that
+        # U (s=I) V^T best-fits W. Exact fit when d_out <= d_in; lossy
+        # projection when d_out > d_in (tall, e.g. gate/up_proj). Singular
+        # values are flattened to 1 because they no longer correspond to the
+        # random basis.
+        # Activate by setting env var FURA_SVD_RANDOM_U=1 before launching run_rl.
+        import os as _os
+        if _os.environ.get("FURA_SVD_RANDOM_U") == "1":
+            d_out, r = u.shape  # (d_out, r), r = min(d_out, d_in)
+            g = torch.randn(d_out, r, device=u.device, dtype=u.dtype)
+            u_rand, _ = torch.linalg.qr(g, mode="reduced")
+            # Recompute V so U V^T = U U^T W  (best subspace fit).
+            vh = u_rand.T @ weight.to(dtype=compute_dtype)
+            u = u_rand
+            s = torch.ones_like(s)  # scale is now carried by vh, not s.
+
         merge_target = resolve_svd_s_merged_to(
             train_position=train_position,
             s_merged_to=s_merged_to,
