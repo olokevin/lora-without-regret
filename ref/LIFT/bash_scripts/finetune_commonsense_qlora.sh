@@ -70,6 +70,7 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --val_set_size 120 \
     --eval_step 400 \
     --save_interval 100000 \
+    --load_last_model \
     --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \

@@ -92,6 +92,16 @@ When running BlockTT (`fura`) or quantized BlockTT (`qfura`) experiments, these 
 
 Rationale for qfura specifically: the quant-error benchmark (`docs/reports/qfura-quant-error.md`) shows `output_one_block` achieves ~3× lower model-level KL than `input_one_block` on Llama-3-8B post-conversion, and `keep_trainable` (vs `frozen`) gives the NF4-quantized core a flat singular spectrum to encode.
 
+## Checkpoint save policy for fine-tuning runs
+
+**All fine-tuning shell scripts under `ref/LIFT/bash_scripts/` MUST save the last-step model, not best-eval.**
+
+Pass `--load_last_model` in every `finetune_*_{lora,qlora,fura,qfura,blocktt,qdora,...}.sh`. Do NOT rely on `--val_set_size > 0` plus the implicit best-eval-checkpoint code path in `finetune_*.py`.
+
+Why: the published LIFT/LLM-Adapters LoRA recipes use last-model save. Mixing best-eval (e.g. inherited from `finetune_commonsense_blocktt.sh`'s template) with last-model breaks comparability across methods within this repo and against external baselines, because best-eval can lock in a checkpoint from before the lr-decay-to-zero phase. If a new shell script is being created by copying an existing one, audit the `--load_last_model` flag on the recipient.
+
+The default for `finetune_*.py`'s `--val_set_size` is non-zero, and not passing `--load_last_model` triggers the best-eval branch silently. Always pass the flag explicitly.
+
 ## Hardware Assumptions
 
 Experiments designed for H100 (94GB). SFT uses Qwen3-4B, RL uses Qwen3-1.7B. Adjust batch size or add gradient checkpointing for smaller GPUs.
