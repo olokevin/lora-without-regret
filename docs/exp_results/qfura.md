@@ -96,6 +96,50 @@ Both QLoRA runs are slower per-step than qfura because the 4-bit dequant happens
 | qfura | 9h 25m |
 | QLoRA r=48 | 10h 21m |
 
+## Llama-3.1-8B commonsense results
+
+Same recipe (commonsense_170k, 3 epochs, lr 2e-4, batch 8×2 accum) but with **`meta-llama/Llama-3.1-8B`** as the base. Adds a third method, **qdora** (NF4 base + DoRA adapters via PEFT `use_dora=True`, magnitude/direction decomposition).
+
+| Method | Trainable params | Trainable % |
+|---|---|---|
+| qfura (rank=full, output_one_block, keep_trainable, flat) | 118,685,696 | 1.46% |
+| QLoRA r=64 (α=128, all 7 modules) | 167,772,160 | 2.05% |
+| qdora r=64 (α=128, all 7 modules) | 169,148,416 | 2.06% |
+
+| Dataset | n | qfura | QLoRA r=64 | qdora r=64 |
+|---|---:|---:|---:|---:|
+| BoolQ | 3270 | 74.00 | 62.20 | 65.10 |
+| PIQA | 1838 | 90.80 | 79.50 | 70.40 |
+| SIQA | 1954 | 82.30 | 69.10 | 69.50 |
+| HellaSwag | 10042 | 96.60 | 82.40 | 60.90 |
+| WinoGrande | 1267 | 87.80 | 73.70 | 71.10 |
+| ARC-Easy | 2376 | 93.50 | 81.40 | 67.70 |
+| ARC-Challenge | 1172 | 83.30 | 63.80 | 52.40 |
+| OBQA | 500 | 89.40 | 70.60 | 62.20 |
+| **Average (unweighted)** | | **87.21** | **72.84** | **64.81** |
+| **Average (n-weighted)** | 22419 | **89.30** | **78.30** | **65.93** |
+
+### Llama-3.1-8B observations
+
+- **qfura is essentially unchanged** by the base-model upgrade from Llama-3 to Llama-3.1 (87.30 → 87.21 unweighted). Whatever extra pretraining 3.1 received doesn't translate to qfura's commonsense accuracy.
+- **qfura wins by ~14-22 points** depending on weighting and comparison method.
+- **qdora (DoRA adapters on NF4 base) underperforms QLoRA at the same rank** by 8.0 unweighted / 12.4 n-weighted points. This is contrary to DoRA's published claim of better-than-LoRA performance. Possible explanations:
+  1. DoRA's per-output-column magnitude vector might be sensitive to lr=2e-4 — many DoRA papers use lower LRs (5e-5 to 1e-4) because the magnitude updates compound through the per-step normalization.
+  2. PEFT's NF4 + DoRA path is newer than the LoRA path; subtle bugs may exist in the merge step (`merge_and_unload()` for DoRA reconstructs the magnitude/direction product from the saved adapter, which is more complex than LoRA's `B @ A` merge).
+  3. Best-eval-checkpoint behavior may interact with DoRA's training trajectory (transient eval-loss spikes during magnitude training could lock in a suboptimal early checkpoint).
+- **HellaSwag is the discriminator**: qdora 60.9% is *27 points below qfura* (96.6%) and *21 points below qlora* (82.4%). HellaSwag tests scene-completion semantics where the `output_one_block` BTT factorization apparently captures more useful structure than rank-64 LoRA / DoRA.
+- **The base-model upgrade helps QLoRA more than qfura.** QLoRA r=64 on Llama-3.1 (78.30 n-weighted) is ~9 points better than QLoRA r=48 on Llama-3 (69.40 n-weighted), partly from the extra rank and partly from the better base. qfura's performance is base-invariant.
+
+### Llama-3.1-8B training time
+
+| Method | Wall clock (3 epochs) |
+|---|---|
+| qfura | 11h 44m |
+| QLoRA r=64 | 10h 33m |
+| qdora r=64 | **22h 40m** |
+
+qdora is **~2.1× slower** than qlora due to DoRA's per-step column-norm computation on every linear's effective weight. This is a real cost: a method that's slower *and* less accurate has no clear regime where it wins.
+
 ## The math vs commonsense reversal
 
 The single most striking finding from these experiments: **qfura's relative performance against QLoRA at parameter parity flips by ~22 points between math and commonsense.**
@@ -157,6 +201,9 @@ The QLoRA runners auto-merge their PEFT adapter via `tools/merge_qlora_for_eval.
 - qlora math r=48 (merged): `/data/yequan/fura/lift/math/meta-llama/Meta-Llama-3-8B/qlora-r_48-alpha_96-lr_1e-4-seed_43-merged/`
 - qlora math r=64 (merged): `/data/yequan/fura/lift/math/meta-llama/Meta-Llama-3-8B/qlora-r_64-alpha_128-lr_1e-4-seed_43-merged/`
 - qlora commonsense r=48 (merged): `/data/yequan/fura/lift/commonsense/meta-llama/Meta-Llama-3-8B/qlora-r_48-alpha_96-lr_2e-4-seed_43-merged/`
+- qfura commonsense Llama-3.1: `/data/yequan/fura/lift/commonsense/meta-llama/Llama-3.1-8B/qfura-layout_flat-decomp_output_one_block_smerge_keep_trainable-lr_2e-4-seed_43/`
+- qlora commonsense Llama-3.1 r=64 (merged): `/data/yequan/fura/lift/commonsense/meta-llama/Llama-3.1-8B/qlora-r_64-alpha_128-lr_2e-4-seed_43-merged/`
+- qdora commonsense Llama-3.1 r=64 (merged): `/data/yequan/fura/lift/commonsense/meta-llama/Llama-3.1-8B/qdora-r_64-alpha_128-lr_2e-4-seed_43-merged/`
 
 ## Quantization-error references
 
