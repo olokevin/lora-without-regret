@@ -59,7 +59,7 @@ python -m unittest tests/test_analyze_weights.py       # Weight analysis
 - `legacy/` — Old per-mode entrypoints (`sft_full.py`, `sft_lora.py`, `sft_blocktt.py`, `sft_svd.py`, `rl_full.py`, `rl_lora.py`, `rl_blocktt.py`) kept for reference; prefer the unified `run_*.py` scripts.
 
 ### Custom layer decompositions
-- `btt_layer.py` — `BTTLayer` replaces `nn.Linear` with Block Tensor-Train factorization. Key functions: `convert_linear_to_btt()` replaces matching layers in-place, `configure_blocktt_trainability()` freezes/unfreezes cores. Cores are `btt_l` (left, output-side) and `btt_r` (right, input-side). The `--train-position small|large|both` flag controls which core trains; `--s-merged-to` controls where singular values are absorbed.
+- `btt_layer.py` — `BTTLayer` replaces `nn.Linear` with Block Tensor-Train factorization. Key functions: `convert_linear_to_btt()` replaces matching layers in-place, `configure_blocktt_trainability()` freezes/unfreezes cores. Cores are `btt_l` (left, output-side) and `btt_r` (right, input-side). The `--train-position small|large|both` flag controls which core trains; `--s-merged-to` controls where singular values are absorbed. The `--convert-mode {svd,qr}` flag selects the per-block decomposition: `svd` (default) gives `U S V^T`; `qr` uses LQ when `a >= b` and QR when `a < b` so the small `(k x k)` factor is always orthogonal — `qr` has no singular values and ignores `--s-merged-to` (`keep_frozen`/`keep_trainable` are rejected).
 - `svd_layer.py` — `SVDLayer` replaces `nn.Linear` with full-rank SVD factorization (`svd_a @ svd_b`). Same `convert_linear_to_svd()` / `configure_svd_trainability()` pattern. `--train-position output|input` selects trainable factor.
 
 ### Optimizers

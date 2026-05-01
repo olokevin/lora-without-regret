@@ -465,20 +465,22 @@ def main():
         },
     )
 
-    # Save final model if no validation
-    # PEFT's save_pretrained saves only the adapter weights; the frozen 4-bit base
-    # is not saved here. To get a full HF-format checkpoint usable by
-    # bash_scripts/eval_math.sh / eval_commonsense.sh, run
-    # tools/merge_qlora_for_eval.py after training to merge the adapter into
-    # the (bf16) base and save as a full model.
-    if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+    # --- Save policy: write last_adapter/ always, best_adapter/ if best-tracking ran.
+    # PEFT's save_pretrained writes adapter weights only; the 4-bit base is
+    # reloaded at eval time. Layout:
+    #   <output_dir>/last_adapter/  : final-step adapter (always)
+    #   <output_dir>/best_adapter/  : adapter at lowest val_loss (if val_set_size > 0)
+    # The shell scripts merge each subdir into bf16 base, producing
+    # <output_dir>/last/ and <output_dir>/best/ for eval.
+    def _save_adapter(src_model, sub_folder):
+        target_dir = os.path.join(args.output_dir, sub_folder)
+        os.makedirs(target_dir, exist_ok=True)
+        src_model.save_pretrained(target_dir)
+        tokenizer.save_pretrained(target_dir)
 
-    if args.output_dir is not None:
-        # Evaluate last model
+    if args.output_dir is not None and accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+
         if args.val_set_size > 0 and not args.load_last_model:
             ppl, val_loss = evaluate(model)
             print_rank_0(
@@ -490,13 +492,20 @@ def main():
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
 
-        model = best_model if best_model is not None else model
+        last_model = accelerator.unwrap_model(model)
+        _save_adapter(last_model, "last_adapter")
+        print_rank_0(
+            f"Saved last-step adapter to {os.path.join(args.output_dir, 'last_adapter')}",
+            args.global_rank,
+        )
 
-        # Save adapter weights via PEFT; the 4-bit base model is not saved here
-        # and must be reloaded separately during evaluation.
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+        if best_model is not None:
+            _save_adapter(best_model, "best_adapter")
+            print_rank_0(
+                f"Saved best-eval adapter to {os.path.join(args.output_dir, 'best_adapter')} "
+                f"(val_loss={best_eval_loss:.4f})",
+                args.global_rank,
+            )
 
     if use_wandb:
         accelerator.end_training()

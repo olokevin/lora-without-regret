@@ -529,34 +529,33 @@ def main():
         },
     )
 
-    # Save final model.
-    # qdora_impl=peft: PEFT's save_pretrained writes only the adapter; the
-    #     frozen 4-bit base must be re-merged at eval time via
-    #     tools/merge_qlora_for_eval.py.
-    # qdora_impl=fast: write a full HF-format checkpoint directly by
-    #     materializing each Qdora4bitLinear into a bf16 nn.Linear. The eval
-    #     scripts can then load it as a standard model. The output dir gets
-    #     a "-merged" suffix at the shell level so the existing flow is
-    #     preserved; here we just save to args.output_dir.
-    def _save(_model):
-        unwrapped = accelerator.unwrap_model(_model)
+    # --- Save policy: write last/ always, best/ if best-tracking ran.
+    # qdora_impl=fast: writes a fully-merged HF model directly to
+    #     <output_dir>/<sub_folder>/. Eval can load it as a standard model.
+    # qdora_impl=peft: writes only the PEFT adapter to
+    #     <output_dir>/<sub_folder>_adapter/. The shell merges into bf16 base
+    #     to produce <output_dir>/<sub_folder>/ for eval.
+    def _save_one(src_model, sub_folder):
+        unwrapped = accelerator.unwrap_model(src_model)
         if args.qdora_impl == "fast":
             from qdora_fast import materialize_qdora_to_linear
             n_merged = materialize_qdora_to_linear(unwrapped)
-            print(f"[qdora] fast path: materialized {n_merged} Qdora4bitLinear modules to nn.Linear before save")
+            print(f"[qdora] fast path ({sub_folder}): materialized {n_merged} Qdora4bitLinear modules to nn.Linear before save")
+            target_dir = os.path.join(args.output_dir, sub_folder)
+            os.makedirs(target_dir, exist_ok=True)
             unwrapped.save_pretrained(
-                args.output_dir, safe_serialization=True, max_shard_size="5GB"
+                target_dir, safe_serialization=True, max_shard_size="5GB"
             )
+            tokenizer.save_pretrained(target_dir)
         else:
-            unwrapped.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+            target_dir = os.path.join(args.output_dir, f"{sub_folder}_adapter")
+            os.makedirs(target_dir, exist_ok=True)
+            unwrapped.save_pretrained(target_dir)
+            tokenizer.save_pretrained(target_dir)
 
-    if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
+    if args.output_dir is not None and accelerator.is_main_process:
         accelerator.wait_for_everyone()
-        _save(model)
 
-    if args.output_dir is not None:
-        # Evaluate last model
         if args.val_set_size > 0 and not args.load_last_model:
             ppl, val_loss = evaluate(model)
             print_rank_0(
@@ -568,8 +567,19 @@ def main():
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
 
-        model = best_model if best_model is not None else model
-        _save(model)
+        _save_one(model, "last")
+        print_rank_0(
+            f"Saved last-step checkpoint to {os.path.join(args.output_dir, 'last' if args.qdora_impl == 'fast' else 'last_adapter')}",
+            args.global_rank,
+        )
+
+        if best_model is not None:
+            _save_one(best_model, "best")
+            print_rank_0(
+                f"Saved best-eval checkpoint to {os.path.join(args.output_dir, 'best' if args.qdora_impl == 'fast' else 'best_adapter')} "
+                f"(val_loss={best_eval_loss:.4f})",
+                args.global_rank,
+            )
 
     if use_wandb:
         accelerator.end_training()

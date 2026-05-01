@@ -74,7 +74,7 @@ accelerate launch \
     --seed ${seed} \
     --gradient_checkpointing \
     --instruction_type single \
-    --load_last_model \
+    ${LOAD_LAST_MODEL:-"--load_last_model"} \
     --adapter_name ${adapter_name} \
     --lora_r ${lora_r} \
     --lora_alpha ${lora_alpha} \
@@ -87,11 +87,32 @@ accelerate launch \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
 if [ "${MAX_STEPS}" = "0" ]; then
-    bash bash_scripts/eval_commonsense_lora.sh \
-        CKPT="$OUTPUT" \
-        adapter_name="${adapter_name}" \
-        base_model="${MODEL}" \
-        wandb_project="${wandb_project}" \
-        wandb_run_name="${run_name}" \
-        wandb_run_id="${wandb_run_id}"
+    # If training saved last/ (and optionally best/) subdirs, eval each separately;
+    # otherwise fall back to the old single-checkpoint layout.
+    if [ -d "$OUTPUT/last" ]; then
+        bash bash_scripts/eval_commonsense_lora.sh \
+            CKPT="$OUTPUT/last" \
+            adapter_name="${adapter_name}" \
+            base_model="${MODEL}" \
+            wandb_project="${wandb_project}" \
+            wandb_run_name="${run_name}-last" \
+            wandb_run_id=""
+        if [ -d "$OUTPUT/best" ]; then
+            bash bash_scripts/eval_commonsense_lora.sh \
+                CKPT="$OUTPUT/best" \
+                adapter_name="${adapter_name}" \
+                base_model="${MODEL}" \
+                wandb_project="${wandb_project}" \
+                wandb_run_name="${run_name}-best" \
+                wandb_run_id=""
+        fi
+    else
+        bash bash_scripts/eval_commonsense_lora.sh \
+            CKPT="$OUTPUT" \
+            adapter_name="${adapter_name}" \
+            base_model="${MODEL}" \
+            wandb_project="${wandb_project}" \
+            wandb_run_name="${run_name}" \
+            wandb_run_id="${wandb_run_id}"
+    fi
 fi

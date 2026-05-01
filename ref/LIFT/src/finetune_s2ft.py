@@ -664,15 +664,16 @@ def main():
         train_loss = train_epoch(epoch)
         accelerator.print(f"Epoch {epoch+1}: Average loss = {train_loss:.4f}")
 
-    # Save the final model if no validation was done
-    if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        
-        save_hf_format(unwrapped_model, tokenizer, args)
+    # --- Save policy: write last/ always, best/ if best-tracking ran.
+    def _save_one(src_model, sub_folder):
+        if args.s2:
+            print_rank_0("converting s2 to linear layer ...", args.global_rank)
+            src_model = convert_s2_to_linear_layer(src_model)
+        save_hf_format(src_model, tokenizer, args, sub_folder=sub_folder)
 
-    if args.output_dir is not None:
-        # evaluate last model
+    if args.output_dir is not None and accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+
         if args.val_set_size > 0 and not args.load_last_model:
             ppl, val_loss = evaluate(model)
             print_rank_0(
@@ -684,13 +685,18 @@ def main():
                 best_eval_loss = val_loss
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
-                final_saved_model_index = "last"
 
-        model = best_model if best_model is not None else model
-        if args.s2:
-            print_rank_0("converting s2 to linear layer ...", args.global_rank)
-            model = convert_s2_to_linear_layer(model)
-        save_hf_format(model, tokenizer, args)
+        last_model = accelerator.unwrap_model(model)
+        _save_one(last_model, "last")
+        print_rank_0(f"Saved last-step checkpoint to {os.path.join(args.output_dir, 'last')}", args.global_rank)
+
+        if best_model is not None:
+            _save_one(best_model, "best")
+            print_rank_0(
+                f"Saved best-eval checkpoint to {os.path.join(args.output_dir, 'best')} "
+                f"(val_loss={best_eval_loss:.4f})",
+                args.global_rank,
+            )
 
     if use_wandb:
         accelerator.end_training()

@@ -78,15 +78,22 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
 if [ "${MAX_STEPS}" = "0" ]; then
-    MERGED="${OUTPUT}-merged"
-    if [ ! -f "${MERGED}/config.json" ]; then
-        uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
-            --base_model ${MODEL} \
-            --adapter_dir "${OUTPUT}" \
-            --output_dir "${MERGED}"
-    fi
+    # finetune_qlora.py writes adapters to <OUTPUT>/last_adapter and (if best
+    # tracking ran) <OUTPUT>/best_adapter. Merge each present adapter into
+    # <OUTPUT>/last and <OUTPUT>/best so eval_commonsense.sh's resolver finds
+    # them. Pass CKPT="${OUTPUT}" — the eval shell prefers last/ over best/.
+    for sub in last best; do
+        ADAPTER_DIR="${OUTPUT}/${sub}_adapter"
+        MERGED_DIR="${OUTPUT}/${sub}"
+        if [ -f "${ADAPTER_DIR}/adapter_config.json" ] && [ ! -f "${MERGED_DIR}/config.json" ]; then
+            uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
+                --base_model ${MODEL} \
+                --adapter_dir "${ADAPTER_DIR}" \
+                --output_dir "${MERGED_DIR}"
+        fi
+    done
     bash ./bash_scripts/eval_commonsense.sh \
-        CKPT="${MERGED}" \
+        CKPT="${OUTPUT}" \
         base_model="${MODEL}" \
         wandb_project="${wandb_project}" \
         wandb_run_name="${run_name}" \

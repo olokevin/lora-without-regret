@@ -244,6 +244,18 @@ def parse_args(argv=None):
         help="BTT rank; default full for lossless initialization",
     )
     parser.add_argument(
+        "--convert-mode",
+        type=str,
+        default="svd",
+        choices=["svd", "qr"],
+        help=(
+            "Per-block decomposition for BlockTT init. 'svd' (default) gives "
+            "U S V^T factors; 'qr' uses LQ when a>=b and QR when a<b so the "
+            "small (k x k) factor is always orthogonal. 'qr' has no singular "
+            "values and ignores --s-merged-to."
+        ),
+    )
+    parser.add_argument(
         "--no-train-bias",
         action="store_true",
         help="Freeze BTT biases; by default biases are trainable",
@@ -407,6 +419,7 @@ def validate_mode_specific_flags(args, argv):
             "--blocktt-normalize-after-update",
             "--blocktt-factorize-by-head",
             "--no-blocktt-factorize-by-head",
+            "--convert-mode",
         ],
         "svd": [],
     }
@@ -484,6 +497,15 @@ def validate_mode_specific_flags(args, argv):
         raise ValueError(
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
             "use output, input, or split"
+        )
+    if (
+        args.train_mode == "blocktt"
+        and getattr(args, "convert_mode", "svd") == "qr"
+        and args.s_merged_to in {"keep_frozen", "keep_trainable"}
+    ):
+        raise ValueError(
+            "--convert-mode qr is incompatible with --s-merged-to keep_frozen/keep_trainable: "
+            "QR has no singular values to keep."
         )
 
     validate_calibrated_btt_args(args, argv=argv, hyphen_style=True)
@@ -877,6 +899,7 @@ def prepare_model(args, *, train_dataset=None, collate_fn=None, tokenizer=None):
             train_position=train_position,
             factorize_by_head=args.blocktt_factorize_by_head,
             model_config=model.config,
+            convert_mode=getattr(args, "convert_mode", "svd"),
         )
         stats = configure_blocktt_trainability(
             model,

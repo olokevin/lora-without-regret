@@ -33,6 +33,14 @@ if [ "${no_wandb:-0}" = "1" ]; then
     no_wandb_flag="--no_wandb"
 fi
 
+# Project default: --load_last_model (save last only). Set save_both=1 to drop
+# the flag, which lets finetune_qdora.py track best-eval and write both
+# <OUTPUT>/last and <OUTPUT>/best.
+load_last_flag="--load_last_model"
+if [ "${save_both:-0}" = "1" ]; then
+    load_last_flag=""
+fi
+
 export WANDB_RUN_ID="${wandb_run_id}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
@@ -74,7 +82,7 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --val_set_size 120 \
     --eval_step 400 \
     --save_interval 100000 \
-    --load_last_model \
+    ${load_last_flag} \
     --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \
@@ -82,24 +90,27 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
 if [ "${MAX_STEPS}" = "0" ]; then
-    if [ "${qdora_impl}" = "fast" ]; then
-        # Fast path saves an already-merged HF model directly to $OUTPUT
-        # (Qdora4bitLinear modules are materialized to bf16 nn.Linear in
-        # finetune_qdora.py before save_pretrained). Eval directly.
-        EVAL_CKPT="${OUTPUT}"
-    else
-        # PEFT path saves only the adapter; merge into bf16 base for eval.
-        MERGED="${OUTPUT}-merged"
-        if [ ! -f "${MERGED}/config.json" ]; then
-            uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
-                --base_model ${MODEL} \
-                --adapter_dir "${OUTPUT}" \
-                --output_dir "${MERGED}"
-        fi
-        EVAL_CKPT="${MERGED}"
+    # finetune_qdora.py dual-save layout:
+    #   fast path: writes full HF models to <OUTPUT>/last/ (always) and
+    #              <OUTPUT>/best/ (if best-tracking ran).
+    #   peft path: writes adapters to <OUTPUT>/last_adapter/ and
+    #              <OUTPUT>/best_adapter/; merge each into a sibling
+    #              <OUTPUT>/{last,best}/ for eval.
+    if [ "${qdora_impl}" != "fast" ]; then
+        for sub in last best; do
+            ADAPTER_DIR="${OUTPUT}/${sub}_adapter"
+            MERGED_DIR="${OUTPUT}/${sub}"
+            if [ -f "${ADAPTER_DIR}/adapter_config.json" ] && [ ! -f "${MERGED_DIR}/config.json" ]; then
+                uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
+                    --base_model ${MODEL} \
+                    --adapter_dir "${ADAPTER_DIR}" \
+                    --output_dir "${MERGED_DIR}"
+            fi
+        done
     fi
+    # eval_commonsense.sh prefers last/ over best/.
     bash ./bash_scripts/eval_commonsense.sh \
-        CKPT="${EVAL_CKPT}" \
+        CKPT="${OUTPUT}" \
         base_model="${MODEL}" \
         wandb_project="${wandb_project}" \
         wandb_run_name="${run_name}" \

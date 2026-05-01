@@ -622,18 +622,29 @@ def main():
         },
     )
 
-    # Save final model if no validation
-    if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
+    # --- Save policy: write last/ always, write best/ if best-tracking was active.
+    # Layout:
+    #   <output_dir>/last/  : final-step weights (always saved)
+    #   <output_dir>/best/  : weights at lowest val_loss seen during training
+    #                        (saved only if val_set_size > 0)
+    # When --load_last_model is set, best-tracking is skipped during training
+    # to save memory; only last/ is written.
+    def _save_one(src_model, sub_folder):
+        # Use save_hf_format(args, sub_folder=...) which writes to
+        # <args.output_dir>/<sub_folder>. Mutates src_model in place via
+        # materialize_btt_to_linear. Caller must not reuse src_model after.
         if getattr(args, "calib_mode", "none") != "none":
-            save_calibrated_btt_checkpoint(unwrapped_model, args.output_dir, tokenizer)
+            target_dir = os.path.join(args.output_dir, sub_folder)
+            os.makedirs(target_dir, exist_ok=True)
+            save_calibrated_btt_checkpoint(src_model, target_dir, tokenizer)
         else:
-            materialize_btt_to_linear(unwrapped_model)
-            save_hf_format(unwrapped_model, tokenizer, args)
+            materialize_btt_to_linear(src_model)
+            save_hf_format(src_model, tokenizer, args, sub_folder=sub_folder)
 
-    if args.output_dir is not None:
-        # Evaluate last model
+    if args.output_dir is not None and accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+
+        # End-of-training eval, used to refresh best_model if better.
         if args.val_set_size > 0 and not args.load_last_model:
             ppl, val_loss = evaluate(model)
             print_rank_0(
@@ -645,12 +656,19 @@ def main():
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
 
-        model = best_model if best_model is not None else model
-        if getattr(args, "calib_mode", "none") != "none":
-            save_calibrated_btt_checkpoint(model, args.output_dir, tokenizer)
-        else:
-            materialize_btt_to_linear(model)
-            save_hf_format(model, tokenizer, args)
+        # Always save the final (last-step) model.
+        last_model = accelerator.unwrap_model(model)
+        _save_one(last_model, "last")
+        print_rank_0(f"Saved last-step checkpoint to {os.path.join(args.output_dir, 'last')}", args.global_rank)
+
+        # Save best if best-tracking ran (val_set_size > 0 and not skip).
+        if best_model is not None:
+            _save_one(best_model, "best")
+            print_rank_0(
+                f"Saved best-eval checkpoint to {os.path.join(args.output_dir, 'best')} "
+                f"(val_loss={best_eval_loss:.4f})",
+                args.global_rank,
+            )
 
     if use_wandb:
         accelerator.end_training()

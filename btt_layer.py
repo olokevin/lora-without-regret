@@ -18,6 +18,17 @@ VALID_S_MERGED_TO = {
     "keep_trainable",
 }
 VALID_BLOCKTT_DECOMP_MODES = {"square", "input_one_block", "output_one_block"}
+VALID_BLOCKTT_CONVERT_MODES = {"svd", "qr"}
+
+
+def normalize_blocktt_convert_mode(mode):
+    if not isinstance(mode, str):
+        raise ValueError("BlockTT convert_mode must be a string")
+    canonical = mode.strip().lower()
+    if canonical not in VALID_BLOCKTT_CONVERT_MODES:
+        allowed = ", ".join(sorted(VALID_BLOCKTT_CONVERT_MODES))
+        raise ValueError(f"BlockTT convert_mode must be one of: {allowed}")
+    return canonical
 BLOCKTT_DECOMP_MODE_ALIASES = {
     "input": "input_one_block",
     "output": "output_one_block",
@@ -228,6 +239,7 @@ def convert_linear_to_btt(
     train_position="small",
     factorize_by_head=False,
     model_config=None,
+    convert_mode="svd",
 ):
     if btt_rank is None:
         btt_rank = "full"
@@ -236,6 +248,7 @@ def convert_linear_to_btt(
             "forward_impl is ignored by the canonical BTTLayer implementation.",
             stacklevel=2,
         )
+    convert_mode = normalize_blocktt_convert_mode(convert_mode)
 
     include_name_set = set(include_names) if include_names is not None else None
     if isinstance(decomp_mode, dict):
@@ -279,7 +292,7 @@ def convert_linear_to_btt(
     print(
         f"Converting {len(modules_to_replace)} Linear layers to BTT "
         f"(rank={btt_rank}, decomp_mode={decomp_mode_printable}, init_mode={init_mode}, "
-        f"forward_impl={forward_impl})"
+        f"forward_impl={forward_impl}, convert_mode={convert_mode})"
     )
 
     for full_name, linear in modules_to_replace:
@@ -332,6 +345,7 @@ def convert_linear_to_btt(
             linear.bias.data if linear.bias is not None else None,
             s_merged_to=s_merged_to,
             train_position=train_position,
+            convert_mode=convert_mode,
         )
 
         setattr(parent, child_name, btt_layer)
@@ -659,6 +673,37 @@ class BTTLayer(nn.Module):
             f"bias: {self.bias.shape if self.bias is not None else False}"
         )
 
+    @staticmethod
+    @torch.no_grad()
+    def _qr_decompose_blocks(blocks, use_rank):
+        """Per-block QR/LQ decomposition.
+
+        Picks LQ when a >= b and QR when a < b so the small (k x k) factor is
+        always orthogonal and the cores fit the existing BTT layout slots:
+            l_used: (B, a, use_rank)
+            r_used: (B, use_rank, b)
+
+        For full rank (use_rank == min(a, b)) reconstruction is exact. For
+        truncated rank we slice the trailing rows/cols of the triangular
+        factor; this is NOT Frobenius-optimal, unlike SVD truncation.
+        """
+        a = blocks.shape[-2]
+        b = blocks.shape[-1]
+        if a >= b:
+            # LQ: blocks.T = Qp @ Rp, blocks = Rp.T @ Qp.T = L @ Q
+            # Qp: (B, b, b), Rp: (B, b, a) -> L = Rp.T: (B, a, b), Q = Qp.T: (B, b, b)
+            Qp, Rp = torch.linalg.qr(blocks.transpose(-1, -2), mode="reduced")
+            L = Rp.transpose(-1, -2)
+            Q = Qp.transpose(-1, -2)
+            l_used = L[:, :, :use_rank]
+            r_used = Q[:, :use_rank, :]
+        else:
+            # QR: blocks = Q @ R, Q: (B, a, a), R: (B, a, b)
+            Q, R = torch.linalg.qr(blocks, mode="reduced")
+            l_used = Q[:, :, :use_rank]
+            r_used = R[:, :use_rank, :]
+        return l_used.contiguous(), r_used.contiguous()
+
     @torch.no_grad()
     def init_from_linear_weight(
         self,
@@ -666,7 +711,9 @@ class BTTLayer(nn.Module):
         bias=None,
         s_merged_to=None,
         train_position="small",
+        convert_mode="svd",
     ):
+        convert_mode = normalize_blocktt_convert_mode(convert_mode)
         if not weight.is_cuda:
             raise RuntimeError(
                 "BTT initialization requires CUDA weights so decomposition runs on GPU. "
@@ -687,15 +734,14 @@ class BTTLayer(nn.Module):
         # Dense weight (m*a, n*b) -> block matrix batch (m*n, a, b).
         blocks = weight.reshape(self.m, self.a, self.n, self.b)
         blocks = blocks.permute(0, 2, 1, 3).reshape(self.m * self.n, self.a, self.b)
-        svd_dtype = (
+        decomp_dtype = (
             torch.float32
             if param_dtype in (torch.float16, torch.bfloat16)
             else param_dtype
         )
-        U, S, Vh = torch.linalg.svd(blocks.to(dtype=svd_dtype), full_matrices=False)
 
-        max_svd_rank = min(self.a, self.b)
-        use_rank = min(self.rank, max_svd_rank)
+        max_full_rank = min(self.a, self.b)
+        use_rank = min(self.rank, max_full_rank)
 
         core_l = torch.zeros(
             self.m * self.n,
@@ -712,42 +758,63 @@ class BTTLayer(nn.Module):
             dtype=param_dtype,
         )
 
-        merge_target = resolve_blocktt_s_merged_to(
-            train_position=train_position,
-            s_merged_to=s_merged_to,
-            left_size=self.btt_l.numel(),
-            right_size=self.btt_r.numel(),
-        )
-        u_used = U[:, :, :use_rank].to(dtype=param_dtype)
-        vh_used = Vh[:, :use_rank, :].to(dtype=param_dtype)
-        s_used = torch.clamp(S[:, :use_rank], min=0).to(dtype=param_dtype)
-
-        if merge_target in {"keep_frozen", "keep_trainable"}:
-            core_l[:, :, :use_rank] = u_used
-            core_r[:, :use_rank, :] = vh_used
-            s_keep = torch.zeros(
-                self.m * self.n,
-                self.rank,
-                device=weight.device,
-                dtype=param_dtype,
+        if convert_mode == "qr":
+            if s_merged_to in {"keep_frozen", "keep_trainable"}:
+                raise ValueError(
+                    "convert_mode='qr' is incompatible with s_merged_to in "
+                    "{'keep_frozen', 'keep_trainable'}: QR has no singular values to keep."
+                )
+            if s_merged_to is not None:
+                warnings.warn(
+                    f"s_merged_to={s_merged_to!r} is ignored under convert_mode='qr' "
+                    "(no singular-value scaling exists).",
+                    stacklevel=2,
+                )
+            l_used, r_used = self._qr_decompose_blocks(
+                blocks.to(dtype=decomp_dtype), use_rank=use_rank
             )
-            s_keep[:, :use_rank] = s_used
-            self.btt_s = nn.Parameter(
-                s_keep.reshape(self.m, self.n, self.rank),
-                requires_grad=(merge_target == "keep_trainable"),
-            )
-        elif merge_target == "split":
-            sqrt_s = torch.sqrt(s_used)
-            core_l[:, :, :use_rank] = u_used * sqrt_s.unsqueeze(1)
-            core_r[:, :use_rank, :] = sqrt_s.unsqueeze(-1) * vh_used
-        elif merge_target == "output":
-            core_l[:, :, :use_rank] = u_used * s_used.unsqueeze(1)
-            core_r[:, :use_rank, :] = vh_used
-        else:
-            core_l[:, :, :use_rank] = u_used
-            core_r[:, :use_rank, :] = s_used.unsqueeze(-1) * vh_used
-        if merge_target not in {"keep_frozen", "keep_trainable"}:
+            core_l[:, :, :use_rank] = l_used.to(dtype=param_dtype)
+            core_r[:, :use_rank, :] = r_used.to(dtype=param_dtype)
             self.btt_s = None
+        else:
+            U, S, Vh = torch.linalg.svd(blocks.to(dtype=decomp_dtype), full_matrices=False)
+
+            merge_target = resolve_blocktt_s_merged_to(
+                train_position=train_position,
+                s_merged_to=s_merged_to,
+                left_size=self.btt_l.numel(),
+                right_size=self.btt_r.numel(),
+            )
+            u_used = U[:, :, :use_rank].to(dtype=param_dtype)
+            vh_used = Vh[:, :use_rank, :].to(dtype=param_dtype)
+            s_used = torch.clamp(S[:, :use_rank], min=0).to(dtype=param_dtype)
+
+            if merge_target in {"keep_frozen", "keep_trainable"}:
+                core_l[:, :, :use_rank] = u_used
+                core_r[:, :use_rank, :] = vh_used
+                s_keep = torch.zeros(
+                    self.m * self.n,
+                    self.rank,
+                    device=weight.device,
+                    dtype=param_dtype,
+                )
+                s_keep[:, :use_rank] = s_used
+                self.btt_s = nn.Parameter(
+                    s_keep.reshape(self.m, self.n, self.rank),
+                    requires_grad=(merge_target == "keep_trainable"),
+                )
+            elif merge_target == "split":
+                sqrt_s = torch.sqrt(s_used)
+                core_l[:, :, :use_rank] = u_used * sqrt_s.unsqueeze(1)
+                core_r[:, :use_rank, :] = sqrt_s.unsqueeze(-1) * vh_used
+            elif merge_target == "output":
+                core_l[:, :, :use_rank] = u_used * s_used.unsqueeze(1)
+                core_r[:, :use_rank, :] = vh_used
+            else:
+                core_l[:, :, :use_rank] = u_used
+                core_r[:, :use_rank, :] = s_used.unsqueeze(-1) * vh_used
+            if merge_target not in {"keep_frozen", "keep_trainable"}:
+                self.btt_s = None
 
         core_l = core_l.reshape(self.m, self.n, self.a, self.rank)
         core_r = core_r.reshape(self.m, self.n, self.rank, self.b)

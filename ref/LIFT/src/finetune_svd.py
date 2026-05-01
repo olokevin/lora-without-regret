@@ -513,15 +513,14 @@ def main():
         },
     )
 
-    # Save final model if no validation
-    if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        materialize_svd_to_linear(unwrapped_model)
-        save_hf_format(unwrapped_model, tokenizer, args)
+    # --- Save policy: write last/ always, best/ if best-tracking ran.
+    def _save_one(src_model, sub_folder):
+        materialize_svd_to_linear(src_model)
+        save_hf_format(src_model, tokenizer, args, sub_folder=sub_folder)
 
-    if args.output_dir is not None:
-        # Evaluate last model
+    if args.output_dir is not None and accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+
         if args.val_set_size > 0 and not args.load_last_model:
             ppl, val_loss = evaluate(model)
             print_rank_0(
@@ -533,9 +532,17 @@ def main():
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
 
-        model = best_model if best_model is not None else model
-        materialize_svd_to_linear(model)
-        save_hf_format(model, tokenizer, args)
+        last_model = accelerator.unwrap_model(model)
+        _save_one(last_model, "last")
+        print_rank_0(f"Saved last-step checkpoint to {os.path.join(args.output_dir, 'last')}", args.global_rank)
+
+        if best_model is not None:
+            _save_one(best_model, "best")
+            print_rank_0(
+                f"Saved best-eval checkpoint to {os.path.join(args.output_dir, 'best')} "
+                f"(val_loss={best_eval_loss:.4f})",
+                args.global_rank,
+            )
 
     if use_wandb:
         accelerator.end_training()

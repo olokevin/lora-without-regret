@@ -43,7 +43,27 @@ if [ -z "$CKPT" ]; then
     exit 1
 fi
 
-MODEL="$CKPT"
+# Resolve $CKPT against the dual-save layout introduced by finetune_*.py:
+#   <output_dir>/last/  : final-step weights (always written by training)
+#   <output_dir>/best/  : best-eval weights (only when val_set_size > 0 and
+#                        --load_last_model is not set)
+# If $CKPT is itself a flat HF checkpoint (config.json present), use as-is.
+# Else prefer last/ over best/ (project default = save last model).
+# Override with EVAL_PREFER=best to pick best/ when both exist.
+if [ -f "${CKPT}/config.json" ]; then
+    MODEL="$CKPT"
+elif [ "${EVAL_PREFER:-last}" = "best" ] && [ -f "${CKPT}/best/config.json" ]; then
+    MODEL="${CKPT}/best"
+elif [ -f "${CKPT}/last/config.json" ]; then
+    MODEL="${CKPT}/last"
+elif [ -f "${CKPT}/best/config.json" ]; then
+    MODEL="${CKPT}/best"
+else
+    echo "Error: no usable checkpoint at ${CKPT}, ${CKPT}/last, or ${CKPT}/best (config.json missing)" >&2
+    exit 1
+fi
+echo "[eval_math] resolved CKPT=${CKPT} -> MODEL=${MODEL}"
+
 OUTPUT_DIR="${MODEL}/math"
 
 PROJECT_DIR="${PROJECT_DIR:-/home/yequan/Project/lora/lora-without-regret/.worktrees/qfura}"

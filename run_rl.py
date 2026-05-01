@@ -354,6 +354,18 @@ def parse_args(argv=None):
         help="BTT rank; default full for lossless decomposition",
     )
     parser.add_argument(
+        "--convert-mode",
+        type=str,
+        default="svd",
+        choices=["svd", "qr"],
+        help=(
+            "Per-block decomposition for BlockTT init. 'svd' (default) gives "
+            "U S V^T factors; 'qr' uses LQ when a>=b and QR when a<b so the "
+            "small (k x k) factor is always orthogonal. 'qr' has no singular "
+            "values and ignores --s-merged-to."
+        ),
+    )
+    parser.add_argument(
         "--no-train-bias",
         action="store_true",
         help="Freeze BTT biases; by default biases are trainable",
@@ -535,6 +547,7 @@ def validate_mode_specific_flags(args, argv):
             "--decomp-mode", "--blocktt-rank", "--no-train-bias",
             "--blocktt-normalize-after-update",
             "--blocktt-factorize-by-head", "--no-blocktt-factorize-by-head",
+            "--convert-mode",
         ],
         "svd": [],
     }
@@ -622,6 +635,15 @@ def validate_mode_specific_flags(args, argv):
         raise ValueError(
             "--s-merged-to frozen/trainable is invalid when blocktt --train-position is both; "
             "use 'split' or 'keep_trainable'"
+        )
+    if (
+        args.train_mode == "blocktt"
+        and getattr(args, "convert_mode", "svd") == "qr"
+        and args.s_merged_to in {"keep_frozen", "keep_trainable"}
+    ):
+        raise ValueError(
+            "--convert-mode qr is incompatible with --s-merged-to keep_frozen/keep_trainable: "
+            "QR has no singular values to keep."
         )
 
     # Math-verify validation
@@ -1536,6 +1558,7 @@ def main(argv=None):
                 "train_bias": train_bias,
                 "blocktt_normalize_after_update": args.blocktt_normalize_after_update,
                 "blocktt_factorize_by_head": args.blocktt_factorize_by_head,
+                "convert_mode": getattr(args, "convert_mode", "svd"),
             }
         )
     elif args.train_mode == "svd":
@@ -1752,6 +1775,7 @@ def main(argv=None):
                 train_position=mode_info["train_position"],
                 factorize_by_head=mode_info.get("blocktt_factorize_by_head", False),
                 model_config=model.config,
+                convert_mode=mode_info.get("convert_mode", "svd"),
             )
             stats = configure_blocktt_trainability(
                 model,
