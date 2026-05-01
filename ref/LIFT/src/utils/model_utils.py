@@ -23,32 +23,66 @@ def make_model_gradient_checkpointing_compatible(model):
 def get_tokenizer(model_name_or_path, fast_tokenizer=True):
     if "llama" in model_name_or_path.lower():
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, fast_tokenizer=fast_tokenizer, add_bos_token = False)       # not adding start token 
+            model_name_or_path, use_fast=fast_tokenizer, add_bos_token = False)       # not adding start token
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             tokenizer.padding_side = 'right'
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, fast_tokenizer=fast_tokenizer, add_bos_token = False)      # not adding start token 
+            model_name_or_path, use_fast=fast_tokenizer, add_bos_token = False)      # not adding start token
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'right'
     return tokenizer
 
 
+def _resolve_to_local_path(model_name_or_path):
+    """Resolve an HF model ID to a local snapshot path if available.
+    Only returns a path if it contains tokenizer files (tokenizer.json or tokenizer_config.json).
+    """
+    def _has_tokenizer(path):
+        return os.path.isfile(os.path.join(path, "tokenizer.json")) or \
+               os.path.isfile(os.path.join(path, "tokenizer_config.json"))
+
+    if os.path.isdir(model_name_or_path) and _has_tokenizer(model_name_or_path):
+        return model_name_or_path
+    # Try to find the model in HF cache directories
+    for hf_root in [
+        os.environ.get("HF_HOME", ""),
+        os.path.expanduser("~/.cache/huggingface"),
+        "/data/yequan/huggingface",
+    ]:
+        if not hf_root:
+            continue
+        hub_dir = os.path.join(hf_root, "hub")
+        model_dir = os.path.join(hub_dir, "models--" + model_name_or_path.replace("/", "--"))
+        snapshots_dir = os.path.join(model_dir, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            snaps = os.listdir(snapshots_dir)
+            if snaps:
+                snap_path = os.path.join(snapshots_dir, snaps[0])
+                if _has_tokenizer(snap_path):
+                    return snap_path
+    return model_name_or_path
+
+
 def load_hf_tokenizer(model_name_or_path,
                       fast_tokenizer=True,
                       add_special_tokens=None):
-    if os.path.exists(model_name_or_path):
-        # Locally tokenizer loading has some issue, so we need to force download
-        model_json = os.path.join(model_name_or_path, "config.json")
-        if os.path.exists(model_json):
-            model_json_file = json.load(open(model_json))
-            model_name = model_json_file.get("_name_or_path",
-                                             model_name_or_path)
-            tokenizer = get_tokenizer(model_name,
-                                      fast_tokenizer=fast_tokenizer)
+    model_json = os.path.join(model_name_or_path, "config.json")
+    if os.path.exists(model_name_or_path) and os.path.exists(model_json):
+        # Local checkpoint with config.json
+        model_json_file = json.load(open(model_json))
+        model_name = model_json_file.get("_name_or_path",
+                                         model_name_or_path)
+        # If _name_or_path is an HF ID (not a local path), resolve it
+        if not os.path.exists(model_name):
+            model_name = _resolve_to_local_path(model_name)
+        tokenizer = get_tokenizer(model_name,
+                                  fast_tokenizer=fast_tokenizer)
     else:
-        tokenizer = get_tokenizer(model_name_or_path,
+        # Resolve HF model ID to local snapshot path to avoid sentencepiece issues
+        local_path = _resolve_to_local_path(model_name_or_path)
+        tokenizer = get_tokenizer(local_path,
                                   fast_tokenizer=fast_tokenizer)
 
     if add_special_tokens is not None:

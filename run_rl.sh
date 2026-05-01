@@ -47,7 +47,7 @@ run_full()
 
 run_lora()
 {
-  local train_mode="lora"
+  local train_mode="${TRAIN_MODE:-lora}"
   local lr="${LR:-2e-4}"
   local optimizer="${OPTIMIZER:-adamw}"
   local lora_rank="${LORA_RANK:-64}"
@@ -56,10 +56,14 @@ run_lora()
   local run_name="${train_mode}-${optimizer}-lr_${lr}-rank_${lora_rank}${name_suffix}"
   local device="${DEVICE:-2}"
   local vllm_url="${VLLM_URL:-http://localhost:8000}"
+  local -a vllm_url_args=()
   local -a cfg_suffix_args=()
   if [[ -n "${CFG_SUFFIX:-}" ]]; then
     # Intended for trusted local overrides, e.g. CFG_SUFFIX="--flag --arg value".
     read -r -a cfg_suffix_args <<< "${CFG_SUFFIX}"
+  fi
+  if [[ "$train_mode" == "lora" || "$train_mode" == "dora" || "$train_mode" == "randlora" ]]; then
+    vllm_url_args=(--vllm-url "$vllm_url")
   fi
 
   CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
@@ -68,7 +72,7 @@ run_lora()
     --optimizer "$optimizer" \
     --lora-rank "$lora_rank" \
     --trainable-type "$trainable_type" \
-    --vllm-url "$vllm_url" \
+    "${vllm_url_args[@]}" \
     --model-id Qwen/Qwen3-1.7B \
     --wandb-project qwen3-1_7B-RL \
     --wandb-run-name "$run_name" \
@@ -85,7 +89,6 @@ run_lora_full()
   local name_suffix="${NAME_SUFFIX:-}"
   local run_name="${train_mode}-${optimizer}-lr_${lr}-rank_${lora_rank}${name_suffix}"
   local device="${DEVICE:-2}"
-  local vllm_url="${VLLM_URL:-http://localhost:8000}"
   local -a cfg_suffix_args=()
   if [[ -n "${CFG_SUFFIX:-}" ]]; then
     # Intended for trusted local overrides, e.g. CFG_SUFFIX="--flag --arg value".
@@ -98,7 +101,30 @@ run_lora_full()
     --optimizer "$optimizer" \
     --lora-rank "$lora_rank" \
     --trainable-type "$trainable_type" \
-    --vllm-url "$vllm_url" \
+    --model-id Qwen/Qwen3-1.7B \
+    --wandb-project qwen3-1_7B-RL \
+    --wandb-run-name "$run_name" \
+    "${cfg_suffix_args[@]}"
+}
+
+run_lift()
+{
+  local train_mode="lift"
+  local lr="${LR:-1e-4}"
+  local optimizer="${OPTIMIZER:-adamw}"
+  local name_suffix="${NAME_SUFFIX:-}"
+  local run_name="${train_mode}-${optimizer}-lr_${lr}${name_suffix}"
+  local device="${DEVICE:-2}"
+  local -a cfg_suffix_args=()
+  if [[ -n "${CFG_SUFFIX:-}" ]]; then
+    # Intended for trusted local overrides, e.g. CFG_SUFFIX="--flag --arg value".
+    read -r -a cfg_suffix_args <<< "${CFG_SUFFIX}"
+  fi
+
+  CUDA_VISIBLE_DEVICES="$device" uv run run_rl.py \
+    --train-mode "$train_mode" \
+    --lr "$lr" \
+    --optimizer "$optimizer" \
     --model-id Qwen/Qwen3-1.7B \
     --wandb-project qwen3-1_7B-RL \
     --wandb-run-name "$run_name" \
@@ -270,14 +296,28 @@ run_sequential()
   # LR=2e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
   # LR=4e-4 DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
 
-  LR=2e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
-  LR=4e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  # LR=2e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
+  # LR=4e-4 DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable run_blocktt
 
   # LR=1e-5 TRAIN_POSITION=output S_MERGED_TO=output run_svd
   # LR=1e-5 TRAIN_POSITION=output S_MERGED_TO=input run_svd
 
   # LR=1e-5 TRAIN_POSITION=input S_MERGED_TO=input run_svd
   # LR=1e-5 TRAIN_POSITION=input S_MERGED_TO=output run_svd
+
+
+  ### rerun eval
+  # DEVICE=0 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=trainable bash run_rl.sh >/dev/null 2>&1 &
+  # DEVICE=3 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=keep_trainable bash run_rl.sh >/dev/null 2>&1 &
+
+  # DEVICE=6 LR=8e-5 LORA_RANK=16 run_lora
+  # DEVICE=6 LR=8e-5 LORA_RANK=64 run_lora
+  # DEVICE=6 LR=8e-5 LORA_RANK=64 TRAIN_MODE=dora run_lora
+
+  DEVICE=7 LR=8e-5 LORA_RANK=64 TRAIN_MODE=pissa run_lora
+  DEVICE=7 LR=8e-5 LORA_RANK=64 TRAIN_MODE=milora run_lora
+  DEVICE=7 LR=8e-5 LORA_RANK=64 TRAIN_MODE=randlora run_lora
+
 }
 
 
@@ -287,6 +327,16 @@ elif [[ "$TRAIN_MODE" == "lora" ]]; then
     run_lora
 elif [[ "$TRAIN_MODE" == "lora_full" ]]; then
     run_lora_full
+elif [[ "$TRAIN_MODE" == "dora" ]]; then
+    run_lora
+elif [[ "$TRAIN_MODE" == "pissa" ]]; then
+    run_lora
+elif [[ "$TRAIN_MODE" == "milora" ]]; then
+    run_lora
+elif [[ "$TRAIN_MODE" == "randlora" ]]; then
+    run_lora
+elif [[ "$TRAIN_MODE" == "lift" ]]; then
+    run_lift
 elif [[ "$TRAIN_MODE" == "svd" ]]; then
     run_svd
 elif [[ "$TRAIN_MODE" == "blocktt" ]]; then
@@ -297,7 +347,7 @@ elif [[ "$TRAIN_MODE" == "sequential" ]]; then
     run_sequential
 else
     echo "Unsupported train mode: $TRAIN_MODE"
-    echo "Use TRAIN_MODE=full|lora|lora_full|svd|blocktt|sequential"
+    echo "Use TRAIN_MODE=full|lora|lora_full|dora|pissa|milora|randlora|lift|svd|blocktt|blocktt_muon|sequential"
     exit 1
 fi
 
@@ -310,6 +360,11 @@ fi
 # DEVICE=4 LR=1e-5 TRAIN_MODE=full bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=0 LR=8e-5 TRAIN_MODE=lora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=0 LR=8e-5 TRAIN_MODE=lora_full LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=8e-5 TRAIN_MODE=dora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=8e-5 TRAIN_MODE=randlora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=8e-5 TRAIN_MODE=pissa LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=8e-5 TRAIN_MODE=milora LORA_RANK=16 bash run_rl.sh >/dev/null 2>&1 &
+# DEVICE=0 LR=1e-4 TRAIN_MODE=lift bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=1 LR=8e-5 TRAIN_MODE=svd bash run_rl.sh >/dev/null 2>&1 &
 # DEVICE=6 LR=8e-5 TRAIN_MODE=blocktt bash run_rl.sh >/dev/null 2>&1 &
 

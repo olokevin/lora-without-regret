@@ -58,7 +58,7 @@ REGISTRY: dict[str, DatasetSpec] = {
         top_p=1.0,
     ),
     "Minerva": DatasetSpec(
-        hf_id="math-ai/minerva-math",
+        hf_id="math-ai/minervamath",
         split="test",
         problem_field="question",
         answer_field="answer",

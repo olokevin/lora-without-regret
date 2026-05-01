@@ -88,6 +88,98 @@ class TestSaveMergedCheckpointLora(unittest.TestCase):
             model.unmerge_adapter.assert_called_once()
 
 
+class TestExportLoraMergedWeightsForVllm(unittest.TestCase):
+    def test_clones_merged_tensors_before_unmerge(self):
+        import torch.nn as nn
+        import run_rl
+
+        class _Base(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(1, 1, bias=False)
+                with torch.no_grad():
+                    self.linear.weight.fill_(1.0)
+
+        class _PeftLike:
+            def __init__(self):
+                self.base = _Base()
+                self.merged = False
+
+            def merge_adapter(self):
+                if not self.merged:
+                    with torch.no_grad():
+                        self.base.linear.weight.add_(2.0)
+                    self.merged = True
+
+            def unmerge_adapter(self):
+                if self.merged:
+                    with torch.no_grad():
+                        self.base.linear.weight.sub_(2.0)
+                    self.merged = False
+
+            def get_base_model(self):
+                return self.base
+
+        model = _PeftLike()
+        weight_tuples = run_rl.export_lora_merged_weights_for_vllm(model)
+
+        self.assertFalse(model.merged)
+        self.assertEqual(model.base.linear.weight.item(), 1.0)
+        self.assertEqual(len(weight_tuples), 1)
+        name, exported = weight_tuples[0]
+        self.assertEqual(name, "linear.weight")
+        self.assertEqual(exported.item(), 3.0)
+
+        with torch.no_grad():
+            model.base.linear.weight.fill_(9.0)
+        self.assertEqual(exported.item(), 3.0)
+
+    def test_skips_dora_and_randlora_aux_tensors(self):
+        import run_rl
+
+        class _Base:
+            def __init__(self):
+                self.params = {
+                    "linear.base_layer.weight": torch.nn.Parameter(torch.tensor([[1.0]])),
+                    "linear.lora_magnitude_vector.default.weight": torch.nn.Parameter(
+                        torch.tensor([5.0])
+                    ),
+                    "linear.randlora_lambda.default": torch.nn.Parameter(torch.tensor([6.0])),
+                    "linear.randlora_gamma.default": torch.nn.Parameter(torch.tensor([7.0])),
+                    "linear.randlora_m.default": torch.nn.Parameter(torch.tensor([8.0])),
+                }
+
+            def named_parameters(self):
+                return iter(self.params.items())
+
+        class _PeftLike:
+            def __init__(self):
+                self.base = _Base()
+                self.merged = False
+
+            def merge_adapter(self):
+                if not self.merged:
+                    with torch.no_grad():
+                        self.base.params["linear.base_layer.weight"].add_(2.0)
+                    self.merged = True
+
+            def unmerge_adapter(self):
+                if self.merged:
+                    with torch.no_grad():
+                        self.base.params["linear.base_layer.weight"].sub_(2.0)
+                    self.merged = False
+
+            def get_base_model(self):
+                return self.base
+
+        model = _PeftLike()
+        weight_tuples = run_rl.export_lora_merged_weights_for_vllm(model)
+
+        self.assertEqual([name for name, _ in weight_tuples], ["linear.weight"])
+        self.assertEqual(weight_tuples[0][1].item(), 3.0)
+        self.assertEqual(model.base.params["linear.base_layer.weight"].item(), 1.0)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for BTT conversion")
 class TestBuildFactoredDenseStateDict(unittest.TestCase):
     """Exercises the factored->dense conversion using real BTTLayer instances."""

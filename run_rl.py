@@ -11,6 +11,7 @@ Examples:
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -257,6 +258,11 @@ def parse_args(argv=None):
         "--enable-save-ckpt",
         action="store_true",
         help="Save checkpoints at step 1, step 10, and final step (default: disabled)",
+    )
+    parser.add_argument(
+        "--save-best-val-ckpt",
+        action="store_true",
+        help="Save a merged HF checkpoint to <run_dir>/best/ whenever eval/accuracy improves.",
     )
     parser.add_argument(
         "--save-first-step-grads-path",
@@ -754,13 +760,18 @@ def load_datasets_and_tokenizer(model_id, prompt_template_path):
     with open(prompt_template_path, "r", encoding="utf-8") as f:
         template = f.read().strip()
 
+    has_chat_template = tokenizer.chat_template is not None
+
     def process_data(example):
         with_template = template.replace("{question}", example["problem"])
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": with_template}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        if has_chat_template:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": with_template}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            prompt = with_template
         answer = remove_boxed(last_boxed_only_string(example["solution"]))
         return {"prompt": prompt, "answer": answer}
 
@@ -904,7 +915,14 @@ def save_merged_checkpoint(model, tokenizer, ckpt_dir: str, train_mode: str, arg
         model.merge_adapter()
         try:
             base = model.get_base_model()
-            base.save_pretrained(ckpt_dir)
+            # RandLoRA shares the randlora_A projection tensors across layers;
+            # safetensors refuses to serialize shared storages, so fall back
+            # to the non-safetensors path for randlora. The merged base
+            # weights are what downstream eval loads from disk.
+            if train_mode == "randlora":
+                base.save_pretrained(ckpt_dir, safe_serialization=False)
+            else:
+                base.save_pretrained(ckpt_dir)
         finally:
             model.unmerge_adapter()
     elif train_mode in {"blocktt", "svd"}:
@@ -1035,6 +1053,32 @@ def normalize_lora_merged_weight_name(name: str) -> str | None:
     return name.replace(".base_layer.", ".")
 
 
+@torch.no_grad()
+def export_lora_merged_weights_for_vllm(model):
+    """Return dense base-model weights with the active PEFT adapter merged.
+
+    The tensors must be cloned before unmerge_adapter() runs. Otherwise the
+    returned tuples hold references to the base parameters, which PEFT mutates
+    back to the unmerged values in-place.
+    """
+    model.merge_adapter()
+    try:
+        base_model = model.get_base_model()
+        weight_tuples = []
+        seen = set()
+        for name, param in base_model.named_parameters():
+            normalized = normalize_lora_merged_weight_name(name)
+            if normalized is None:
+                continue
+            if normalized in seen:
+                raise RuntimeError(f"Duplicate normalized LoRA weight name: {normalized}")
+            seen.add(normalized)
+            weight_tuples.append((normalized, param.detach().clone()))
+        return weight_tuples
+    finally:
+        model.unmerge_adapter()
+
+
 def build_lora_http_generators(args, model, run_dir):
     loaded_loras = []
 
@@ -1113,27 +1157,8 @@ def build_lora_local_generators(args, model):
         logprobs_mode="processed_logprobs",
     )
 
-    def export_lora_merged_weights():
-        with torch.no_grad():
-            model.merge_adapter()
-            try:
-                base_model = model.get_base_model()
-                weight_tuples = []
-                seen = set()
-                for name, param in base_model.named_parameters():
-                    normalized = normalize_lora_merged_weight_name(name)
-                    if normalized is None:
-                        continue
-                    if normalized in seen:
-                        raise RuntimeError(f"Duplicate normalized LoRA weight name: {normalized}")
-                    seen.add(normalized)
-                    weight_tuples.append((normalized, param))
-                return weight_tuples
-            finally:
-                model.unmerge_adapter()
-
     def generate(prompts: list[str], temperature=0, responses_per_prompt=1):
-        weight_tuples = export_lora_merged_weights()
+        weight_tuples = export_lora_merged_weights_for_vllm(model)
         vllm_internal_model = (
             vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
         )
@@ -1815,6 +1840,8 @@ def main(argv=None):
     save_grads_steps = parse_save_grads_steps(args.save_grads_steps)
     stop_requested = False
 
+    best_val_state = {"acc": float("-inf"), "step": -1}
+
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
 
@@ -1833,19 +1860,42 @@ def main(argv=None):
         print(f"step={step}, correct: {correct} / {len(outputs)} ({accuracy:.2%})")
 
         if not args.no_wandb:
-            wandb.log(
-                {
-                    "eval/accuracy": accuracy,
-                    "eval/correct": correct,
-                    "eval/total": len(outputs),
-                    "eval/time_seconds": eval_time,
-                },
-                step=step,
-            )
+            log_payload = {
+                "eval/accuracy": accuracy,
+                "eval/correct": correct,
+                "eval/total": len(outputs),
+                "eval/time_seconds": eval_time,
+            }
+            if step == 0:
+                log_payload["eval/baseline_accuracy"] = accuracy
+                wandb.run.summary["eval/baseline_accuracy"] = accuracy
+            wandb.log(log_payload, step=step)
 
-    print("Starting initial evaluation...")
+        if args.save_best_val_ckpt and accuracy > best_val_state["acc"]:
+            best_val_state["acc"] = accuracy
+            best_val_state["step"] = step
+            best_dir = os.path.join(run_dir, "best")
+            os.makedirs(best_dir, exist_ok=True)
+            try:
+                save_merged_checkpoint(model, tokenizer, best_dir, args.train_mode, args)
+                meta = {"step": step, "eval_accuracy": accuracy}
+                with open(os.path.join(best_dir, "best_val_info.json"), "w") as fh:
+                    json.dump(meta, fh, indent=2)
+                print(
+                    f"[save-best-val-ckpt] step={step} new best eval/accuracy={accuracy:.4f} -> {best_dir}"
+                )
+                if not args.no_wandb:
+                    wandb.run.summary["best_val/accuracy"] = accuracy
+                    wandb.run.summary["best_val/step"] = step
+            except Exception as exc:
+                print(f"[save-best-val-ckpt] WARNING: save failed at step={step}: {exc!r}")
+
+        return accuracy
+
+    print("Pre-training baseline evaluation (step=0, before any optimizer update)...")
     model = model.to(device)
-    eval_model(0)
+    baseline_accuracy = eval_model(0)
+    print(f"Pre-training baseline accuracy: {baseline_accuracy:.2%}")
     model.train()
 
     for i in range(args.n_grpo_steps):
@@ -2064,9 +2114,20 @@ def main(argv=None):
         os.makedirs(final_ckpt_dir, exist_ok=True)
         if args.enable_merged_ckpt:
             print(f"Saving final merged checkpoint to {final_ckpt_dir}")
-            save_merged_checkpoint(
-                model, tokenizer, final_ckpt_dir, args.train_mode, args
-            )
+            try:
+                save_merged_checkpoint(
+                    model, tokenizer, final_ckpt_dir, args.train_mode, args
+                )
+            except Exception as _save_exc:
+                # Don't let a checkpoint-save failure take down the
+                # post-training math-verify eval — that eval uses the
+                # in-memory model, not the on-disk checkpoint.
+                print(
+                    f"WARNING: save_merged_checkpoint failed: {_save_exc!r}. "
+                    "Continuing to math-verify eval via the in-memory model."
+                )
+                if not args.no_wandb:
+                    wandb.log({"save_merged_checkpoint/error": repr(_save_exc)})
 
     # ─── Post-training math-verify eval ────────────────────────────────────
     if args.enable_math_verify:
@@ -2079,22 +2140,10 @@ def main(argv=None):
                 if args.train_mode in {"blocktt", "svd"}:
                     weight_tuples = export_weights_for_vllm(model)
                 elif args.train_mode in {"lora", "lora_full", "dora", "pissa", "milora", "randlora"}:
-                    model.merge_adapter()
-                    try:
-                        base = model.get_base_model()
-                        weight_tuples = []
-                        seen = set()
-                        for name, p in base.named_parameters():
-                            normalized = normalize_lora_merged_weight_name(name)
-                            if normalized is None or normalized in seen:
-                                continue
-                            seen.add(normalized)
-                            weight_tuples.append((normalized, p))
-                        in_process_llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
-                            weight_tuples
-                        )
-                    finally:
-                        model.unmerge_adapter()
+                    weight_tuples = export_lora_merged_weights_for_vllm(model)
+                    in_process_llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
+                        weight_tuples
+                    )
                     weight_tuples = None  # already loaded
                 else:
                     weight_tuples = [(n, p) for n, p in model.named_parameters()]

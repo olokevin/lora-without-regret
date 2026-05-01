@@ -4,7 +4,6 @@
 # DEVICE=4 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=input_one_block TRAIN_POSITION=small S_MERGED_TO=keep_trainable CFG_SUFFIX="--blocktt-normalize-after-update" NAME_SUFFIX="-norm" bash run_rl.sh
 
 DEVICE=1 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=keep_trainable bash run_rl.sh
-DEVICE=1 LR=1e-4 TRAIN_MODE=blocktt DECOMP_MODE=output_one_block TRAIN_POSITION=small S_MERGED_TO=keep_trainable CFG_SUFFIX="--blocktt-normalize-after-update" NAME_SUFFIX="-norm" bash run_rl.sh
 
 
 ### sft
