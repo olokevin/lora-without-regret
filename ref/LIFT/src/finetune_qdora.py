@@ -150,6 +150,29 @@ def parse_args():
         default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         help="List of module names to apply LoRA adapters to.",
     )
+    parser.add_argument(
+        "--qdora_impl",
+        type=str,
+        default="fast",
+        choices=["peft", "fast"],
+        help=(
+            "DoRA implementation. 'peft' uses LoraConfig(use_dora=True) — slow "
+            "but matches the published reference exactly. 'fast' uses the "
+            "hand-rolled Qdora4bitLinear with bnb.matmul_4bit fused kernel and "
+            "cached column-norm — ~2x faster, default."
+        ),
+    )
+    parser.add_argument(
+        "--dora_norm_cache_steps",
+        type=int,
+        default=16,
+        help=(
+            "Recompute the DoRA column norm every K training steps. K=1 "
+            "matches PEFT's exact behavior (norm refreshed every step). "
+            "Higher K trades a little staleness for speed. Ignored when "
+            "--qdora_impl=peft."
+        ),
+    )
 
     parser.add_argument(
         "--wandb_project",
@@ -269,22 +292,59 @@ def main():
             collate_fn=data_collator,
         )
 
-    # --- qdora: NF4 base + DoRA adapters via PEFT use_dora=True.
+    # --- qdora: NF4 base + DoRA adapters.
     # DoRA decomposes each linear's weight into a magnitude vector m
     # (one scalar per output column) and a direction matrix; trainable
     # params are m, A, B with the original W frozen (NF4-quantized here).
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=list(args.target_modules),
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        use_dora=True,
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+
+    if args.qdora_impl == "peft":
+        # Reference path: PEFT's Linear4bit + use_dora=True. Slow because
+        # PEFT dequantizes the full weight on every forward to compute the
+        # column norm. Kept as a baseline for ablation.
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=list(args.target_modules),
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            use_dora=True,
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+        print(f"[qdora] using PEFT reference path (use_dora=True).")
+    elif args.qdora_impl == "fast":
+        # Hand-rolled Qdora4bitLinear: bnb.matmul_4bit fused base matmul +
+        # column-norm cached every K steps. Numerically equivalent to PEFT's
+        # path at K=1. Default K=16 trades a tiny bit of staleness for speed.
+        sys.path.insert(
+            0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir))
+        )
+        from qdora_fast import convert_to_qdora_fast
+        # Freeze everything first.
+        for p in model.parameters():
+            p.requires_grad = False
+        stats = convert_to_qdora_fast(
+            model,
+            target_module_names=list(args.target_modules),
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            norm_cache_steps=args.dora_norm_cache_steps,
+        )
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in model.parameters())
+        print(
+            f"[qdora] fast path: replaced {stats['num_converted']} Linear4bit "
+            f"layers with Qdora4bitLinear (norm_cache_steps={args.dora_norm_cache_steps})."
+        )
+        print(
+            f"[qdora] trainable params: {n_trainable:,} || all params: {n_total:,} "
+            f"|| trainable%: {100*n_trainable/n_total:.4f}"
+        )
+    else:
+        raise ValueError(f"unknown --qdora_impl: {args.qdora_impl}")
 
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -469,17 +529,31 @@ def main():
         },
     )
 
-    # Save final model if no validation
-    # PEFT's save_pretrained saves only the adapter weights; the frozen 4-bit base
-    # is not saved here. To get a full HF-format checkpoint usable by
-    # bash_scripts/eval_math.sh / eval_commonsense.sh, run
-    # tools/merge_qlora_for_eval.py after training to merge the adapter into
-    # the (bf16) base and save as a full model.
+    # Save final model.
+    # qdora_impl=peft: PEFT's save_pretrained writes only the adapter; the
+    #     frozen 4-bit base must be re-merged at eval time via
+    #     tools/merge_qlora_for_eval.py.
+    # qdora_impl=fast: write a full HF-format checkpoint directly by
+    #     materializing each Qdora4bitLinear into a bf16 nn.Linear. The eval
+    #     scripts can then load it as a standard model. The output dir gets
+    #     a "-merged" suffix at the shell level so the existing flow is
+    #     preserved; here we just save to args.output_dir.
+    def _save(_model):
+        unwrapped = accelerator.unwrap_model(_model)
+        if args.qdora_impl == "fast":
+            from qdora_fast import materialize_qdora_to_linear
+            n_merged = materialize_qdora_to_linear(unwrapped)
+            print(f"[qdora] fast path: materialized {n_merged} Qdora4bitLinear modules to nn.Linear before save")
+            unwrapped.save_pretrained(
+                args.output_dir, safe_serialization=True, max_shard_size="5GB"
+            )
+        else:
+            unwrapped.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+
     if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
         accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+        _save(model)
 
     if args.output_dir is not None:
         # Evaluate last model
@@ -495,12 +569,7 @@ def main():
                     best_model = copy.deepcopy(model.module).to("cpu")
 
         model = best_model if best_model is not None else model
-
-        # Save adapter weights via PEFT; the 4-bit base model is not saved here
-        # and must be reloaded separately during evaluation.
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+        _save(model)
 
     if use_wandb:
         accelerator.end_training()

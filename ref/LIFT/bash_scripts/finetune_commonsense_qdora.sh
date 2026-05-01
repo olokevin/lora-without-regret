@@ -22,6 +22,8 @@ lora_dropout="${lora_dropout:-0.05}"
 lr="${lr:-2e-4}"
 seed="${seed:-43}"
 MAX_STEPS="${MAX_STEPS:-0}"
+qdora_impl="${qdora_impl:-fast}"
+dora_norm_cache_steps="${dora_norm_cache_steps:-16}"
 model_tag="${MODEL##*/}"
 
 wandb_project="${wandb_project:-qdora-commonsense-${model_tag}}"
@@ -66,6 +68,8 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --lora_r ${lora_r} \
     --lora_alpha ${lora_alpha} \
     --lora_dropout ${lora_dropout} \
+    --qdora_impl ${qdora_impl} \
+    --dora_norm_cache_steps ${dora_norm_cache_steps} \
     --max_steps ${MAX_STEPS} \
     --val_set_size 120 \
     --eval_step 400 \
@@ -78,15 +82,24 @@ uv run --project ${PROJECT_DIR} accelerate launch \
     --output_dir $OUTPUT 2> >(tee $OUTPUT/err.log >&2) | tee $OUTPUT/training.log
 
 if [ "${MAX_STEPS}" = "0" ]; then
-    MERGED="${OUTPUT}-merged"
-    if [ ! -f "${MERGED}/config.json" ]; then
-        uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
-            --base_model ${MODEL} \
-            --adapter_dir "${OUTPUT}" \
-            --output_dir "${MERGED}"
+    if [ "${qdora_impl}" = "fast" ]; then
+        # Fast path saves an already-merged HF model directly to $OUTPUT
+        # (Qdora4bitLinear modules are materialized to bf16 nn.Linear in
+        # finetune_qdora.py before save_pretrained). Eval directly.
+        EVAL_CKPT="${OUTPUT}"
+    else
+        # PEFT path saves only the adapter; merge into bf16 base for eval.
+        MERGED="${OUTPUT}-merged"
+        if [ ! -f "${MERGED}/config.json" ]; then
+            uv run --project ${PROJECT_DIR} python ${PROJECT_DIR}/tools/merge_qlora_for_eval.py \
+                --base_model ${MODEL} \
+                --adapter_dir "${OUTPUT}" \
+                --output_dir "${MERGED}"
+        fi
+        EVAL_CKPT="${MERGED}"
     fi
     bash ./bash_scripts/eval_commonsense.sh \
-        CKPT="${MERGED}" \
+        CKPT="${EVAL_CKPT}" \
         base_model="${MODEL}" \
         wandb_project="${wandb_project}" \
         wandb_run_name="${run_name}" \
