@@ -42,7 +42,7 @@ accelerate launch \
     --mixed_precision="bf16" \
     src/finetune_svd.py \
     --model_name_or_path ${MODEL} \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 16 \
     --logging_steps 10 \
     --max_seq_len 2048 \
@@ -50,7 +50,7 @@ accelerate launch \
     --weight_decay 0. \
     --num_train_epochs 3 \
     --mixed_precision bf16 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 16 \
     --lr_scheduler_type linear \
     --num_warmup_steps 0.03 \
     --seed ${seed} \

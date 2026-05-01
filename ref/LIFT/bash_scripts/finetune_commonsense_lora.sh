@@ -32,14 +32,24 @@ seed="${seed:-43}"
 MAX_STEPS="${MAX_STEPS:-0}"
 model_tag="${MODEL##*/}"
 
+# target_modules: space-separated list. Default = original 5-module set so legacy runs are unchanged.
+target_modules="${target_modules:-q_proj k_proj v_proj up_proj down_proj}"
+# Tag the run when overridden (count tokens; 5 -> default = no tag, 7 -> "7mod", else "Nmod").
+_tm_count=$(echo $target_modules | wc -w)
+if [ "$_tm_count" = "5" ] && [ "$target_modules" = "q_proj k_proj v_proj up_proj down_proj" ]; then
+    _tm_tag=""
+else
+    _tm_tag="-tgt_${_tm_count}mod"
+fi
+
 wandb_project="${wandb_project:-commonsense-${model_tag}}"
-run_name="${run_name:-${adapter_name}-lr_${lr}-rank_${lora_r}-seed_${seed}}"
+run_name="${run_name:-${adapter_name}-lr_${lr}-rank_${lora_r}${_tm_tag}-seed_${seed}}"
 wandb_run_id="${wandb_run_id:-$(python -c 'import wandb; print(wandb.util.generate_id())')}"
 
 export WANDB_RUN_ID="${wandb_run_id}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
-OUTPUT="${OUTPUT:-${OUTPUT_SRC_DIR}/commonsense/${MODEL}/${adapter_name}-lr_${lr}-rank_${lora_r}-seed_${seed}}"
+OUTPUT="${OUTPUT:-${OUTPUT_SRC_DIR}/commonsense/${MODEL}/${adapter_name}-lr_${lr}-rank_${lora_r}${_tm_tag}-seed_${seed}}"
 mkdir -p $OUTPUT
 
 cd $SRC_DIR
@@ -68,7 +78,7 @@ accelerate launch \
     --adapter_name ${adapter_name} \
     --lora_r ${lora_r} \
     --lora_alpha ${lora_alpha} \
-    --target_modules q_proj k_proj v_proj up_proj down_proj \
+    --target_modules ${target_modules} \
     --data_path ${DATA_DIR}/ft-training_set/commonsense_170k.json \
     --wandb_project "${wandb_project}" \
     --wandb_run_name "${run_name}" \

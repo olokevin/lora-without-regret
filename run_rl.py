@@ -11,6 +11,7 @@ Examples:
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -257,6 +258,11 @@ def parse_args(argv=None):
         "--enable-save-ckpt",
         action="store_true",
         help="Save checkpoints at step 1, step 10, and final step (default: disabled)",
+    )
+    parser.add_argument(
+        "--save-best-val-ckpt",
+        action="store_true",
+        help="Save a merged HF checkpoint to <run_dir>/best/ whenever eval/accuracy improves.",
     )
     parser.add_argument(
         "--save-first-step-grads-path",
@@ -1834,6 +1840,8 @@ def main(argv=None):
     save_grads_steps = parse_save_grads_steps(args.save_grads_steps)
     stop_requested = False
 
+    best_val_state = {"acc": float("-inf"), "step": -1}
+
     def eval_model(step):
         val_prompts = val_dataset[:1000]["prompt"]
 
@@ -1862,6 +1870,25 @@ def main(argv=None):
                 log_payload["eval/baseline_accuracy"] = accuracy
                 wandb.run.summary["eval/baseline_accuracy"] = accuracy
             wandb.log(log_payload, step=step)
+
+        if args.save_best_val_ckpt and accuracy > best_val_state["acc"]:
+            best_val_state["acc"] = accuracy
+            best_val_state["step"] = step
+            best_dir = os.path.join(run_dir, "best")
+            os.makedirs(best_dir, exist_ok=True)
+            try:
+                save_merged_checkpoint(model, tokenizer, best_dir, args.train_mode, args)
+                meta = {"step": step, "eval_accuracy": accuracy}
+                with open(os.path.join(best_dir, "best_val_info.json"), "w") as fh:
+                    json.dump(meta, fh, indent=2)
+                print(
+                    f"[save-best-val-ckpt] step={step} new best eval/accuracy={accuracy:.4f} -> {best_dir}"
+                )
+                if not args.no_wandb:
+                    wandb.run.summary["best_val/accuracy"] = accuracy
+                    wandb.run.summary["best_val/step"] = step
+            except Exception as exc:
+                print(f"[save-best-val-ckpt] WARNING: save failed at step={step}: {exc!r}")
 
         return accuracy
 

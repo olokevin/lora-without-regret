@@ -345,10 +345,11 @@ def plot_V_heatmap(ax, v_updates: list, layer_idx: int, title: str):
 
 
 def plot_R_heatmap(ax, r_updates: list, layer_idx: int, title: str):
-    """Panel (e): heatmap of |R' - R0| as flat 2D with bold block-boundary lines.
+    """Panel (e): heatmap of |R' - R0| as (n*b) x (m*rank) rectangle.
 
-    R has shape (n, b, m*rank). We flatten to (n*b, m*rank) and draw
-    horizontal bold lines every b rows to delineate the n blocks.
+    R has shape (n, b, m*rank). Each of the n slices is b × (m*rank).
+    We stack vertically into (n*b, m*rank) and draw bold lines every b rows.
+    aspect="equal" so each matrix element is square.
     """
     info = r_updates[layer_idx]
     if info is None:
@@ -365,15 +366,23 @@ def plot_R_heatmap(ax, r_updates: list, layer_idx: int, title: str):
     eps = 1e-10
     flat_log = np.log10(flat + eps)
 
-    im = ax.imshow(flat_log, aspect="auto", cmap="magma", interpolation="nearest")
+    im = ax.imshow(flat_log, aspect="equal", cmap="magma", interpolation="nearest")
 
-    # Draw bold horizontal lines at block boundaries
+    # Bold horizontal lines at block boundaries to separate n slices
     for i in range(1, n):
-        ax.axhline(y=i * b - 0.5, color="white", linewidth=1.5, alpha=0.8)
+        ax.axhline(y=i * b - 0.5, color="white", linewidth=1.8, alpha=0.9)
 
-    ax.set_xlabel("Column index (m × rank)")
-    ax.set_ylabel("Row index (n × b)")
+    ax.set_xlabel("rank")
+    ax.set_ylabel(f"block index (n={n})")
     ax.set_title(title, fontsize=9)
+
+    # y-tick labels at block centers (show every few blocks)
+    step = max(1, n // 8)
+    ytick_positions = [i * b + b // 2 for i in range(0, n, step)]
+    ytick_labels = [str(i) for i in range(0, n, step)]
+    ax.set_yticks(ytick_positions)
+    ax.set_yticklabels(ytick_labels)
+
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log₁₀|R'−R₀|")
 
 
@@ -446,10 +455,11 @@ def build_figure(
     output_path: str,
     curve_title: str = "Learning curves",
 ):
-    fig = plt.figure(figsize=(13.5, 6.0))
+    fig = plt.figure(figsize=(14, 9))
     gs = gridspec.GridSpec(2, 3, figure=fig,
-                           width_ratios=[1, 1.2, 1],
-                           hspace=0.45, wspace=0.38)
+                           width_ratios=[1.2, 1.2, 1],
+                           height_ratios=[1, 1.5],
+                           hspace=0.40, wspace=0.40)
 
     ax_a = fig.add_subplot(gs[0, 0])
     ax_b = fig.add_subplot(gs[0, 1])
