@@ -168,11 +168,11 @@ run_svd()
 run_blocktt()
 {
   local train_mode="blocktt"
-  local lr="${LR:-8e-5}"
+  local lr="${LR:-2e-4}"
   local optimizer="${OPTIMIZER:-adamw}"
-  local decomp_mode="${DECOMP_MODE:-input_one_block}"
+  local decomp_mode="${DECOMP_MODE:-output_one_block}"
   local train_position="${TRAIN_POSITION:-small}"
-  local s_merged_to="${S_MERGED_TO:-frozen}"
+  local s_merged_to="${S_MERGED_TO:-keep_trainable}"
   local device="${DEVICE:-2}"
   local name_suffix="${NAME_SUFFIX:-}"
   local run_name="${train_mode}-${optimizer}-lr_${lr}-${decomp_mode}-s_to_${s_merged_to}-train_${train_position}${name_suffix}"

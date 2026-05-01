@@ -26,12 +26,12 @@ OUTPUT_SRC_DIR="${OUTPUT_SRC_DIR:-/data/yequan/fura/lift}"    # MODIFY THIS LINE
 # seed=$(echo $cfg | cut -f 8 -d ' ')
 
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B}"
-decomp_mode="${decomp_mode:-input_one_block}"
+decomp_mode="${decomp_mode:-output_one_block}"
 train_position="${train_position:-small}"
 blocktt_rank="${blocktt_rank:-full}"
-s_merged_to="${s_merged_to:-frozen}"
+s_merged_to="${s_merged_to:-keep_trainable}"
 trainable_type="${trainable_type:-all}"
-lr="${lr:-1e-4}"
+lr="${lr:-2e-4}"
 seed="${seed:-43}"
 model_tag="${MODEL##*/}"
 
