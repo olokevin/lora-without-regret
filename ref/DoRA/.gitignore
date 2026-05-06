@@ -4,3 +4,23 @@ instruction_tuning_dvora/peft/*
 instruction_tuning_dvora/COPYRIGHT.txt
 instruction_tuning_dvora/get_avg_score.py
 instruction_tuning_dvora/Software Evaluation License.pdf
+
+# ---- Data & training outputs (populated from pscratch or downloads) ----
+# LLaVA (Table 4/12)
+visual_instruction_tuning/playground/
+visual_instruction_tuning/checkpoints/
+visual_instruction_tuning/eval_result/
+# VL-BART (kept installed but unused — data not public)
+image_video_text_understanding/datasets/
+image_video_text_understanding/VL-T5/snap/
+image_video_text_understanding/VL-T5/features_cache/
+image_video_text_understanding/VL-T5/wandb/
+
+# ---- Editable installs / build artifacts from `pip install -e .` ----
+visual_instruction_tuning/llava.egg-info/
+visual_instruction_tuning/peft/peft.egg-info/
+visual_instruction_tuning/peft/build/
+
+# ---- Local helper logs ----
+slurm/*.out
+*.log

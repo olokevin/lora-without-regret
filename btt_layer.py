@@ -428,6 +428,73 @@ def configure_blocktt_trainability(
     }
 
 
+def enable_random_l_training(model, k):
+    """Mark all BTT L cores as trainable so they enter the optimizer.
+
+    Pair with RandomLkScheduler to randomly toggle requires_grad on a
+    fixed-size subset (k of N) per training step. Without this priming
+    pass, AdamW's parameter group filter drops L cores at optimizer
+    creation time and runtime requires_grad changes don't add them back.
+
+    Returns a list of (name, btt_l) tuples — pass this to RandomLkScheduler.
+    """
+    l_params = []
+    for name, module in model.named_modules():
+        if not isinstance(module, BTTLayer):
+            continue
+        if not hasattr(module, "btt_l"):
+            continue
+        # All L go into optimizer; per-step toggle decides which ones see grads
+        module.btt_l.requires_grad = True
+        l_params.append((name, module.btt_l))
+    if not l_params:
+        return []
+    if k > len(l_params):
+        raise ValueError(
+            f"random_l_count={k} exceeds total L cores={len(l_params)}"
+        )
+    return l_params
+
+
+class RandomLkScheduler:
+    """Per-step random subset selector for BTT L cores.
+
+    Disables grad on all registered L params, then re-enables it on a fresh
+    sample of k each call to ``step``. Use as a HF TrainerCallback wrapper or
+    invoke ``step()`` manually before ``optimizer.zero_grad()``.
+
+    Notes
+    -----
+    The optimizer must already contain every L param (see
+    ``enable_random_l_training``). AdamW's m/v state is created lazily on
+    first non-zero update, so cores that never get selected don't pay the
+    state cost; cores that do get selected accumulate state across visits.
+    """
+
+    def __init__(self, l_params, k, generator=None):
+        self.l_params = list(l_params)  # list[(name, Parameter)]
+        self.k = int(k)
+        if self.k <= 0 or self.k > len(self.l_params):
+            raise ValueError(
+                f"k must be in (0, {len(self.l_params)}], got {self.k}"
+            )
+        # Use a private RNG so global random/torch seeds aren't perturbed
+        self._gen = generator if generator is not None else torch.Generator()
+        self.last_indices = []
+
+    def step(self):
+        """Pick k random L cores; freeze others, unfreeze chosen."""
+        for _, p in self.l_params:
+            p.requires_grad = False
+        n = len(self.l_params)
+        # torch.randperm + slice = uniform sample without replacement
+        idx = torch.randperm(n, generator=self._gen).tolist()[: self.k]
+        for i in idx:
+            self.l_params[i][1].requires_grad = True
+        self.last_indices = idx
+        return idx
+
+
 @torch.no_grad()
 def normalize_trainable_blocktt_cores_(model, eps=1e-12):
     try:

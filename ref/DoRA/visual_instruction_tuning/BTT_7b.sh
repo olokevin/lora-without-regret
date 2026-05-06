@@ -1,14 +1,20 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
+# BlockTT replacement of Dora_7b.sh. Same hyperparameters (lr, epoch, bs, ...)
+# swap DoRA peft wrapper for a direct Linear->BTT conversion.
+#
+# Config: rank=full, decomp=output_one_block, train_position=small,
+#         s_merged_to=keep_trainable (singular values stay trainable).
 
-deepspeed llava/train/train_mem_dora.py \
-    --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
-    --deepspeed ./scripts/zero3.json \
+deepspeed llava/train/train_mem_btt.py \
+    --btt_enable True \
+    --btt_rank full \
+    --btt_decomp_mode output_one_block \
+    --btt_train_position small \
+    --btt_s_merged_to keep_trainable \
+    --btt_trainable_type all \
+    --mm_projector_lr 2e-5 \
+    --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-7b-v1.5 \
     --version v1 \
     --data_path ./playground/data/llava_v1_5_mix665k.json \
@@ -22,7 +28,7 @@ deepspeed llava/train/train_mem_dora.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-dora-r128-alpha-256 \
+    --output_dir ./checkpoints/llava-v1.5-7b-btt-full-output_one_block-small-keep_trainable \
     --num_train_epochs 1 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
@@ -42,4 +48,4 @@ deepspeed llava/train/train_mem_dora.py \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
-    --run_name ${WANDB_NAME:-llava-dora-r128-a256}
+    --run_name ${WANDB_NAME:-llava-btt-full-ob-small-kt}

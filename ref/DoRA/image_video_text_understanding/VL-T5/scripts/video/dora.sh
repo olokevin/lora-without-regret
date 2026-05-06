@@ -16,12 +16,12 @@ echo $model
 if [ $model == "t5" ]
 then
     folder_prefix="VLT5"
-    backbone="t5-base"
+    backbone="${BACKBONE_T5:-t5-base}"
     batch_size=300
 elif [ $model == "bart" ]
 then
     folder_prefix="VLBart"
-    backbone="facebook/bart-base"
+    backbone="${BACKBONE_BART:-facebook/bart-base}"
     batch_size=50
 fi
 
